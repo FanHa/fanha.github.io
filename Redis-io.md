@@ -1,5 +1,5 @@
 ## Redis源码学习笔记 --- 网络IO
-源码版本 3.2.8
+源码版本 3.2.9
 
 ### 一、概论
 Redis是单线程执行,server.c中的main函数在正常运行的情况下会进入死循环
@@ -199,4 +199,119 @@ networking.c
         return c;
     }
 
-由上面的源码,服务器接受TCP连接,根据accept后的套接字fd,创建一个客户连接,然后调用aeCreateFileEvent注册一个可读的事件,并配以readQueryFromClient函数,并把新的客户连接 listAddNodeTail(server.clients,c)添加到服务器管理的客户连接队列中.这样下一次客户端传来redis命令(比如 "set a 10"),就会触发eventloop里的事件,在redis的主循环里就会调用readQueryFromClient函数来出来这次请求
+由上面的源码,服务器接受TCP连接,根据accept后的套接字fd,创建一个客户连接,然后调用aeCreateFileEvent注册一个可读的事件,并配以readQueryFromClient函数,并把新的客户连接 listAddNodeTail(server.clients,c)添加到服务器管理的客户连接队列中.这样下一次客户端传来redis命令(比如 "set a 10"),就会触发eventloop里的事件,在redis的主循环里就会调用readQueryFromClient函数来出来这次请求.
+
+### readQueryFromClient
+redis服务器与客户端建立TCP连接后,监听了客户端后续发送的请求事件,并注册此事件的执行函数为readQueryFromClient.
+
+networking.c  
+
+    void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
+        ...
+        c->querybuf = sdsMakeRoomFor(c->querybuf, readlen);
+        nread = read(fd, c->querybuf+qblen, readlen);
+        ...
+        processInputBuffer(c);
+    }
+---
+    void processInputBuffer(client *c) {
+        ...
+        while(sdslen(c->querybuf)) {
+            ...
+            if (c->argc == 0) {
+                resetClient(c);
+            } else {
+                /* Only reset the client when the command was executed. */
+                if (processCommand(c) == C_OK)
+                    resetClient(c);
+                ...
+            }
+        }
+        server.current_client = NULL;
+    }
+去掉其他辅助的处理,可以看函数将套接字请求里的内容读取到了 c->querybuf中,然后 processInputBuffer(c)处理请求内容;processInputBuffer经过一些前置性的辅助处理后,最终调用processCommand(C)来处理命令;
+
+server.c  
+
+    int processCommand(client *c) {
+        ...
+        c->cmd = c->lastcmd = lookupCommand(c->argv[0]->ptr);
+        ...
+        /* Exec the command */
+        if (c->flags & CLIENT_MULTI &&
+            c->cmd->proc != execCommand && c->cmd->proc != discardCommand &&
+            c->cmd->proc != multiCommand && c->cmd->proc != watchCommand)
+        {
+            ...
+        } else {
+            call(c,CMD_CALL_FULL);
+            c->woff = server.master_repl_offset;
+            if (listLength(server.ready_keys))
+                handleClientsBlockedOnLists();
+        }
+        return C_OK;
+    }
+---
+    void call(client *c, int flags) {
+        ...
+        c->cmd->proc(c);
+        ...
+    ｝
+processCommand解析命令,找到命令将调用的函数,检测排除各种可能的错误,到call(c,CMD_CALL_FULL)函数执行;call函数里,调用了之前动态查找到的命令函数.  
+注意,这里call函数并没有返回结果,那么服务器怎么把命令的结果返回给客户端呢?这里以最基本的命令"get X"为例;这个命令在t_string.c文件的对应函数是void getCommand(client *c).
+
+t_string.c
+
+    void getCommand(client *c) {
+        getGenericCommand(c);
+    }
+---
+    int getGenericCommand(client *c) {
+        robj *o;
+
+        if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.nullbulk)) == NULL)
+            return C_OK;
+
+        if (o->type != OBJ_STRING) {
+            ...
+        } else {
+            addReplyBulk(c,o);
+            return C_OK;
+        }
+    }
+
+函数将命令调用返回的结果通过addReplyBulk(c,o)交给了client结构处理.
+
+networking.c
+
+    void addReplyBulk(client *c, robj *obj) {
+        addReplyBulkLen(c,obj);
+        addReply(c,obj);
+        addReply(c,shared.crlf);
+    }
+---
+    void addReply(client *c, robj *obj) {
+        if (prepareClientToWrite(c) != C_OK) return;
+        ...
+        if (...)) {
+            if (...)
+                _addReplyObjectToList(c,obj);
+        } else if (...) {
+            ...
+            if (...) {
+                ...
+                if (_addReplyToBuffer(c,buf,len) == C_OK)
+                ...
+            }
+            ...
+            if (...)
+            ...
+        } else {
+            serverPanic("Wrong obj->encoding in addReply()");
+        }
+    }
+
+首先通过prepareClientToWrite(c)向redis的异步IO注册一个写事件,然后把要写的内容通过_addReplyObjectToList加到响应的buff区.
+
+>注1:这里我本来闪过一个疑问,先注册了写事件,然后再把要写的内容写入buffer区;那么如果写事件注册成功,而要写的内容还没写入到buffer区,这时如果有循环触发了这个写事件,会不会出错?后来想起redis是单线程执行,所以必定是第一个事件在这个地方注册了写函数,然后接着执行了下面的把内容写入buffer区后,才会去触发下一个事件.
+>注2:突然又有了另外一个脑洞,如果以后的异步IO在IO库内部自己实现了同时并发处理事件,那么redis现有的架构是不是不能支持这种异步IO.
