@@ -1,9 +1,19 @@
 ## Redis源码学习笔记 --- 网络IO
 源码版本 3.2.9
 
-### 一、概论
-Redis是单线程执行,server.c中的main函数在正常运行的情况下会进入死循环
+### 概论
 
+Redis是单线程执行,server.c中的main函数在正常运行的情况下会进入死循环.  
+redis处理一个简单普通命令(如 "get X")的网络IO流程如下:  
+1.redis服务器在主循环前监听某端口,注册一个读事件,配以处理tcp连接的函数;  
+2.客户端发起tcp连接,服务器在主循环中检测到这个事件,触发处理tcp连接函数,在这个函数里,注册了另外的读事件,配以处理redis命令的函数;  
+3.建立tcp连接完成后,客户端发送redis命令,服务器在主循环中检测到这个事件,触发处理redis命令的函数,这个函数解析,并执行命令,把要返回的结果写到相应的buffer区.  
+4.每一次主循环前,程序会查看Buffer区是否有要返回的内容,并通过两种方式返回给客户端.  
+    4.1. 直接返回给客户端;  
+    4.2. 注册一个写事件,再下一次主循环触发写事件的函数,返回信息给客户端;
+
+
+### 主循环
 server.c
 
     aeSetBeforeSleepProc(server.el,beforeSleep);
@@ -311,7 +321,67 @@ networking.c
         }
     }
 
-首先通过prepareClientToWrite(c)向redis的异步IO注册一个写事件,然后把要写的内容通过_addReplyObjectToList加到响应的buff区.
+首先通过prepareClientToWrite(c) 把客户端加到需要回复请求的队列里 ,然后把要写的内容通过_addReplyObjectToList加到相应的buff区. 
+>在这里,我本以为会注册一个写事件,这样下一次程序主循环会触发这个写事件并返回内容到客户端,但实际上源码并没有这样做,于是带着疑问又回到主循环的代码.
 
->注1:这里我本来闪过一个疑问,先注册了写事件,然后再把要写的内容写入buffer区;那么如果写事件注册成功,而要写的内容还没写入到buffer区,这时如果有循环触发了这个写事件,会不会出错?后来想起redis是单线程执行,所以必定是第一个事件在这个地方注册了写函数,然后接着执行了下面的把内容写入buffer区后,才会去触发下一个事件.
->注2:突然又有了另外一个脑洞,如果以后的异步IO在IO库内部自己实现了同时并发处理事件,那么redis现有的架构是不是不能支持这种异步IO.
+ae.c  
+
+    void aeMain(aeEventLoop *eventLoop) {
+        eventLoop->stop = 0;
+        while (!eventLoop->stop) {
+            if (eventLoop->beforesleep != NULL)
+                eventLoop->beforesleep(eventLoop);
+            aeProcessEvents(eventLoop, AE_ALL_EVENTS);
+        }
+    }
+
+在这里发现在aeProcessEvent函数前面调用了 eventLoop->beforesleep(eventLoop),回溯到这个函数的注册和原型.
+
+server.c
+
+    aeSetBeforeSleepProc(server.el,beforeSleep);
+    aeMain(server.el);
+    aeDeleteEventLoop(server.el);
+---
+    void beforeSleep(struct aeEventLoop *eventLoop) {
+        ...
+        /* Handle writes with pending output buffers. */
+        handleClientsWithPendingWrites();
+    }
+
+
+networking.c
+
+    int handleClientsWithPendingWrites(void) {
+        ...
+        while((ln = listNext(&li))) {
+            ...
+            /* Try to write buffers to the client socket. */
+            if (writeToClient(c->fd,c,0) == C_ERR) continue;
+
+            /* If there is nothing left, do nothing. Otherwise install
+            * the write handler. */
+            if (clientHasPendingReplies(c) &&
+                aeCreateFileEvent(server.el, c->fd, AE_WRITABLE,
+                    sendReplyToClient, c) == AE_ERR)
+            {
+                freeClientAsync(c);
+            }
+        }
+        return processed;
+    }
+
+从这个流程可以看出,redis服务器先尝试直接向客户端写,如果遇到了问题(可能某些命令需要后续的返回),才会注册一个写事件,以便再下一次主循环时触发这个事件,把内容返回给客户端.
+
+
+### 总结
+redis处理一个简单普通命令(如 "get X")的网络IO流程如下:  
+1.redis服务器在主循环前监听某端口,注册一个读事件,配以处理tcp连接的函数;  
+2.客户端发起tcp连接,服务器在主循环中检测到这个事件,触发处理tcp连接函数,在这个函数里,注册了另外的读事件,配以处理redis命令的函数;  
+3.建立tcp连接完成后,客户端发送redis命令,服务器在主循环中检测到这个事件,触发处理redis命令的函数,这个函数解析,并执行命令,把要返回的结果写到相应的buffer区.  
+4.每一次主循环前,程序会查看Buffer区是否有要返回的内容,并通过两种方式返回给客户端.  
+    4.1. 直接返回给客户端;  
+    4.2. 注册一个写事件,再下一次主循环触发写事件的函数,返回信息给客户端;
+
+### 其他
+第一次写笔记,剪辑掉了很多自认为相关性较少的内容,只保留了与网络IO相关的.以后慢慢把其他方面的内容补上,并结合更深层次的理解,把这篇也优化,表述更清晰
