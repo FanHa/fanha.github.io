@@ -141,7 +141,7 @@ ngx_cycle.c
         ...
     }
 + 第一部分调用了每个CORE_MODULE的create_conf回调函数;
-+ 第二部分ngx_conf_param函数其实隐藏大量的模块的初始化的过程,它由各个CORE_MODULE再调用想对应的子模块的配置解析,但大多与这次笔记的联系相关不大,少数联系紧密的会在后面再提;
++ 第二部分ngx_conf_param函数其实隐藏大量的模块的初始化的过程,它由各个CORE_MODULE再调用想对应的子模块的配置解析,但大多与这次笔记的联系相关不大,少数联系紧密的会在后面再提[跳转2];
 + 第三部分则调用各个CORE_MODULE的init_conf回调函数;
 
 #### ngx_master_process_cycle
@@ -278,6 +278,41 @@ ngx_epoll_module.c
         }
     }
 
-从epoll异步IO系统中取出事件,然后根据类别调用读(或写)事件的回调函数(rev->handler,wev->handler),那么这个回调函数是在哪里被注册的呢,这里可以回过头来[跳到跳转1],看epoll_module模块的init_process回调函数ngx_epoll_init:
+从epoll异步IO系统中取出事件,然后根据类别调用读(或写)事件的回调函数(rev->handler,wev->handler),那么这个回调函数是在哪里被注册的呢,这里可以回过头来[跳到跳转1],ngx_event_core_module模块的init_process回调函数ngx_event_process_init有初始建立连接的回调函数.
 
-#### ngx_epoll_init
+#### ngx_event_process_init
+ngx_event.c
+
+    ngx_event_process_init(ngx_cycle_t *cycle){
+        ...
+        rev = cycle->read_events;
+        ...
+        ls = cycle->listening.elts;
+        for (i = 0; i < cycle->listening.nelts; i++) {
+            ...
+            rev->handler = (c->type == SOCK_STREAM) ? ngx_event_accept
+                                                : ngx_event_recvmsg;
+            ...
+        }
+        ...
+    }
+这里看出给每个监听套接字的读事件注册了一个回调函数ngx_event_accept(或ngx_event_recvmsg),一般我们收到的nginx连接都是tcp,即type==SOCK_STREAM,所以这里我们认为回调函数注册的是ngx_event_accept,这样当nginx服务器收到来自客户端的第一个信息时,调用这个函数来建立tcp连接,并为接下来的客户端请求注册新的回调函数;
+
+#### 接受TCP连接的回调函数ngx_event_accept
+ngx_event_accept.c
+
+    ngx_event_accept(ngx_event_t *ev){
+        ...
+        lc = ev->data;
+        ls = lc->listening;
+        ...
+        do {
+            ...
+            s = accept(lc->fd, &sa.sockaddr, &socklen);
+            ...
+            ls->handler(c);
+            ...
+        }
+        ...
+    }
+这里accpet建立了连接后,调用了ls->handler,这个回调函数是在哪里注册的呢,[跳到跳转2]
