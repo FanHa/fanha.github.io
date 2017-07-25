@@ -315,4 +315,138 @@ ngx_event_accept.c
         }
         ...
     }
-这里accpet建立了连接后,调用了ls->handler,这个回调函数是在哪里注册的呢,[跳到跳转2]
+
+这里accpet建立了连接后,调用了ls->handler,这个回调函数是在哪里注册的呢,[跳到跳转2]在ngx_conf_param一层层解析到ngx_conf_handler函数.
+
+    ngx_conf_param  
+        ngx_conf_parse  
+            ngx_conf_handler  
+
+ngx_conf_file.c
+
+    ngx_conf_handler(ngx_conf_t *cf, ngx_int_t last){
+        for (i = 0; cf->cycle->modules[i]; i++) {
+
+        cmd = cf->cycle->modules[i]->commands;
+        if (cmd == NULL) {
+            continue;
+        }
+
+        for ( /* void */ ; cmd->name.len; cmd++) {
+            ...
+            rv = cmd->set(cf, cmd, conf);
+            ...
+        }
+        ...
+    }
+这里调用了每个模块的每个commands的set函数,期中ngx_http_module模块的"http"cmd中有个set函数为ngx_http_block.
+
+##### ngx_http_block
+ngx_http.c
+    ngx_http_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf){
+        ...
+        if (ngx_http_optimize_servers(cf, cmcf, cmcf->ports) != NGX_OK) {
+            return NGX_CONF_ERROR;
+        }
+        ...
+    }
+---
+    ngx_http_optimize_servers(ngx_conf_t *cf, ngx_http_core_main_conf_t *cmcf,
+    ngx_array_t *ports)
+    {
+        ...
+        for (p = 0; p < ports->nelts; p++) {
+            ...
+            if (ngx_http_init_listening(cf, &port[p]) != NGX_OK) {
+                return NGX_ERROR;
+            }
+        }
+        ...
+    }
+---
+    ngx_http_init_listening(ngx_conf_t *cf, ngx_http_conf_port_t *port)
+    {
+        ...
+        ls = ngx_http_add_listening(cf, &addr[i]);
+        ...
+    }
+---
+    ngx_http_add_listening(ngx_conf_t *cf, ngx_http_conf_addr_t *addr)
+    {
+        ...
+        ls->handler = ngx_http_init_connection;
+        ...
+    }
+
+经过一层一层的调用,终于找到了最后定义ls->handler回调函数的地方,在这里也可以看出,nginx在初始化时已经把监听,连接等方方面面与网络io方面的信息都安排妥当,只等客户端发送请求后,把客户的信息填到这些初始化的结构里,就可以直接执行了;而不用动态的配置,选择要执行的方法.
+
+#### ngx_http_init_connection
+由上可知nginx在与客户端建立tcp连接后调用了ngx_http_init_connection函数;
+
+ngx_http_request.c
+
+    ngx_http_init_connection(ngx_connection_t *c)
+    {
+        ...
+        rev = c->read;
+        rev->handler = ngx_http_wait_request_handler;
+        ...
+        if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+            ngx_http_close_connection(c);
+            return;
+        }
+        ...
+    }
+这里为了解析方便,省略掉了很多旁支的处理,如ssl,如tcp连接复用,等等.
+通过ngx_handle_read_event异步IO循环里注册了一个新的读事件,这个读事件的回调函数是ngx_http_wait_request_handler,这样下次客户端发送信息到nginx,在主循环里,执行这个信息处理的回调函数就是ngx_http_wait_request_handler.
+
+#### ngx_http_wait_request_handler
+ngx_http_request.c
+
+    ngx_http_wait_request_handler(ngx_event_t *rev)
+    {
+        ...
+        ngx_http_process_request_line(rev);
+    }
+---
+层层解析调用,最终调用了ngx_http_process_request来处理http请求
+
+ngx_http_request.c
+
+    ngx_http_process_request(ngx_http_request_t *r){
+        ...
+        c->read->handler = ngx_http_request_handler;
+        c->write->handler = ngx_http_request_handler;
+        r->read_event_handler = ngx_http_block_reading;
+
+        ngx_http_handler(r);
+
+        ngx_http_run_posted_requests(c);
+    }
+
+#### ngx_http_handler
+ngx_http_core_module.c
+
+    ngx_http_handler(ngx_http_request_t *r)
+    {
+        ...
+        r->write_event_handler = ngx_http_core_run_phases;
+        ngx_http_core_run_phases(r);
+        ...
+    }
+---
+    ngx_http_core_run_phases(ngx_http_request_t *r)
+    {
+        ...
+        ph = cmcf->phase_engine.handlers;
+
+        while (ph[r->phase_handler].checker) {
+
+            rc = ph[r->phase_handler].checker(r, &ph[r->phase_handler]);
+
+            if (rc == NGX_OK) {
+                return;
+            }
+        }
+    }
+这里http请求按照预设的步骤一步步解析处理请求的内容,把请求得到的内容返回给客户端的写事件应该也是在这些步骤里,需继续阅读
