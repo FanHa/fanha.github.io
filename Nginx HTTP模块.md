@@ -243,3 +243,81 @@ ngx_http_core_module.c
             }
         }
     }
+
+### nginx转发php请求和静态文件请求
+上面处理http模块的phase的NGX_HTTP_CONTENT_PHASE阶段时,调用check函数是 ngx_http_core_content_phase.
+
+ngx_http_core_module.c
+    ngx_http_core_content_phase(ngx_http_request_t *r,
+        ngx_http_phase_handler_t *ph)
+    {
+        ...
+        if (r->content_handler) {
+            r->write_event_handler = ngx_http_request_empty_handler;
+            ngx_http_finalize_request(r, r->content_handler(r));
+            return NGX_OK;
+        }
+
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                    "content phase: %ui", r->phase_handler);
+
+        rc = ph->handler(r);
+        ...
+    }
+这里可以看到这个阶段先判断r->content_handler是否存在,只有在不存在content_handler时才会调用ph->handler,那么这个content_handler什么时候会存在呢,转发fastCGI或者获取静态文件时,会存在.  
+在往前看phase处理代码,找到NGX_HTTP_FIND_CONFIG_PHASE阶段的check函数ngx_http_core_find_config_phase,这个函数调用了ngx_http_update_location_config.
+
+ngx_http_core_module.c  
+
+    ngx_http_update_location_config(ngx_http_request_t *r){
+        ngx_http_core_loc_conf_t  *clcf;
+
+        clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+        ...
+        if (clcf->handler) {
+            r->content_handler = clcf->handler;
+        }
+    }
+
+这里可以看到如果loc_conf(即clcf)里本身已注册了handler,则把这个函数赋予r->content_handler.
+
+
+#### 通过FastCGI转发php请求
+我们来看fastCGI模块的内容,
+ngx_http_fastcgi_module.c
+
+    static ngx_http_module_t  ngx_http_fastcgi_module_ctx = {
+        ngx_http_fastcgi_add_variables,        /* preconfiguration */
+        NULL,                                  /* postconfiguration */
+
+        ngx_http_fastcgi_create_main_conf,     /* create main configuration */
+        NULL,                                  /* init main configuration */
+
+        NULL,                                  /* create server configuration */
+        NULL,                                  /* merge server configuration */
+
+        ngx_http_fastcgi_create_loc_conf,      /* create location configuration */
+        ngx_http_fastcgi_merge_loc_conf        /* merge location configuration */
+    };
+
+这里最后一个ngx_http_fastcgi_merge_loc_conf就是我们要找的注册了loc_conf的handler,而nginx在初始化配置阶段会调用这个merge location 函数[引用NGINX网络IO模块].
+
+    ngx_http_fastcgi_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
+    {
+        ...
+        clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+        ...
+        if (clcf->lmt_excpt && clcf->handler == NULL
+            && (conf->upstream.upstream || conf->fastcgi_lengths))
+        {
+            clcf->handler = ngx_http_fastcgi_handler;
+        }
+        ...
+    }
+
+这里可以看到clcf的handler是ngx_http_fastcgi_handler.
+
+    ngx_http_fastcgi_handler
+    ->  rc = ngx_http_read_client_request_body(r, ngx_http_upstream_init);
+        ->  rc = ngx_http_do_read_client_request_body(r);
+            ->  rc = ngx_http_request_body_filter(r, &out);
