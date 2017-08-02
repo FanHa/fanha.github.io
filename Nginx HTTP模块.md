@@ -317,7 +317,107 @@ ngx_http_fastcgi_module.c
 
 这里可以看到clcf的handler是ngx_http_fastcgi_handler.
 
-    ngx_http_fastcgi_handler
-    ->  rc = ngx_http_read_client_request_body(r, ngx_http_upstream_init);
-        ->  rc = ngx_http_do_read_client_request_body(r);
-            ->  rc = ngx_http_request_body_filter(r, &out);
+#### ngx_http_fastcgi_handler
+ngx_http_fastcgi_module.c
+
+    ngx_http_fastcgi_handler(ngx_http_request_t *r)
+    {
+        ...
+        ngx_http_upstream_t           *u;
+        ...
+        if (ngx_http_upstream_create(r) != NGX_OK) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        ...
+        u = r->upstream;
+        ...
+        u->create_request = ngx_http_fastcgi_create_request;
+        u->reinit_request = ngx_http_fastcgi_reinit_request;
+        u->process_header = ngx_http_fastcgi_process_header;
+        u->abort_request = ngx_http_fastcgi_abort_request;
+        u->finalize_request = ngx_http_fastcgi_finalize_request;
+        ...
+        rc = ngx_http_read_client_request_body(r, ngx_http_upstream_init);
+        ...
+    }
+
+首先ngx_http_upstream_create初始创建upsteam(主要是分配内存空间和几个数值参数),然后注册了upstream的一些回调函数,最后调用ngx_http_read_client_request_body处理请求.  
+注意这里ngx_http_read_client_request_body的第二个参数 ngx_http_upstream_init是一个函数.
+
+ngx_http_request_body.c
+
+    ngx_http_read_client_request_body(ngx_http_request_t *r,
+        ngx_http_client_body_handler_pt post_handler)
+    {
+        ...
+        if (r != r->main || r->request_body || r->discard_body) {
+            r->request_body_no_buffering = 0;
+            post_handler(r);
+            return NGX_OK;
+        }
+        ...
+    }
+这里直接调用了作为参数传进来的post_handler,也就是前面的ngx_http_upstream_init.
+
+#### ngx_http_upstream_init
+ngx_http_upstream.c
+
+    ngx_http_upstream_init(ngx_http_request_t *r)
+    {
+        ngx_connection_t     *c;
+        c = r->connection;
+        ...
+        if (ngx_event_flags & NGX_USE_CLEAR_EVENT) {
+
+            if (!c->write->active) {
+                if (ngx_add_event(c->write, NGX_WRITE_EVENT, NGX_CLEAR_EVENT)
+                    == NGX_ERROR)
+                {
+                    ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+                    return;
+                }
+            }
+        }
+
+        ngx_http_upstream_init_request(r);
+    }
+    
+这里可以看到先注册了一个写事件到异步IO(epoll)里,然后接着处理请求.
+
+    ngx_http_upstream_init_request(ngx_http_request_t *r)
+    {
+        ...
+        ngx_http_upstream_t            *u;
+        ...
+        u = r->upstream;
+        ...
+        if (u->create_request(r) != NGX_OK) {
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return;
+        }
+        ...
+        ngx_http_upstream_connect(r, u);
+        ...
+    }
+---
+    ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
+    {
+        ngx_connection_t  *c;
+        ...
+        rc = ngx_event_connect_peer(&u->peer);
+        ...
+        c = u->peer.connection;
+
+        c->data = r;
+        ...
+        c->write->handler = ngx_http_upstream_handler;
+        c->read->handler = ngx_http_upstream_handler;
+
+        u->write_event_handler = ngx_http_upstream_send_request_handler;
+        u->read_event_handler = ngx_http_upstream_process_header;
+
+        c->sendfile &= r->connection->sendfile;
+        u->output.sendfile = c->sendfile;
+        ...
+        ngx_http_upstream_send_request(r, u, 1);
+    }
