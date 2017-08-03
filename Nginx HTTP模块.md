@@ -264,7 +264,8 @@ ngx_http_core_module.c
         rc = ph->handler(r);
         ...
     }
-这里可以看到这个阶段先判断r->content_handler是否存在,只有在不存在content_handler时才会调用ph->handler,那么这个content_handler什么时候会存在呢,转发fastCGI或者获取静态文件时,会存在.  
+这里可以看到这个阶段先判断r->content_handler是否存在,只有在不存在content_handler时才会调用ph->handler.  
+那么这个content_handler什么时候会存在呢?转发fastCGI或者获取静态文件时,会存在.   
 在往前看phase处理代码,找到NGX_HTTP_FIND_CONFIG_PHASE阶段的check函数ngx_http_core_find_config_phase,这个函数调用了ngx_http_update_location_config.
 
 ngx_http_core_module.c  
@@ -382,7 +383,7 @@ ngx_http_upstream.c
         ngx_http_upstream_init_request(r);
     }
     
-这里可以看到先注册了一个写事件到异步IO(epoll)里,然后接着处理请求.
+上面代码可以看到先注册了一个写事件到异步IO(epoll)里,然后接着处理请求.
 
     ngx_http_upstream_init_request(ngx_http_request_t *r)
     {
@@ -421,3 +422,77 @@ ngx_http_upstream.c
         ...
         ngx_http_upstream_send_request(r, u, 1);
     }
+
+上面代码看到注册了一些事件回调函数后,调用ngx_http_upstream_send_request.
+
+    ngx_http_upstream_send_request(ngx_http_request_t *r, ngx_http_upstream_t *u,
+        ngx_uint_t do_write)
+    {
+        ...
+        rc = ngx_http_upstream_send_request_body(r, u, do_write);
+        ...
+        ngx_add_timer(c->read, u->conf->read_timeout);
+
+        if (c->read->ready) {
+            ngx_http_upstream_process_header(r, u);
+            return;
+        }
+        ...
+    }
+上面代码将请求转发给上游(如php-fpm),然后加了个时间事件处理上游返回的内容;(注:这里有点疑问,以后细看)
+但如果这个时候,读事件(c->read->ready)已经ready里,直接调用处理返回内容的函数ngx_http_upstream_process_header.
+
+#### ngx_http_upstream_process_header
+ngx_http_upstream.c
+
+    ngx_http_upstream_process_header(ngx_http_request_t *r, ngx_http_upstream_t *u)
+    {
+        ...
+        for ( ;; ) {
+
+            n = c->recv(c, u->buffer.last, u->buffer.end - u->buffer.last);
+            ...
+            rc = u->process_header(r);
+            ...
+        }
+        ...
+        /* rc == NGX_OK */
+        ...
+        if (!r->subrequest_in_memory) {
+            ngx_http_upstream_send_response(r, u);
+            return;
+        }
+        ...
+    }
+
+上面代码从上游(php-fpm)获取数据,然后把处理结果通过ngx_http_upstream_send_response返回个客户端.
+
+    ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
+    {
+        ...
+        ngx_http_upstream_process_non_buffered_downstream(r);
+        ...
+    }
+---
+    ngx_http_upstream_process_non_buffered_downstream(ngx_http_request_t *r)
+    {
+        ngx_http_upstream_process_non_buffered_request(r, 1);
+    }
+---
+    ngx_http_upstream_process_non_buffered_request(ngx_http_request_t *r,
+        ngx_uint_t do_write)
+    {
+        ...
+        rc = ngx_http_output_filter(r, u->out_bufs);
+        ...
+        if (ngx_handle_write_event(downstream->write, clcf->send_lowat)
+                != NGX_OK){
+                    ...
+                }
+        ...
+    }
+由上面代码可以看到,上游返回的内容加到了写回客户端的buff中,然后添加了一个写事件,写回客户端.至此http模块的处理内容结束.
+
+### 总结
+这篇笔记摈弃了很多处理的分支(如缓存,如一个请求需要发多个包才能把内容传输完,各种错误处理等等),只分析了最简单的,从客户端发了一个请求到nginx,nginx把请求发送给上游php-fpm,php-fpm返回给nginx,nginx再把结果返回给客户端.
+
