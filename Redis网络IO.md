@@ -15,12 +15,12 @@ redis处理一个简单普通命令(如 "get X")的网络IO流程如下:
 
 ### 主循环
 server.c
-
+```c
     aeSetBeforeSleepProc(server.el,beforeSleep);
     aeMain(server.el);
     aeDeleteEventLoop(server.el);
 
----
+//
     void aeMain(aeEventLoop *eventLoop) {
         eventLoop->stop = 0;
         while (!eventLoop->stop) {
@@ -29,7 +29,7 @@ server.c
             aeProcessEvents(eventLoop, AE_ALL_EVENTS);
         }
     }
-
+```
 这里aeProcessEvents就是真正的执行函数
 
 ae.c
@@ -50,7 +50,7 @@ ae.c
 
 从函数的注释中可以看出，每一次循环会先执行所有的TIME EVENT,然后执行所有的FILE EVENT,此次笔记主要关注redis接收请求和回复请求的网络IO,所以只关注FILE EVENT,FILE EVENT的执行流程如下  
 ae.c  
-
+```c
     numevents = aeApiPoll(eventLoop, tvp);
     for (j = 0; j < numevents; j++) {
         aeFileEvent *fe = &eventLoop->events[eventLoop->fired[j].fd];
@@ -68,7 +68,7 @@ ae.c
         }
          processed++;
     }
-
+```
 aeApiPoll(eventLoop, tvp)通过更底层的异步IO方式(目前Redis有4种可选IO:epoll,evport,kqueue,select,打算再在另一个笔记里理清不同IO方式的优劣__TODO__)取得此次循环将要处理的事件,并将事件添加到eventloop->fired[]里，并通过循环每个事件,执行事件里事先注册的 rFileProc 或者 wFileProc函数，完成一次循环。
 >注:这里的读和写,是指redis读取客户端发送的命令,和往客户端写客户端请求的数据.  
 
@@ -79,9 +79,9 @@ aeApiPoll(eventLoop, tvp)通过更底层的异步IO方式(目前Redis有4种可�
 前面知道,aeApiPoll通过eventloop里的信息来循环调用读，写事件，那eventloop里的事件是什么时候，从哪里来的呢？把代码回到server.c,找到在调用循环前的initServer();
 
 server.c  
-
+```c
     initServer();
----
+//
     void initServer(void) {
         ...
         server.el = aeCreateEventLoop(server.maxclients+CONFIG_FDSET_INCR);
@@ -97,17 +97,17 @@ server.c
         }
         ...
     }
-
+```
 由此可以看到在initServer()调用封装的aeApiCreate创建更底层IO方式epoll,evport,kqueue,select创建了eventloop,并通过aeCreateFileEvent()函数创建对新的TCP连接的可读监听;即当一个客户发送与服务器开放的端口建立的TCP连接的请求,服务器收到了客户端发送的字符串,此时,会把这个这个事件,和事件的内容(字符串),存在eventloop里,并指定了以后循环此事件的函数acceptTcpHandler.
 
 ae.c
-
+```c
     aeEventLoop *aeCreateEventLoop(int setsize) {
         ...
         if (aeApiCreate(eventLoop) == -1) goto err;
         ...
     }
----
+//
     int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
         aeFileProc *proc, void *clientData)
     {
@@ -127,12 +127,13 @@ ae.c
             eventLoop->maxfd = fd;
         return AE_OK;
     }
+```
 - aeApiCreate是对创建底层IO方式epoll,evport,kqueue,select的一种封装(引用)__TODO__;
 - aeCreateFileEvent通过判断mask(这里是READABLE),指定rfileProc为acceptTcpHandler.
 
 我们再次回到开始循环处理事件的地方  
 ae.c  
-
+```c
     numevents = aeApiPoll(eventLoop, tvp);
     for (j = 0; j < numevents; j++) {
         aeFileEvent *fe = &eventLoop->events[eventLoop->fired[j].fd];
@@ -150,10 +151,11 @@ ae.c
         }
          processed++;
     }
+```
 aeApiPoll取出了客户端发送的TCP连接请求这个事件和字符串内容后,调用了rfileProc也就是acceptTcpHandler函数,来建立TCP连接,并做后续的处理.
 
 networking.c
-
+```c
     void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
         int cport, cfd, max = MAX_ACCEPTS_PER_CALL;
         ...
@@ -166,8 +168,9 @@ networking.c
             acceptCommonHandler(cfd,0,cip);
         }
     }
+```
 ---
-
+```c
     static void acceptCommonHandler(int fd, int flags, char *ip) {
         client *c;
         if ((c = createClient(fd)) == NULL) {
@@ -175,7 +178,9 @@ networking.c
         }
         ...
     }
+```
 ---
+```c
     client *createClient(int fd) {
         client *c = zmalloc(sizeof(client));
 
@@ -208,7 +213,7 @@ networking.c
         initClientMultiState(c);
         return c;
     }
-
+```
 由上面的源码,服务器接受TCP连接,根据accept后的套接字fd,创建一个客户连接,然后调用aeCreateFileEvent注册一个可读的事件,并配以readQueryFromClient函数,并把新的客户连接 listAddNodeTail(server.clients,c)添加到服务器管理的客户连接队列中.这样下一次客户端传来redis命令(比如 "set a 10"),就会触发eventloop里的事件,在redis的主循环里就会调用readQueryFromClient函数来出来这次请求.
 
 ### readQueryFromClient
@@ -216,6 +221,7 @@ redis服务器与客户端建立TCP连接后,监听了客户端后续发送的�
 
 networking.c  
 
+```c
     void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
         ...
         c->querybuf = sdsMakeRoomFor(c->querybuf, readlen);
@@ -223,7 +229,9 @@ networking.c
         ...
         processInputBuffer(c);
     }
+```
 ---
+```c
     void processInputBuffer(client *c) {
         ...
         while(sdslen(c->querybuf)) {
@@ -239,10 +247,11 @@ networking.c
         }
         server.current_client = NULL;
     }
+```
 去掉其他辅助的处理,可以看函数将套接字请求里的内容读取到了 c->querybuf中,然后 processInputBuffer(c)处理请求内容;processInputBuffer经过一些前置性的辅助处理后,最终调用processCommand(C)来处理命令;
 
 server.c  
-
+```c
     int processCommand(client *c) {
         ...
         c->cmd = c->lastcmd = lookupCommand(c->argv[0]->ptr);
@@ -261,21 +270,26 @@ server.c
         }
         return C_OK;
     }
+```
 ---
+```c
     void call(client *c, int flags) {
         ...
         c->cmd->proc(c);
         ...
     ｝
+```
 processCommand解析命令,找到命令将调用的函数,检测排除各种可能的错误,到call(c,CMD_CALL_FULL)函数执行;call函数里,调用了之前动态查找到的命令函数.  
 注意,这里call函数并没有返回结果,那么服务器怎么把命令的结果返回给客户端呢?这里以最基本的命令"get X"为例;这个命令在t_string.c文件的对应函数是void getCommand(client *c).
 
 t_string.c
-
+```c
     void getCommand(client *c) {
         getGenericCommand(c);
     }
+```
 ---
+```c
     int getGenericCommand(client *c) {
         robj *o;
 
@@ -289,17 +303,19 @@ t_string.c
             return C_OK;
         }
     }
-
+```
 函数将命令调用返回的结果通过addReplyBulk(c,o)交给了client结构处理.
 
 networking.c
-
+```c
     void addReplyBulk(client *c, robj *obj) {
         addReplyBulkLen(c,obj);
         addReply(c,obj);
         addReply(c,shared.crlf);
     }
+```
 ---
+```c
     void addReply(client *c, robj *obj) {
         if (prepareClientToWrite(c) != C_OK) return;
         ...
@@ -320,12 +336,12 @@ networking.c
             serverPanic("Wrong obj->encoding in addReply()");
         }
     }
-
+```
 首先通过prepareClientToWrite(c) 把客户端加到需要回复请求的队列里 ,然后把要写的内容通过_addReplyObjectToList加到相应的buff区. 
 >在这里,我本以为会注册一个写事件,这样下一次程序主循环会触发这个写事件并返回内容到客户端,但实际上源码并没有这样做,于是带着疑问又回到主循环的代码.
 
 ae.c  
-
+```c
     void aeMain(aeEventLoop *eventLoop) {
         eventLoop->stop = 0;
         while (!eventLoop->stop) {
@@ -334,24 +350,26 @@ ae.c
             aeProcessEvents(eventLoop, AE_ALL_EVENTS);
         }
     }
-
+```
 在这里发现在aeProcessEvent函数前面调用了 eventLoop->beforesleep(eventLoop),回溯到这个函数的注册和原型.
 
 server.c
-
+```c
     aeSetBeforeSleepProc(server.el,beforeSleep);
     aeMain(server.el);
     aeDeleteEventLoop(server.el);
+```
 ---
+```c
     void beforeSleep(struct aeEventLoop *eventLoop) {
         ...
         /* Handle writes with pending output buffers. */
         handleClientsWithPendingWrites();
     }
-
+```
 
 networking.c
-
+```c
     int handleClientsWithPendingWrites(void) {
         ...
         while((ln = listNext(&li))) {
@@ -370,7 +388,7 @@ networking.c
         }
         return processed;
     }
-
+```
 从这个流程可以看出,redis服务器先尝试直接向客户端写,如果遇到了问题(可能某些命令需要后续的返回),才会注册一个写事件,以便再下一次主循环时触发这个事件,把内容返回给客户端.
 
 

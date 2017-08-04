@@ -9,7 +9,7 @@ ngx_conf_param
 ngx_http_block函数首先调用每个HTTP模块的一些回调函数.
 
 ngx_http.c
-
+```c
     ngx_http_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     {
         ...
@@ -61,18 +61,20 @@ ngx_http.c
         }
         ...
     }
-
+```
 然后切换cmd_type调用下一层(NGX_HTTP_MAIN_CONF)的cmd回调函数.
 
-
+```c
     /* parse inside the http{} block */
 
     cf->module_type = NGX_HTTP_MODULE;
     cf->cmd_type = NGX_HTTP_MAIN_CONF;
     rv = ngx_conf_parse(cf, NULL);
+```
 
 接着调用每个HTTP模块的init_main_conf函数,并ngx_http_merge_servers.(这里我认为应该是nginx配置文件里可能里,外层定义了同样的变量,会合并去掉这个冗余的变量,但这里暂时不深究.)
 
+```c
     for (m = 0; cf->cycle->modules[m]; m++) {
         if (cf->cycle->modules[m]->type != NGX_HTTP_MODULE) {
             continue;
@@ -95,11 +97,12 @@ ngx_http.c
             goto failed;
         }
     }
-
+```
 
 接下来到了http模块初始化的的核心循环.
 nginx把处理http请求放在了一个一个的按顺序排列的phase阶段里,每个http模块可以把处理http请求的方法注册到某个phase里.当nginx把请求转发给HTTP模块处理流程后,依次调用每个phase里的处理方法,完成对http请求的处理.
 
+```c
     if (ngx_http_init_phases(cf, cmcf) != NGX_OK) {
         return NGX_CONF_ERROR;
     }
@@ -122,6 +125,7 @@ nginx把处理http请求放在了一个一个的按顺序排列的phase阶段里
     if (ngx_http_init_phase_handlers(cf, cmcf) != NGX_OK) {
         return NGX_CONF_ERROR;
     }
+```
 
 + postconfiguration回调:  
     每个http模块在这个回调函数里把自己想要在哪个phase阶段,用哪个函数处理注册到 main_conf里.
@@ -129,7 +133,7 @@ nginx把处理http请求放在了一个一个的按顺序排列的phase阶段里
     把放在main_conf里的回调函数取出来,按照注册的信息依次放到每个phase,并附上相应的check函数.
 
 ngx_http.c
-
+```c
     ngx_http_init_phase_handlers(ngx_conf_t *cf, ngx_http_core_main_conf_t *cmcf)
     {
         ...
@@ -219,11 +223,12 @@ ngx_http.c
 
         return NGX_OK;
     }
+```
 
 #### 怎样进入http模块的处理流程
-nginx建立好tcp连接后对http请求的处理最终会进入到ngx_http_core_run_phases函数(怎么到这一步参考[引用nginx网络IO]).这里就是调用每个phase的回掉函数,并通过前面注册的check函数判断是否进入下一个phase阶段的处理或者返回.  
+nginx建立好tcp连接后对http请求的处理最终会进入到ngx_http_core_run_phases函数(怎么到这一步参考[Nginx 源码阅读笔记 网络IO](https://fanha.github.io/nginx%E7%BD%91%E7%BB%9CIO)).这里就是调用每个phase的回掉函数,并通过前面注册的check函数判断是否进入下一个phase阶段的处理或者返回.  
 ngx_http_core_module.c
-
+```c
     ngx_http_core_run_phases(ngx_http_request_t *r)
     {
         ngx_int_t                   rc;
@@ -243,11 +248,13 @@ ngx_http_core_module.c
             }
         }
     }
+```
 
 ### nginx转发php请求和静态文件请求
 上面处理http模块的phase的NGX_HTTP_CONTENT_PHASE阶段时,调用check函数是 ngx_http_core_content_phase.
 
 ngx_http_core_module.c
+```c
     ngx_http_core_content_phase(ngx_http_request_t *r,
         ngx_http_phase_handler_t *ph)
     {
@@ -264,12 +271,13 @@ ngx_http_core_module.c
         rc = ph->handler(r);
         ...
     }
+```
 这里可以看到这个阶段先判断r->content_handler是否存在,只有在不存在content_handler时才会调用ph->handler.  
 那么这个content_handler什么时候会存在呢?转发fastCGI或者获取静态文件时,会存在.   
 在往前看phase处理代码,找到NGX_HTTP_FIND_CONFIG_PHASE阶段的check函数ngx_http_core_find_config_phase,这个函数调用了ngx_http_update_location_config.
 
 ngx_http_core_module.c  
-
+```c
     ngx_http_update_location_config(ngx_http_request_t *r){
         ngx_http_core_loc_conf_t  *clcf;
 
@@ -279,14 +287,14 @@ ngx_http_core_module.c
             r->content_handler = clcf->handler;
         }
     }
-
+```
 这里可以看到如果loc_conf(即clcf)里本身已注册了handler,则把这个函数赋予r->content_handler.
 
 
 #### 通过FastCGI转发php请求
 我们来看fastCGI模块的内容,
 ngx_http_fastcgi_module.c
-
+```c
     static ngx_http_module_t  ngx_http_fastcgi_module_ctx = {
         ngx_http_fastcgi_add_variables,        /* preconfiguration */
         NULL,                                  /* postconfiguration */
@@ -300,9 +308,11 @@ ngx_http_fastcgi_module.c
         ngx_http_fastcgi_create_loc_conf,      /* create location configuration */
         ngx_http_fastcgi_merge_loc_conf        /* merge location configuration */
     };
+```
 
-这里最后一个ngx_http_fastcgi_merge_loc_conf就是我们要找的注册了loc_conf的handler,而nginx在初始化配置阶段会调用这个merge location 函数[引用NGINX网络IO模块].
+这里最后一个ngx_http_fastcgi_merge_loc_conf就是我们要找的注册了loc_conf的handler,而nginx在初始化配置阶段会调用这个merge location 函数[Nginx 源码阅读笔记 网络IO](https://fanha.github.io/nginx%E7%BD%91%E7%BB%9CIO).
 
+```c
     ngx_http_fastcgi_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     {
         ...
@@ -315,12 +325,12 @@ ngx_http_fastcgi_module.c
         }
         ...
     }
-
+```
 这里可以看到clcf的handler是ngx_http_fastcgi_handler.
 
 #### ngx_http_fastcgi_handler
 ngx_http_fastcgi_module.c
-
+```c
     ngx_http_fastcgi_handler(ngx_http_request_t *r)
     {
         ...
@@ -341,12 +351,12 @@ ngx_http_fastcgi_module.c
         rc = ngx_http_read_client_request_body(r, ngx_http_upstream_init);
         ...
     }
-
+```
 首先ngx_http_upstream_create初始创建upsteam(主要是分配内存空间和几个数值参数),然后注册了upstream的一些回调函数,最后调用ngx_http_read_client_request_body处理请求.  
 注意这里ngx_http_read_client_request_body的第二个参数 ngx_http_upstream_init是一个函数.
 
 ngx_http_request_body.c
-
+```c
     ngx_http_read_client_request_body(ngx_http_request_t *r,
         ngx_http_client_body_handler_pt post_handler)
     {
@@ -358,11 +368,12 @@ ngx_http_request_body.c
         }
         ...
     }
+```
 这里直接调用了作为参数传进来的post_handler,也就是前面的ngx_http_upstream_init.
 
 #### ngx_http_upstream_init
 ngx_http_upstream.c
-
+```c
     ngx_http_upstream_init(ngx_http_request_t *r)
     {
         ngx_connection_t     *c;
@@ -382,9 +393,9 @@ ngx_http_upstream.c
 
         ngx_http_upstream_init_request(r);
     }
-    
+ ```   
 上面代码可以看到先注册了一个写事件到异步IO(epoll)里,然后接着处理请求.
-
+```c
     ngx_http_upstream_init_request(ngx_http_request_t *r)
     {
         ...
@@ -400,7 +411,9 @@ ngx_http_upstream.c
         ngx_http_upstream_connect(r, u);
         ...
     }
+```
 ---
+```c
     ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
     {
         ngx_connection_t  *c;
@@ -422,9 +435,9 @@ ngx_http_upstream.c
         ...
         ngx_http_upstream_send_request(r, u, 1);
     }
-
+```
 上面代码看到注册了一些事件回调函数后,调用ngx_http_upstream_send_request.
-
+```c
     ngx_http_upstream_send_request(ngx_http_request_t *r, ngx_http_upstream_t *u,
         ngx_uint_t do_write)
     {
@@ -439,12 +452,13 @@ ngx_http_upstream.c
         }
         ...
     }
+```
 上面代码将请求转发给上游(如php-fpm),然后加了个时间事件处理上游返回的内容;(注:这里有点疑问,以后细看)
 但如果这个时候,读事件(c->read->ready)已经ready里,直接调用处理返回内容的函数ngx_http_upstream_process_header.
 
 #### ngx_http_upstream_process_header
 ngx_http_upstream.c
-
+```c
     ngx_http_upstream_process_header(ngx_http_request_t *r, ngx_http_upstream_t *u)
     {
         ...
@@ -464,21 +478,25 @@ ngx_http_upstream.c
         }
         ...
     }
-
+```
 上面代码从上游(php-fpm)获取数据,然后把处理结果通过ngx_http_upstream_send_response返回个客户端.
-
+```c
     ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
     {
         ...
         ngx_http_upstream_process_non_buffered_downstream(r);
         ...
     }
+```
 ---
+```c
     ngx_http_upstream_process_non_buffered_downstream(ngx_http_request_t *r)
     {
         ngx_http_upstream_process_non_buffered_request(r, 1);
     }
+```
 ---
+```c
     ngx_http_upstream_process_non_buffered_request(ngx_http_request_t *r,
         ngx_uint_t do_write)
     {
@@ -491,6 +509,7 @@ ngx_http_upstream.c
                 }
         ...
     }
+```
 由上面代码可以看到,上游返回的内容加到了写回客户端的buff中,然后添加了一个写事件,写回客户端.至此http模块的处理内容结束.
 
 ### 总结
