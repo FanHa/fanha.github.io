@@ -221,7 +221,7 @@ ngx_event.c
 ngx_process_events是个宏,实际调用的是ngx_event_actions.process_events.
 
     #define ngx_process_events   ngx_event_actions.process_events
-这个ngx_event_actions是根据不同的异步IO方式封装的一层函数组,这里我们只考虑epoll的情况:
+这个ngx_event_actions是根据不同的多路复用IO方式封装的一层函数组,这里我们只考虑epoll的情况:
 ngx_epoll_module.c
 ```c
     ngx_epoll_init(ngx_cycle_t *cycle, ngx_msec_t timer)
@@ -291,7 +291,7 @@ ngx_epoll_module.c
     }
 ```
 
-从epoll异步IO系统中取出事件,然后根据类别调用读(或写)事件的回调函数(rev->handler,wev->handler),那么这个回调函数是在哪里被注册的呢,这里可以回过头来[跳到跳转1],ngx_event_core_module模块的init_process回调函数ngx_event_process_init有初始建立连接的回调函数.
+从epoll多路复用IO系统中取出事件,然后根据类别调用读(或写)事件的回调函数(rev->handler,wev->handler),那么这个回调函数是在哪里被注册的呢,这里可以回过头来[跳到跳转1],ngx_event_core_module模块的init_process回调函数ngx_event_process_init有初始建立连接的回调函数.
 
 #### ngx_event_process_init
 ngx_event.c
@@ -415,7 +415,7 @@ ngx_http_request.c
     }
 ```
 这里为了解析方便,省略掉了很多旁支的处理,如ssl,如tcp连接复用,等等.
-通过ngx_handle_read_event异步IO循环里注册了一个新的读事件,这个读事件的回调函数是ngx_http_wait_request_handler,这样下次客户端发送信息到nginx,在主循环里,执行这个信息处理的回调函数就是ngx_http_wait_request_handler.
+通过ngx_handle_read_event多路复用IO循环里注册了一个新的读事件,这个读事件的回调函数是ngx_http_wait_request_handler,这样下次客户端发送信息到nginx,在主循环里,执行这个信息处理的回调函数就是ngx_http_wait_request_handler.
 
 #### ngx_http_wait_request_handler
 ngx_http_request.c

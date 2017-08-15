@@ -394,7 +394,7 @@ ngx_http_upstream.c
         ngx_http_upstream_init_request(r);
     }
  ```   
-上面代码可以看到先注册了一个写事件到异步IO(epoll)里,然后接着处理请求.
+上面代码可以看到先注册了一个写事件到多路复用IO(epoll)里,然后接着处理请求.
 ```c
     ngx_http_upstream_init_request(ngx_http_request_t *r)
     {
