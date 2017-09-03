@@ -3,7 +3,7 @@
 
 ### 概论
 
-Redis是单线程执行,server.c中的main函数在正常运行的情况下会进入死循环.  
+Redis是单线程执行,server.c中的main函数在正常运行的情况下会进入一个无限循环.  
 redis处理一个简单普通命令(如 "get X")的网络IO流程如下:  
 1.redis服务器在主循环前监听某端口,注册一个读事件,配以处理tcp连接的函数;  
 2.客户端发起tcp连接,服务器在主循环中检测到这个事件,触发处理tcp连接函数,在这个函数里,注册了另外的读事件,配以处理redis命令的函数;  
@@ -20,7 +20,7 @@ server.c
     aeMain(server.el);
     aeDeleteEventLoop(server.el);
 
-//
+//...
     void aeMain(aeEventLoop *eventLoop) {
         eventLoop->stop = 0;
         while (!eventLoop->stop) {
@@ -32,21 +32,23 @@ server.c
 ```
 这里aeProcessEvents就是真正的执行函数
 
-ae.c
-> /* Process every pending time event, then every pending file event
->  (that may be registered by time event callbacks just processed).
->  Without special flags the function sleeps until some file event
->  fires, or when the next time event occurs (if any).
-> 
->  * If flags is 0, the function does nothing and returns.
->  * if flags has AE_ALL_EVENTS set, all the kind of events are processed.
->  * if flags has AE_FILE_EVENTS set, file events are processed.
->  * if flags has AE_TIME_EVENTS set, time events are processed.
->  * if flags has AE_DONT_WAIT set the function returns ASAP until all
-> the events that's possible to process without to wait are processed.
-> 
-> The function returns the number of events >processed. */    
->   int aeProcessEvents(aeEventLoop *eventLoop, int flags)
+```c
+/* ae.c */
+/* Process every pending time event, then every pending file event
+  (that may be registered by time event callbacks just processed).
+  Without special flags the function sleeps until some file event
+  fires, or when the next time event occurs (if any).
+ 
+  * If flags is 0, the function does nothing and returns.
+  * if flags has AE_ALL_EVENTS set, all the kind of events are processed.
+  * if flags has AE_FILE_EVENTS set, file events are processed.
+  * if flags has AE_TIME_EVENTS set, time events are processed.
+  * if flags has AE_DONT_WAIT set the function returns ASAP until all
+ the events that's possible to process without to wait are processed.
+ 
+ The function returns the number of events >processed. */    
+int aeProcessEvents(aeEventLoop *eventLoop, int flags)
+```
 
 从函数的注释中可以看出，每一次循环会先执行所有的TIME EVENT,然后执行所有的FILE EVENT,此次笔记主要关注redis接收请求和回复请求的网络IO,所以只关注FILE EVENT,FILE EVENT的执行流程如下  
 ae.c  
@@ -69,23 +71,27 @@ ae.c
          processed++;
     }
 ```
-aeApiPoll(eventLoop, tvp)通过更底层的多路复用IO方式(目前Redis有4种可选IO:epoll,evport,kqueue,select,打算再在另一个笔记里理清不同IO方式的优劣__TODO__)取得此次循环将要处理的事件,并将事件添加到eventloop->fired[]里，并通过循环每个事件,执行事件里事先注册的 rFileProc 或者 wFileProc函数，完成一次循环。
+aeApiPoll(eventLoop, tvp)通过更底层的多路复用IO方式(目前Redis有4种可选IO:epoll,evport,kqueue,select,见 [阻塞与非阻塞,异步与同步,select(poll)与epoll](https://fanha.github.io/%E9%98%BB%E5%A1%9E%E4%B8%8E%E9%9D%9E%E9%98%BB%E5%A1%9E,%E5%BC%82%E6%AD%A5%E4%B8%8E%E5%90%8C%E6%AD%A5,select(poll)%E4%B8%8Eepoll))取得此次循环将要处理的事件,并将事件添加到eventloop->fired[]里，并通过循环每个事件,执行事件里事先注册的 rFileProc 或者 wFileProc函数，完成一次循环。
 >注:这里的读和写,是指redis读取客户端发送的命令,和往客户端写客户端请求的数据.  
 
-笔记到这里有几个疑问:1,eventloop里的事件从哪里来?2,读取了事件里的内容(比如执行"get a"),执行的程序做了什么,或把?3,写事件把要返回给客户端的内容写到了哪里,怎么传回客户端
+这里有几个疑问:
+1. eventloop里的事件从哪里来?
+2. 读取了事件里的内容(比如执行"get a"),执行的程序做了什么,或把?
+3. 写事件把要返回给客户端的内容写到了哪里,怎么传回客户端
 
 
 ### EVENTLOOP
 前面知道,aeApiPoll通过eventloop里的信息来循环调用读，写事件，那eventloop里的事件是什么时候，从哪里来的呢？把代码回到server.c,找到在调用循环前的initServer();
 
-server.c  
+ 
 ```c
+/* server.c */
     initServer();
-//
+    //...
     void initServer(void) {
-        ...
+        //...
         server.el = aeCreateEventLoop(server.maxclients+CONFIG_FDSET_INCR);
-        ...
+        //...
         /* Create an event handler for accepting new connections in TCP and Unix domain sockets. */
         for (j = 0; j < server.ipfd_count; j++) {
             if (aeCreateFileEvent(server.el, server.ipfd[j], AE_READABLE,
@@ -95,19 +101,19 @@ server.c
                     "Unrecoverable error creating server.ipfd file event.");
                 }
         }
-        ...
+        //...
     }
 ```
-由此可以看到在initServer()调用封装的aeApiCreate创建更底层IO方式epoll,evport,kqueue,select创建了eventloop,并通过aeCreateFileEvent()函数创建对新的TCP连接的可读监听;即当一个客户发送与服务器开放的端口建立的TCP连接的请求,服务器收到了客户端发送的字符串,此时,会把这个这个事件,和事件的内容(字符串),存在eventloop里,并指定了以后循环此事件的函数acceptTcpHandler.
+由此可以看到在initServer()调用封装的aeApiCreate创建更底层IO方式epoll,evport,kqueue,select创建了eventloop,并通过aeCreateFileEvent()函数创建对新的TCP连接的可读监听;即当一个客户发送与服务器开放的端口建立的TCP连接的请求,服务器收到了客户端发送的字符串,此时,会把这个事件,和事件的内容(字符串),存在eventloop里,并指定了以后循环此事件的函数acceptTcpHandler.
 
-ae.c
 ```c
+/* ae.c */
     aeEventLoop *aeCreateEventLoop(int setsize) {
         ...
         if (aeApiCreate(eventLoop) == -1) goto err;
         ...
     }
-//
+    //...
     int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
         aeFileProc *proc, void *clientData)
     {
@@ -128,12 +134,12 @@ ae.c
         return AE_OK;
     }
 ```
-- aeApiCreate是对创建底层IO方式epoll,evport,kqueue,select的一种封装(引用)__TODO__;
+- aeApiCreate是对创建底层IO方式epoll,evport,kqueue,select的一种封装(引用)见 [阻塞与非阻塞,异步与同步,select(poll)与epoll](https://fanha.github.io/%E9%98%BB%E5%A1%9E%E4%B8%8E%E9%9D%9E%E9%98%BB%E5%A1%9E,%E5%BC%82%E6%AD%A5%E4%B8%8E%E5%90%8C%E6%AD%A5,select(poll)%E4%B8%8Eepoll);
 - aeCreateFileEvent通过判断mask(这里是READABLE),指定rfileProc为acceptTcpHandler.
 
 我们再次回到开始循环处理事件的地方  
-ae.c  
 ```c
+/* ae.c */
     numevents = aeApiPoll(eventLoop, tvp);
     for (j = 0; j < numevents; j++) {
         aeFileEvent *fe = &eventLoop->events[eventLoop->fired[j].fd];
@@ -214,14 +220,13 @@ networking.c
         return c;
     }
 ```
-由上面的源码,服务器接受TCP连接,根据accept后的套接字fd,创建一个客户连接,然后调用aeCreateFileEvent注册一个可读的事件,并配以readQueryFromClient函数,并把新的客户连接 listAddNodeTail(server.clients,c)添加到服务器管理的客户连接队列中.这样下一次客户端传来redis命令(比如 "set a 10"),就会触发eventloop里的事件,在redis的主循环里就会调用readQueryFromClient函数来出来这次请求.
+由上面的源码,服务器接受TCP连接,根据accept后的套接字fd,创建一个客户连接,然后调用aeCreateFileEvent注册一个可读的事件,并配以readQueryFromClient函数,并把新的客户连接 listAddNodeTail(server.clients,c)添加到服务器管理的客户连接队列中.这样下一次客户端传来redis命令(比如 "set a 10"),就会触发eventloop里的事件,在redis的主循环里就会调用readQueryFromClient函数来处理这次请求.
 
 ### readQueryFromClient
 redis服务器与客户端建立TCP连接后,监听了客户端后续发送的请求事件,并注册此事件的执行函数为readQueryFromClient.
 
-networking.c  
-
 ```c
+/* networking.c */
     void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
         ...
         c->querybuf = sdsMakeRoomFor(c->querybuf, readlen);
@@ -229,9 +234,7 @@ networking.c
         ...
         processInputBuffer(c);
     }
-```
----
-```c
+//...
     void processInputBuffer(client *c) {
         ...
         while(sdslen(c->querybuf)) {
@@ -250,8 +253,9 @@ networking.c
 ```
 去掉其他辅助的处理,可以看函数将套接字请求里的内容读取到了 c->querybuf中,然后 processInputBuffer(c)处理请求内容;processInputBuffer经过一些前置性的辅助处理后,最终调用processCommand(C)来处理命令;
 
-server.c  
+
 ```c
+/* server.c */
     int processCommand(client *c) {
         ...
         c->cmd = c->lastcmd = lookupCommand(c->argv[0]->ptr);
@@ -270,9 +274,7 @@ server.c
         }
         return C_OK;
     }
-```
----
-```c
+//...
     void call(client *c, int flags) {
         ...
         c->cmd->proc(c);
@@ -393,6 +395,8 @@ networking.c
 
 
 ### 总结
+>(TODO:直接跳转到开头)  
+
 redis处理一个简单普通命令(如 "get X")的网络IO流程如下:  
 1.redis服务器在主循环前监听某端口,注册一个读事件,配以处理tcp连接的函数;  
 2.客户端发起tcp连接,服务器在主循环中检测到这个事件,触发处理tcp连接函数,在这个函数里,注册了另外的读事件,配以处理redis命令的函数;  
