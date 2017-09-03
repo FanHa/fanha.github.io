@@ -6,6 +6,7 @@
 ### nginx模块(module)
 模块(module)是nginx设计中的重要部分,在代码的很多地方可以看到如下或者类似的循环,通过调用每个模块里的回调函数来一步步处理数据.
 
+```c
     for (i = 0; cycle->modules[i]; i++) {
         if (cycle->modules[i]->type != NGX_CORE_MODULE) {
             continue;
@@ -22,7 +23,7 @@
             cycle->conf_ctx[cycle->modules[i]->index] = rv;
         }
     }
----
+    //...
     for (i = 0; cycle->modules[i]; i++) {
         if (cycle->modules[i]->init_process) {
             if (cycle->modules[i]->init_process(cycle) == NGX_ERROR) {
@@ -31,6 +32,7 @@
             }
         }
     }
+```
 
 #### 模块(module)类型
 nginx有四种类型的模块:core,event,http,mail;  
