@@ -145,7 +145,7 @@ int main(int argc, char *argv[]){
     //...
 }
 //...
-static int php_cli_startup(sapi_module_struct *sapi_module) /* {{{ */
+static int php_cli_startup(sapi_module_struct *sapi_module)
 {
 	if (php_module_startup(sapi_module, NULL, 0)==FAILURE) {
 		return FAILURE;
@@ -164,7 +164,7 @@ static int php_cli_startup(sapi_module_struct *sapi_module) /* {{{ */
 #### do_cli
 ```c
 /* cli/php_cli.c */
-static int do_cli(int argc, char **argv) /* {{{ */
+static int do_cli(int argc, char **argv)
 {
     //...
     if (php_request_startup()==FAILURE) {
