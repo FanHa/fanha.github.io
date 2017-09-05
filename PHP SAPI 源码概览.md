@@ -202,6 +202,111 @@ static int do_cli(int argc, char **argv)
 3. php_request_shutdown函数会根据sapi的不同把php执行结果输出到不同的输出流;
 
 
-### cgi(php-fpm)
+### cgi,fcgi,和php-fpm
+1. cgi:  
+cgi是一种协议格式,客户端把http请求发送给web服务器,web服务器按一定的格式整理好,启动一个cgi程序,cgi程序处理完把结果原路返回;  
+
+	客户端<-->web(http服务器)-->cgi程序
+
+2. fcgi: 
+原始的cgi程序每次处理请求都需要启动一个进程,很耗服务器资源;fcgi是一个与web服务器独立的进程,它自身初始化多个请求处理程序池,重复利用这些处理程序池接受web服务器按一定格式传来的请求,返回结果给web服务器.
+
+	客户端<-->web(http服务器)<-->fcgi程序
+
+3. php-fpm:
+cgi只是一种协议,任何语言都可以有相应的实现,php-fpm就是用来处理php请求的fcgi进程.
+
+#### cgi 和 fcgi
+sapi结构如下
+```c
+/* sapi/cgi/cgi_main.c */
+static sapi_module_struct cgi_sapi_module = {
+	"cgi-fcgi",						/* name */
+	"CGI/FastCGI",					/* pretty name */
+
+	php_cgi_startup,				/* startup */
+	php_module_shutdown_wrapper,	/* shutdown */
+
+	sapi_cgi_activate,				/* activate */
+	sapi_cgi_deactivate,			/* deactivate */
+
+	sapi_cgi_ub_write,				/* unbuffered write */
+	sapi_cgi_flush,					/* flush */
+	NULL,							/* get uid */
+	sapi_cgi_getenv,				/* getenv */
+
+	php_error,						/* error handler */
+
+	NULL,							/* header handler */
+	sapi_cgi_send_headers,			/* send headers handler */
+	NULL,							/* send header handler */
+
+	sapi_cgi_read_post,				/* read POST data */
+	sapi_cgi_read_cookies,			/* read Cookies */
+
+	sapi_cgi_register_variables,	/* register server variables */
+	sapi_cgi_log_message,			/* Log message */
+	NULL,							/* Get request time */
+	NULL,							/* Child terminate */
+
+	STANDARD_SAPI_MODULE_PROPERTIES
+};
+```
+
+基本执行流程
+```c
+/* sapi/cgi/cgi_main.c */
+int main(int argc, char *argv[])
+{
+	//...
+	/* 判断自己是fcgi还是cgi */
+	fastcgi = fcgi_is_fastcgi();
+	//...
+	if (!fastcgi) {
+		/* Make sure we detect we are a cgi - a bit redundancy here,
+		 * but the default case is that we have to check only the first one. */
+		if (getenv("SERVER_SOFTWARE") ||
+			getenv("SERVER_NAME") ||
+			getenv("GATEWAY_INTERFACE") ||
+			getenv("REQUEST_METHOD")
+		) {
+			cgi = 1;
+		}
+	}
+	/* 将请求的query_string保存下来 */
+	if((query_string = getenv("QUERY_STRING")) != NULL && strchr(query_string, '=') == NULL) {
+		/* we've got query string that has no = - apache CGI will pass it to command line */
+		unsigned char *p;
+		decoded_query_string = strdup(query_string);
+		php_url_decode(decoded_query_string, strlen(decoded_query_string));
+		for (p = (unsigned char *)decoded_query_string; *p &&  *p <= ' '; p++) {
+			/* skip all leading spaces */
+		}
+		if(*p == '-') {
+			skip_getopt = 1;
+		}
+		free(decoded_query_string);
+	}
+	//...
+	/* 如果是fcgi将一些sapi函数替换 */
+	if (fastcgi || bindpath) {
+		/* Override SAPI callbacks */
+		cgi_sapi_module.ub_write     = sapi_fcgi_ub_write;
+		cgi_sapi_module.flush        = sapi_fcgi_flush;
+		cgi_sapi_module.read_post    = sapi_fcgi_read_post;
+		cgi_sapi_module.getenv       = sapi_fcgi_getenv;
+		cgi_sapi_module.read_cookies = sapi_fcgi_read_cookies;
+	}
+	//...
+	/* 将要执行的文件路径保存 */
+	cgi_sapi_module.executable_location = argv[0];
+	//...
+	/* 执行sapi结构的startup函数, 这里调用的是php_cgi_startup,实际主要就是执行每个php模块的 MINIT */
+	if (cgi_sapi_module.startup(&cgi_sapi_module) == FAILURE){
+		//...
+	}
+
+}
+```
 ### apache(php_mod)
 
