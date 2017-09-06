@@ -199,7 +199,7 @@ static int do_cli(int argc, char **argv)
 ```
 1. do_cli首先调用php_request_startup函数,这个函数里调用了每个php模块的MINIT函数;
 2. 执行php文件;
-3. php_request_shutdown函数会根据sapi的不同把php执行结果输出到不同的输出流;
+3. php_request_shutdown函数最终会调用sapi结构注册的flush或ub_write函数,以此来区分不同的sapi的输出方式;
 
 
 ### cgi,fcgi,和php-fpm
@@ -304,6 +304,83 @@ int main(int argc, char *argv[])
 	/* 执行sapi结构的startup函数, 这里调用的是php_cgi_startup,实际主要就是执行每个php模块的 MINIT */
 	if (cgi_sapi_module.startup(&cgi_sapi_module) == FAILURE){
 		//...
+	}
+	//...
+	/* 这里依然是判断是否是cgi,从警告可以看出这种方式确实存在安全隐患,已经不再被php新版本支持了*/
+	if (cgi && CGIG(force_redirect)) {
+		//...
+		SG(sapi_headers).http_response_code = 400;
+				PUTS("<b>Security Alert!</b> The PHP CGI cannot be accessed directly.\n\n\
+<p>This PHP CGI binary was compiled with force-cgi-redirect enabled.  This\n\
+means that a page will only be served up if the REDIRECT_STATUS CGI variable is\n\
+set, e.g. via an Apache Action directive.</p>\n\
+<p>For more information as to <i>why</i> this behaviour exists, see the <a href=\"http://php.net/security.cgi-bin\">\
+manual page for CGI security</a>.</p>\n\
+<p>For more information about changing this behaviour or re-enabling this webserver,\n\
+consult the installation file that came with this distribution, or visit \n\
+<a href=\"http://php.net/install.windows\">the manual page</a>.</p>\n");
+	}
+	//...
+	/* 接下来进入fcgi方式的执行流程了 */
+	if (fastcgi) {
+		//...
+		/* 首先初始化请求的结构(主要是分配空间,属性的初始化在后头) */
+		request = fcgi_init_request(fcgi_fd, NULL, NULL, NULL);
+		//...
+		/* 这里parent是一个全局变量,初始化为1,即父进程,父进程进入无限循环保证正在运行的子进程数量*/
+		while (parent) {
+			do {
+					pid = fork();
+					switch (pid) {
+					case 0:
+						/* 子进程把parent变量置为0 ,一遍子进程跳出此循环 */
+						parent = 0;
+
+						/* don't catch our signals */
+						sigaction(SIGTERM, &old_term, 0);
+						sigaction(SIGQUIT, &old_quit, 0);
+						sigaction(SIGINT,  &old_int,  0);
+						zend_signal_init();
+						break;
+					case -1:
+						perror("php (pre-forking)");
+						exit(1);
+						break;
+					default:
+						/* Fine */
+						running++;
+						break;
+					}
+			} while (parent && (running < children));
+			//...
+		}
+	}
+	//...
+	/* 循环调用等待收到一个fcgi请求时,做出处理(TODO:这里有疑问,从哪里监听了请求事件?) */
+	while (!fastcgi || fcgi_accept_request(request) >= 0) {
+			SG(server_context) = fastcgi ? (void *)request : (void *) 1;
+			/* 这里是真正的把请求的内容保存到了本地的request结构里*/
+			init_request_info(request);
+			//... 
+			/* 保存cgi,fcgi 命令需要执行的脚本文件名字 */
+			if (SG(request_info).path_translated || cgi || fastcgi) {
+				file_handle.type = ZEND_HANDLE_FILENAME;
+				file_handle.filename = SG(request_info).path_translated;
+				file_handle.handle.fp = NULL;
+			} else {
+				file_handle.filename = "-";
+				file_handle.type = ZEND_HANDLE_FP;
+				file_handle.handle.fp = stdin;
+			}
+			//...
+			/* 把请求的各种信息都初始化到file_handle结构后,就把整个程序流程交给php引擎去解析和执行了 */
+			switch (behavior) {
+				case PHP_MODE_STANDARD:
+					php_execute_script(&file_handle);
+					break;
+					//...
+			}
+
 	}
 
 }
