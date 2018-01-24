@@ -77,7 +77,7 @@ class Application extends SymfonyApplication implements ApplicationContract
 }
 ```
 Application本身并没有实现run方法,我们从它集成的SymfonyApplication类中找到了run
-> Laravel 最初是由symfony分裂出来的（精简版?）
+> 注:Laravel 最初是由symfony分裂出来的（精简版?）
 ```php
 /* vendor/symfony/console/Application.php */
     public function run(InputInterface $input = null, OutputInterface $output = null)
