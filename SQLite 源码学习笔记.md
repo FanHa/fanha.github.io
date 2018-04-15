@@ -135,4 +135,89 @@ int sqlite3_exec(
   char **pzErrMsg             /* Write error messages here */
 ){}
 ```
-#### 
+
+
+## Sql语句的执行流程
+sqlite3_exec()函数执行整个sql语句调用,其中最关键的两个阶段
+```c
+//将字符串的sql语句(zSql)消化解析，并将解析后的语句信息放在pStmt里
+rc = sqlite3_prepare_v2(db, zSql, -1, &pStmt, &zLeftover);
+
+//将已经经过解析的pstmt按既定规则执行
+while( 1 ){
+  //...
+  rc = sqlite3_step(pStmt);
+  //...
+}
+```
+
+### sql prepare阶段
+sqlite3_prepare_v2函数经过一层层封装,最红调用的是sqlite3Prepare(),这里把一条sql语句拆解成了若干个可执行的步骤(step),供后续参照执行.
+```c
+int sqlite3_prepare_v2(
+  sqlite3 *db,              /* Database handle. */
+  const char *zSql,         /* UTF-8 encoded SQL statement. */
+  int nBytes,               /* Length of zSql in bytes. */
+  sqlite3_stmt **ppStmt,    /* OUT: A pointer to the prepared statement */
+  const char **pzTail       /* OUT: End of parsed string */
+){
+  //...
+  rc = sqlite3LockAndPrepare(db,zSql,nBytes,SQLITE_PREPARE_SAVESQL,0,ppStmtpzTail);
+  //...
+}
+
+static int sqlite3LockAndPrepare(
+  sqlite3 *db,              /* Database handle. */
+  const char *zSql,         /* UTF-8 encoded SQL statement. */
+  int nBytes,               /* Length of zSql in bytes. */
+  u32 prepFlags,            /* Zero or more SQLITE_PREPARE_* flags */
+  Vdbe *pOld,               /* VM being reprepared */
+  sqlite3_stmt **ppStmt,    /* OUT: A pointer to the prepared statement */
+  const char **pzTail       /* OUT: End of parsed string */
+){
+  //...
+  do{
+    rc = sqlite3Prepare(db, zSql, nBytes, prepFlags, pOld, ppStmt, pzTail);
+    //...
+  }
+  //...
+}
+```
+
+### sql step执行阶段
+sqlite3_step函数经过层层封装最终调用sqlite3VdbeExec对已经prepare的sql,按序执行既定的step.
+```c
+//vdbeapi.c
+int sqlite3_step(sqlite3_stmt *pStmt){
+  //...
+  while( (rc = sqlite3Step(v))==SQLITE_SCHEMA
+         && cnt++ < SQLITE_MAX_SCHEMA_RETRY ){}
+  //...
+
+}
+
+static int sqlite3Step(Vdbe *p){
+  //...
+  rc = sqlite3VdbeExec(p);
+  //...
+}
+```
+
+#### sqlite3VdbeExec 
+sqlite3VdbeExec()函数主要由一个大的case语句来将prepare解析好的执行步骤分发给具体的执行函数;例如一条基本的"insert xxxxxxxxxx"语句在prepare阶段生成了一条opcode为OP_Insert的操作,在执行阶段就会执行case OP_Insert的流程.
+```c
+int sqlite3VdbeExec(
+  Vdbe *p                    /* The VDBE */
+){
+  Op *aOp = p->aOp;          /* Copy of p->aOp */
+  Op *pOp = aOp;             /* Current operation */
+  //...
+  switch( pOp->opcode ){
+    //...
+    case OP_Insert: 
+    case OP_InsertInt: {
+      //Do something
+    }
+    //...
+}
+```
