@@ -176,13 +176,133 @@ static int sqlite3LockAndPrepare(
   const char **pzTail       /* OUT: End of parsed string */
 ){
   //...
-  do{
-    rc = sqlite3Prepare(db, zSql, nBytes, prepFlags, pOld, ppStmt, pzTail);
-    //...
-  }
+  rc = sqlite3Prepare(db, zSql, nBytes, prepFlags, pOld, ppStmt, pzTail);
+  //...
+}
+
+static int sqlite3Prepare(
+  sqlite3 *db,              /* Database handle. */
+  const char *zSql,         /* UTF-8 encoded SQL statement. */
+  int nBytes,               /* Length of zSql in bytes. */
+  u32 prepFlags,            /* Zero or more SQLITE_PREPARE_* flags */
+  Vdbe *pReprepare,         /* VM being reprepared */
+  sqlite3_stmt **ppStmt,    /* OUT: A pointer to the prepared statement */
+  const char **pzTail       /* OUT: End of parsed string */
+){
+  //...
+  //解析sql语句,并将结果放在sParse中
+  sqlite3RunParser(&sParse, zSqlCopy, &zErrMsg);
   //...
 }
 ```
+
+#### Parser
+Parser主要由一个while(1)循环逐字节解析sql语句,主要分为两个阶段:
+1.sqlite3GetToken函数取得一个token,记录下相应的tokentType;
+2.调用sqlite3Parser函数根据tokenType(及lastTokenType)做对应的token操作
+```c
+//tokenize.c
+int sqlite3RunParser(Parse *pParse, const char *zSql, char **pzErrMsg){
+  //...
+   while( 1 ){
+    if( zSql[0]!=0 ){
+      n = sqlite3GetToken((u8*)zSql, &tokenType);
+      //...
+    }else{
+      //...
+    }
+    if( tokenType>=TK_SPACE ){
+      //...
+    }else{
+      pParse->sLastToken.z = zSql;
+      pParse->sLastToken.n = n;
+      sqlite3Parser(pEngine, tokenType, pParse->sLastToken, pParse);
+      lastTokenParsed = tokenType;
+      zSql += n;
+      if( pParse->rc!=SQLITE_OK || db->mallocFailed ) break;
+    }
+  }
+}
+```
+
+##### sqlite3GetToken
+tokenize首先通过宏和一个数组标记每一种字符所代表的类型
+```c
+//tokenize.c
+
+#define CC_X          0    /* The letter 'x', or start of BLOB literal */
+#define CC_KYWD       1    /* Alphabetics or '_'.  Usable in a keyword */
+#define CC_ID         2    /* unicode characters usable in IDs */
+#define CC_DIGIT      3    /* Digits */
+#define CC_DOLLAR     4    /* '$' */
+#define CC_VARALPHA   5    /* '@', '#', ':'.  Alphabetic SQL variables */
+#define CC_VARNUM     6    /* '?'.  Numeric SQL variables */
+#define CC_SPACE      7    /* Space characters */
+#define CC_QUOTE      8    /* '"', '\'', or '`'.  String literals, quoted ids */
+#define CC_QUOTE2     9    /* '['.   [...] style quoted ids */
+#define CC_PIPE      10    /* '|'.   Bitwise OR or concatenate */
+#define CC_MINUS     11    /* '-'.  Minus or SQL-style comment */
+#define CC_LT        12    /* '<'.  Part of < or <= or <> */
+#define CC_GT        13    /* '>'.  Part of > or >= */
+#define CC_EQ        14    /* '='.  Part of = or == */
+#define CC_BANG      15    /* '!'.  Part of != */
+#define CC_SLASH     16    /* '/'.  / or c-style comment */
+#define CC_LP        17    /* '(' */
+#define CC_RP        18    /* ')' */
+#define CC_SEMI      19    /* ';' */
+#define CC_PLUS      20    /* '+' */
+#define CC_STAR      21    /* '*' */
+#define CC_PERCENT   22    /* '%' */
+#define CC_COMMA     23    /* ',' */
+#define CC_AND       24    /* '&' */
+#define CC_TILDA     25    /* '~' */
+#define CC_DOT       26    /* '.' */
+#define CC_ILLEGAL   27    /* Illegal character */
+
+static const unsigned char aiClass[] = {
+#ifdef SQLITE_ASCII
+/*         x0  x1  x2  x3  x4  x5  x6  x7  x8  x9  xa  xb  xc  xd  xe  xf */
+/* 0x */   27, 27, 27, 27, 27, 27, 27, 27, 27,  7,  7, 27,  7,  7, 27, 27,
+/* 1x */   27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
+/* 2x */    7, 15,  8,  5,  4, 22, 24,  8, 17, 18, 21, 20, 23, 11, 26, 16,
+/* 3x */    3,  3,  3,  3,  3,  3,  3,  3,  3,  3,  5, 19, 12, 14, 13,  6,
+/* 4x */    5,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,
+/* 5x */    1,  1,  1,  1,  1,  1,  1,  1,  0,  1,  1,  9, 27, 27, 27,  1,
+/* 6x */    8,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,
+/* 7x */    1,  1,  1,  1,  1,  1,  1,  1,  0,  1,  1, 27, 10, 27, 25, 27,
+/* 8x */    2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,
+/* 9x */    2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,
+/* Ax */    2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,
+/* Bx */    2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,
+/* Cx */    2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,
+/* Dx */    2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,
+/* Ex */    2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,
+/* Fx */    2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2
+}
+```
+
+
+*z是指向sql语句字符的指针,通过switch得到对应的tokenType,并返回该token的长度,如检测到 z
+所指向的字符对应的aiClass是 CC_SPACE,case内部的循环会接着判断接下来的字符是不是也是'space'类型,直到循环结束,将tokenType 赋值为TK_SPACE,并返回该token长度(便于sqlite3GetToken外部的循环将sql指针向前推进,进行下一个token的解析)
+```c
+int sqlite3GetToken(const unsigned char *z, int *tokenType){
+  int i, c;
+  switch( aiClass[*z] ){ 
+    case CC_SPACE: {
+      testcase( z[0]==' ' );
+      testcase( z[0]=='\t' );
+      testcase( z[0]=='\n' );
+      testcase( z[0]=='\f' );
+      testcase( z[0]=='\r' );
+      for(i=1; sqlite3Isspace(z[i]); i++){}
+      *tokenType = TK_SPACE;
+      return i;
+    }
+    //...
+}
+```
+##### sqlite3Parser 
+//TODO 先了解 yacc 和 bison等相关原理再来
 
 ### sql step执行阶段
 sqlite3_step函数经过层层封装最终调用sqlite3VdbeExec对已经prepare的sql,按序执行既定的step.
