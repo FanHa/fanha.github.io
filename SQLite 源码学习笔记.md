@@ -305,7 +305,7 @@ int sqlite3GetToken(const unsigned char *z, int *tokenType){
 //TODO 先了解 yacc 和 bison等相关原理再来
 
 ### sql step执行阶段
-sqlite3_step函数经过层层封装最终调用sqlite3VdbeExec对已经prepare的sql,按序执行既定的step.
+sqlite3_step函数经过层层封装最终调用sqlite3VdbeExec对已经prepare的sql,按规则执行既定的step.
 ```c
 //vdbeapi.c
 int sqlite3_step(sqlite3_stmt *pStmt){
@@ -324,7 +324,7 @@ static int sqlite3Step(Vdbe *p){
 ```
 
 #### sqlite3VdbeExec 
-sqlite3VdbeExec()函数主要由一个大的case语句来将prepare解析好的执行步骤分发给具体的执行函数;例如一条基本的"insert xxxxxxxxxx"语句在prepare阶段生成了一条opcode为OP_Insert的操作,在执行阶段就会执行case OP_Insert的流程.
+sqlite3VdbeExec()函数主要由一个大的case语句来将prepare解析好的执行步骤分发给具体的执行函数;
 ```c
 int sqlite3VdbeExec(
   Vdbe *p                    /* The VDBE */
@@ -340,4 +340,89 @@ int sqlite3VdbeExec(
     }
     //...
 }
+```
+
+官网有一条例子可窥  https://www.sqlite.org/opcode.html  
+  $ sqlite3 ex1.db  
+  sqlite> explain delete from tbl1 where two<20;  
+```
+  addr  opcode         p1    p2    p3    p4             p5  comment      
+  ----  -------------  ----  ----  ----  -------------  --  -------------
+  0     Init           0     12    0                    00  Start at 12  
+  1     Null           0     1     0                    00  r[1]=NULL    
+  2     OpenWrite      0     2     0     3              00  root=2 iDb=0; tbl1
+  3     Rewind         0     10    0                    00               
+  4       Column         0     1     2                    00  r[2]=tbl1.two
+  5       Ge             3     9     2     (BINARY)       51  if r[2]>=r[3] goto 9
+  6       Rowid          0     4     0                    00  r[4]=rowid   
+  7       Once           0     8     0                    00               
+  8       Delete         0     1     0     tbl1           02               
+  9     Next           0     4     0                    01               
+  10    Noop           0     0     0                    00               
+  11    Halt           0     0     0                    00               
+  12    Transaction    0     1     1     0              01  usesStmtJournal=0
+  13    TableLock      0     2     1     tbl1           00  iDb=0 root=2 write=1
+  14    Integer        20    3     0                    00  r[3]=20      
+  15    Goto           0     1     0                    00
+```
+
+sql 语句"delete from tbl1 where two<20" 经过prepare解析阶段成了如上得opcode(s),step会从第0条Init 开始执行,Init 得代码主要只是一个入口,表明stmt从p2表示得opcodeAddr开始执行,例子中p2值为12, 既从addr=12得Transaction执行
+```c
+// vdbe.c
+jump_to_p2:
+  pOp = &aOp[pOp->p2 - 1];
+  break;
+
+
+// ...
+case OP_Init: {          /* jump */
+  // ...
+  goto jump_to_p2;
+}
+```
+Transaction如其名表示事务(sql语句含delete可能得多条数据,在sql执行时是一个循环一条条delete得,存在失败可能需要回滚),依次往下执行 13-TableLock, 14-Integer, 15-Goto
+
+```c
+// vdbe.c
+case OP_Transaction: {
+  // 主要做一些事务的初始化
+}
+
+case OP_TableLock: {
+  // ...
+  // 给需要执行操作的表上锁
+  rc = sqlite3BtreeLockTable(db->aDb[p1].pBt, pOp->p2, isWriteLock);
+  // ...
+}
+
+case OP_Integer: {
+  // 将整数20存入一个变量(这里是存到一个register里)以便后面用来比较
+  pOut = out2Prerelease(p, pOp);
+  pOut->u.i = pOp->p1;
+  break;
+}
+
+case OP_Goto: {
+  // 跳转到p2所指的opcodeAddr(同前面的jumb_to_p2)是同一段代码
+}
+```
+
+接下来开始对表进入写操作阶段, 首先打开表文件 2-OpenWrite, 打开循环开关, 然后进入一个循环4,5,6,7,8,9遍历表的行,找出two<20 的行并删除, 循环结束且没有出错step到11-Halt
+
+```c
+// vdbe.c
+case OP_Halt: {
+  //这里做一些检测和记录后跳转到vdbe_return(即返回执行结果).
+  goto vdbe_return;
+}
+
+// ...
+vdbe_return:
+  testcase( nVmStep>0 );
+  p->aCounter[SQLITE_STMTSTATUS_VM_STEP] += (int)nVmStep;
+  sqlite3VdbeLeave(p);
+  assert( rc!=SQLITE_OK || nExtraDelete==0 
+       || sqlite3_strlike("DELETE%",p->zSql,0)!=0 
+  );
+  return rc;
 ```
