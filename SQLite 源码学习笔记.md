@@ -390,7 +390,8 @@ case OP_Transaction: {
 
 case OP_TableLock: {
   // ...
-  // 给需要执行操作的表上锁
+  // 给需要执行操作的表上锁(这里的锁不是常见的读写锁,是sqlite shared-cache特性的锁,读写锁是在后面的OP_Openwrite上加的) 
+  // TODO: 什么是shared-cache
   rc = sqlite3BtreeLockTable(db->aDb[p1].pBt, pOp->p2, isWriteLock);
   // ...
 }
@@ -403,11 +404,31 @@ case OP_Integer: {
 }
 
 case OP_Goto: {
+jump_to_p2_and_check_for_interrupt:
+  //...
   // 跳转到p2所指的opcodeAddr(同前面的jumb_to_p2)是同一段代码
 }
 ```
 
-接下来开始对表进入写操作阶段, 首先打开表文件 2-OpenWrite, 打开循环开关, 然后进入一个循环4,5,6,7,8,9遍历表的行,找出two<20 的行并删除, 循环结束且没有出错step到11-Halt
+接下来开始对表进入写操作阶段, 首先打开表文件 2-OpenWrite, 然后设立一个循环标记3-Rewind
+```c
+// vdbe.c
+case OP_OpenWrite:
+// ...
+// 初始化内存空间
+pCur = allocateCursor(p, pOp->p1, nField, iDb, CURTYPE_BTREE);
+// ...
+// 初始化指向数据(以BTREE形式存放)的指针,在这个函数里会给表加上读写锁
+rc = sqlite3BtreeCursor(pX, p2, wrFlag, pKeyInfo, pCur->uc.pCursor);
+// ...
+```
+
+```c
+// vdbe.c
+```
+
+
+ 然后进入一个循环4,5,6,7,8,9遍历表的行,找出two<20 的行并删除, 循环结束且没有出错step到11-Halt
 
 ```c
 // vdbe.c
