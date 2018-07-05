@@ -421,17 +421,43 @@ pCur = allocateCursor(p, pOp->p1, nField, iDb, CURTYPE_BTREE);
 // 初始化指向数据(以BTREE形式存放)的指针,在这个函数里会给表加上读写锁
 rc = sqlite3BtreeCursor(pX, p2, wrFlag, pKeyInfo, pCur->uc.pCursor);
 // ...
+
+case OP_Rewind: {        /* jump */
+  // ...
+  // 将cursor移动到表数据记录的第一条,如果为空就直接跳到p2 所指的addr,再这个例子中p2值为10
+  rc = sqlite3BtreeFirst(pCrsr, &res);
+  // ...
+  if( res ) goto jump_to_p2;
+  break;
+}
 ```
+
+
+ 然后进入一个循环4-Column,5-Ge,6-RowId,7-Once,8-Delete,9-Next遍历表的行,找出two<20 的行并删除, 循环结束且没有出错step到11-Halt
 
 ```c
 // vdbe.c
-```
+case OP_Column: {
+  // ...
+  // 将当前游标(cursor)指向的数据行加载到内存以便作处理
+  memset(&sMem, 0, sizeof(sMem));
+  rc = sqlite3VdbeMemFromBtree(pC->uc.pCursor, 0, aOffset[0], &sMem);
+
+  // ...
+  // 最终行中特定的列的数据去取出,放到p3指向的register,此例为r[2]
+  // 此时register里已经有了r[2] = 当前行的two列指向的值,
+  // 和r[3] = 20 ,即需要和"two"进行比较的值
+  // 可以继续前进进入下一个OP 即OP_Ge
+op_column_out:
+  UPDATE_MAX_BLOBSIZE(pDest);
+  REGISTER_TRACE(pOp->p3, pDest);
+  break;
+}
+
+case OP_Ge: {
+}
 
 
- 然后进入一个循环4,5,6,7,8,9遍历表的行,找出two<20 的行并删除, 循环结束且没有出错step到11-Halt
-
-```c
-// vdbe.c
 case OP_Halt: {
   //这里做一些检测和记录后跳转到vdbe_return(即返回执行结果).
   goto vdbe_return;
