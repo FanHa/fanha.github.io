@@ -380,7 +380,7 @@ case OP_Init: {          /* jump */
   goto jump_to_p2;
 }
 ```
-Transaction如其名表示事务(sql语句含delete可能得多条数据,在sql执行时是一个循环一条条delete得,存在失败可能需要回滚),依次往下执行 13-TableLock, 14-Integer, 15-Goto
+Transaction如其名表示事务(sql语句含delete可能得多条数据,在sql执行时是一个循环一条条delete得,存在失败可能需要回滚),依次往下执行 `13-TableLock`, `14-Integer`, `15-Goto`
 
 ```c
 // vdbe.c
@@ -410,7 +410,7 @@ jump_to_p2_and_check_for_interrupt:
 }
 ```
 
-接下来开始对表进入写操作阶段, 首先打开表文件 2-OpenWrite, 然后设立一个循环标记3-Rewind
+接下来开始对表进入写操作阶段, 首先打开表文件 `2-OpenWrite`, 然后设立一个循环标记`3-Rewind`
 ```c
 // vdbe.c
 case OP_OpenWrite:
@@ -433,7 +433,8 @@ case OP_Rewind: {        /* jump */
 ```
 
 
- 然后进入一个循环4-Column,5-Ge,6-RowId,7-Once,8-Delete,9-Next遍历表的行,找出two<20 的行并删除, 循环结束且没有出错step到11-Halt
+ 然后进入一个循环
+ `4-Column`,`5-Ge`,`6-RowId`,`7-Once`,`8-Delete`,`9-Next`遍历表的行,找出`two<20` 的行并删除, 循环结束且没有出错step到`11-Halt`
 
 ```c
 // vdbe.c
@@ -454,7 +455,60 @@ op_column_out:
   break;
 }
 
+case OP_Eq:
+case OP_Ne:
+case OP_Lt:
+case OP_Le:
+case OP_Gt:  
 case OP_Ge: {
+  // 先从p1, p3中取出要比较的值和信息 
+  pIn1 = &aMem[pOp->p1];
+  pIn3 = &aMem[pOp->p3];
+  flags1 = pIn1->flags;
+  flags3 = pIn3->flags;
+  // ...
+  // 比较r[p1] 和 r[p3] 的值, 这一层封装了不同类型的比较, 得到的是两个值的相对关系, 
+  // res2再根据 OPCode的值和 res来决定比对是否满足,并跳到p2所指的OPcode address
+  // 和人一般的思维过程有点不同, 但这样做是为了方便把对两个值的比较过程本身和比较结果解耦, 
+  // 这样方便在sqlite3MemCompare里加入对不同数据类型的比较,
+  // 甚至通过 p4传入回调(文档上说二进制)来比较高级数据类型的参数
+  res = sqlite3MemCompare(pIn3, pIn1, pOp->p4.pColl);
+  // ...
+compare_op:
+  if( res<0 ){                        /* ne, eq, gt, le, lt, ge */
+    static const unsigned char aLTb[] = { 1,  0,  0,  1,  1,  0 };
+    res2 = aLTb[pOp->opcode - OP_Ne];
+  }else if( res==0 ){
+    static const unsigned char aEQb[] = { 0,  1,  0,  1,  0,  1 };
+    res2 = aEQb[pOp->opcode - OP_Ne];
+  }else{
+    static const unsigned char aGTb[] = { 1,  0,  1,  0,  0,  1 };
+    res2 = aGTb[pOp->opcode - OP_Ne];
+  }
+  // ...
+  if( res2 ){
+    // 比较结果不满足既定要求时, 跳到p2所指的 OPCode Address, 本例是9-Next
+    goto jump_to_p2;
+  }
+  // 满足比较要求时接着执行下一个 OPcode, 本例是6-RowId
+  break;
+
+}
+
+case OP_Rowid: {                 /* out2 */
+  // ...
+  // 这里封装了一层, 将pOut指向p2 所指向的register, 本例是register[4]
+  pOut = out2Prerelease(p, pOp);
+
+  // 将游标指向p1现在所在行
+  pC = p->apCsr[pOp->p1];
+
+  // 取出当前行的key,即rowId
+  v = sqlite3BtreeIntegerKey(pC->uc.pCursor);
+  // ...
+  // 将rowId 赋值给 p2
+  pOut->u.i = v;
+  break;
 }
 
 
