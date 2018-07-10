@@ -468,9 +468,11 @@ case OP_Ge: {
   flags3 = pIn3->flags;
   // ...
   // 比较r[p1] 和 r[p3] 的值, 这一层封装了不同类型的比较, 得到的是两个值的相对关系, 
-  // res2再根据 OPCode的值和 res来决定比对是否满足,并跳到p2所指的OPcode address
-  // 和人一般的思维过程有点不同, 但这样做是为了方便把对两个值的比较过程本身和比较结果解耦, 
-  // 这样方便在sqlite3MemCompare里加入对不同数据类型的比较,
+  // res2再根据 OPCode的值和 res来决定比对是否满足,并跳到p2所指的OPcode address.
+  // 和人一般的思维过程有点不同(人一般是根据符号在对值进行比较,这里是先比较出相对关系
+  // 再根据符号得出比较结果. 
+  // 这样做应该是为了方便把对两个值的比较过程本身和比较结果解耦, 
+  // 这样也方便在sqlite3MemCompare里加入对不同数据类型的比较,
   // 甚至通过 p4传入回调(文档上说二进制)来比较高级数据类型的参数
   res = sqlite3MemCompare(pIn3, pIn1, pOp->p4.pColl);
   // ...
@@ -510,6 +512,68 @@ case OP_Rowid: {                 /* out2 */
   pOut->u.i = v;
   break;
 }
+
+// 这个OP_Once在本例子中,无论是跳转到p2还是继续执行下一条,都是到8-Delete
+case OP_Once: {             /* jump */
+  u32 iAddr;                /* Address of this instruction */
+  assert( p->aOp[0].opcode==OP_Init );
+  if( p->pFrame ){
+    iAddr = (int)(pOp - p->aOp);
+    if( (p->pFrame->aOnce[iAddr/8] & (1<<(iAddr & 7)))!=0 ){
+      VdbeBranchTaken(1, 2);
+      goto jump_to_p2;
+    }
+    p->pFrame->aOnce[iAddr/8] |= 1<<(iAddr & 7);
+  }else{
+    if( p->aOp[0].p1==pOp->p1 ){
+      VdbeBranchTaken(1, 2);
+      goto jump_to_p2;
+    }
+  }
+  VdbeBranchTaken(0, 2);
+  pOp->p1 = p->aOp[0].p1;
+  break;
+}
+
+case OP_Delete: {
+  // ...
+  // cursor指向p1指向的数据行
+  pC = p->apCsr[pOp->p1];
+  // ...
+  // 从btree中删除cursor指向的数据行
+  rc = sqlite3BtreeDelete(pC->uc.pCursor, pOp->p5);
+  // ...
+  // 调用delete 的回调, 这个可以与mysql对某列加个ON DELETE处理类似,sqlite也支持对列进行类似的声明
+  if( opflags & OPFLAG_NCHANGE ){
+    p->nChange++;
+    if( db->xUpdateCallback && HasRowid(pTab) ){
+      db->xUpdateCallback(db->pUpdateArg, SQLITE_DELETE, zDb, pTab->zName,
+          pC->movetoTarget);
+      assert( pC->iDb>=0 );
+    }
+  }
+}
+
+case OP_Next:
+  // ...
+  // 查询p1指向的表是否还有下文,
+  // 如果没有下文,则接着执行接下来的OPCode,也就是 10-Noop , 11-Halt
+  // 如果有下文, 则回转到4-Rowid,进入下一个循环
+  rc = pOp->p4.xAdvance(pC->uc.pCursor, pOp->p3);
+
+  if( rc==SQLITE_OK ){
+    pC->nullRow = 0;
+    p->aCounter[pOp->p5]++;
+#ifdef SQLITE_TEST
+    sqlite3_search_count++;
+#endif
+    goto jump_to_p2_and_check_for_interrupt;
+  }
+  if( rc!=SQLITE_DONE ) goto abort_due_to_error;
+  rc = SQLITE_OK;
+  pC->nullRow = 1;
+  goto check_for_interrupt;
+
 
 
 case OP_Halt: {
