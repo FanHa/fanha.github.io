@@ -332,4 +332,168 @@ mounted() {
 },
 ```
 
+### template 中的内容
+前面知道table的源码文件的template主要有`slot`,`header`,`body`三部分,vue在生成了自身的组件属性(如data等)后开始生成template内的内容.  
 
+#### table-column生成
+slot是个隐藏的组件,接受了使用者写在`el-table`里的`el-table-column`
+```html
+<template>
+  <el-table
+    :data="tableData"
+    style="width: 100%">
+    <el-table-column
+      prop="date"
+      label="日期"
+      width="180">
+    </el-table-column>
+    <el-table-column
+      prop="name"
+      label="姓名"
+      width="180">
+    </el-table-column>
+    <el-table-column
+      prop="address"
+      label="地址">
+    </el-table-column>
+  </el-table>
+</template>
+```
+
+table-column是个vue组件,遵从vue的生命周期,依次循环slot里的`el-table-column`的信息,把column信息组装好然后提交到`store`里供其他组件使用.
+```js
+// table-column.js
+  created() {
+    // created 阶段主要是把列的各种属性初始化,保存到this.columnConfig里
+    // ...
+    let column = getDefaultColumn(type, {
+      id: this.columnId,
+      columnKey: this.columnKey,
+      label: this.label,
+      className: this.className,
+      labelClassName: this.labelClassName,
+      property: this.prop || this.property,
+      type,
+      renderCell: null,
+      renderHeader: this.renderHeader,
+      minWidth,
+      width,
+      isColumnGroup,
+      context: this.context,
+      align: this.align ? 'is-' + this.align : null,
+      headerAlign: this.headerAlign ? 'is-' + this.headerAlign : (this.align ? 'is-' + this.align : null),
+      sortable: this.sortable === '' ? true : this.sortable,
+      sortMethod: this.sortMethod,
+      sortBy: this.sortBy,
+      resizable: this.resizable,
+      showOverflowTooltip: this.showOverflowTooltip || this.showTooltipWhenOverflow,
+      formatter: this.formatter,
+      selectable: this.selectable,
+      reserveSelection: this.reserveSelection,
+      fixed: this.fixed === '' ? true : this.fixed,
+      filterMethod: this.filterMethod,
+      filters: this.filters,
+      filterable: this.filters || this.filterMethod,
+      filterMultiple: this.filterMultiple,
+      filterOpened: false,
+      filteredValue: this.filteredValue || [],
+      filterPlacement: this.filterPlacement || '',
+      index: this.index,
+      sortOrders: this.sortOrders
+    });
+
+    this.columnConfig = column;
+    // ...
+  },
+  mounted() {
+    // mounted 阶段把columnConfig信息 提交到公共的store里供其他组件使用
+    const owner = this.owner;
+    //... 
+    owner.store.commit('insertColumn', this.columnConfig, columnIndex, this.isSubColumn ? parent.columnConfig : null);
+  }
+```
+
+#### table-header 与 table-body
+table-header和table-body组件的render回调就是把`columns`里的属性转成原生的html tag内容,从而把表格及数据展现到浏览器上.
+>> 注:this._l() 是vue实现的一个循环方法,统一数组和对象的循环
+```js
+// table-header.js
+  computed: {
+    columns() {
+      return this.store.states.columns;
+    },
+  },
+  render(h) {
+    return (
+      <table
+        class="el-table__header"
+        cellspacing="0"
+        cellpadding="0"
+        border="0">
+        <colgroup>
+          {
+            this._l(this.columns, column => <col name={ column.id } />)
+          }
+          {
+            this.hasGutter ? <col name="gutter" /> : ''
+          }
+        </colgroup>
+        <thead class={ [{ 'is-group': isGroup, 'has-gutter': this.hasGutter }] }>
+          {
+            this._l(columnRows, (columns, rowIndex) =>
+              <tr
+                style={ this.getHeaderRowStyle(rowIndex) }
+                class={ this.getHeaderRowClass(rowIndex) }
+              >
+                {
+                  this._l(columns, (column, cellIndex) =>
+                    <th
+                      colspan={ column.colSpan }
+                      rowspan={ column.rowSpan }
+                      on-mousemove={ ($event) => this.handleMouseMove($event, column) }
+                      on-mouseout={ this.handleMouseOut }
+                      on-mousedown={ ($event) => this.handleMouseDown($event, column) }
+                      on-click={ ($event) => this.handleHeaderClick($event, column) }
+                      on-contextmenu={ ($event) => this.handleHeaderContextMenu($event, column) }
+                      style={ this.getHeaderCellStyle(rowIndex, cellIndex, columns, column) }
+                      class={ this.getHeaderCellClass(rowIndex, cellIndex, columns, column) }>
+                      <div class={ ['cell', column.filteredValue && column.filteredValue.length > 0 ? 'highlight' : '', column.labelClassName] }>
+                        {
+                          column.renderHeader
+                            ? column.renderHeader.call(this._renderProxy, h, { column, $index: cellIndex, store: this.store, _self: this.$parent.$vnode.context })
+                            : column.label
+                        }
+                        {
+                          column.sortable
+                            ? <span class="caret-wrapper" on-click={ ($event) => this.handleSortClick($event, column) }>
+                              <i class="sort-caret ascending" on-click={ ($event) => this.handleSortClick($event, column, 'ascending') }>
+                              </i>
+                              <i class="sort-caret descending" on-click={ ($event) => this.handleSortClick($event, column, 'descending') }>
+                              </i>
+                            </span>
+                            : ''
+                        }
+                        {
+                          column.filterable
+                            ? <span class="el-table__column-filter-trigger" on-click={ ($event) => this.handleFilterClick($event, column) }><i class={ ['el-icon-arrow-down', column.filterOpened ? 'el-icon-arrow-up' : ''] }></i></span>
+                            : ''
+                        }
+                      </div>
+                    </th>
+                  )
+                }
+                {
+                  this.hasGutter ? <th class="gutter"></th> : ''
+                }
+              </tr>
+            )
+          }
+        </thead>
+      </table>
+    );
+  },
+
+```
+
+
+### 结
