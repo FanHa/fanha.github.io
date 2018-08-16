@@ -122,7 +122,7 @@ addr  opcode         p1    p2    p3    p4             p5  comment
 + addr 4-5 过滤出name != 'paul'的外层行
 + 第一次循环到`addr-6-Once`时执行的时 `addr-7-OpenAutoIndex` 和 循环 addr 8-14
   + `addr-7-OpenAutoIndex` 创建一个临时存index的区域 
-  + addr 8-14 循环整个`department`表,临时取出department.dept,department.emp_id,department的rowID组成一个类似联合索引,存入前面的临时index,这里联合索引的第一个字段就是要查的department表的条件 dept;
+  + addr 8-14 循环整个`department`表,临时取出department.dept,department.emp_id,department的rowID组成一个类似联合索引(也是覆盖索引),存入前面的临时index,这里联合索引的第一个字段就是要查的department表的条件 dept;
 + 接下来的外层循环到达 `addr-6-Once`时会直接跳到p2 所指的 `addr-15-String8` 和内层循环 addr 16-22
   + `addr-16-SeekGE`首先把循环指针定位到前面生成的临时index中找到'finance'所在的行
   + 然后 addr 17-22 会扫描前面生成的index,把满足条件 dept = 'finance' 的行取出并放到resultRow里,因为前面生成的是联合索引,所以GT(Great than)代表匹配到的行
