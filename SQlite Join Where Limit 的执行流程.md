@@ -199,3 +199,121 @@ addr  opcode         p1    p2    p3    p4             p5  comment
 ```
 
 #### inner join
+通过连接词 on 来构造连接条件满足得行,暂时称 from 的表 `company` 为左表, join 的表 `department` 为右表
++ 循环`5-Column` 到 `13-ResultRow`
++ 每一次循环
+  + `5-Column`取出右表`depatment` 的emp_id
+  + `6-Affinity` --> `9-DeferredSeek` 从左表的索引表中 匹配是否又包含这个emp_id的行
+  + 如果包含则取出相应的列,保存该行结果
+  + 执行下一个循环
+```
+sqlite> explain SELECT EMP_ID, NAME, DEPT FROM COMPANY INNER JOIN DEPARTMENT ON COMPANY.ID = DEPARTMENT.EMP_ID;
+addr  opcode         p1    p2    p3    p4             p5  comment
+----  -------------  ----  ----  ----  -------------  --  -------------
+0     Init           0     16    0                    00  Start at 16
+1     OpenRead       1     4     0     3              00  root=4 iDb=0; DEPARTMENT
+2     OpenRead       0     2     0     2              00  root=2 iDb=0; COMPANY
+3     OpenRead       2     3     0     k(1,)          02  root=3 iDb=0; sqlite_autoindex_COMPANY_1
+4     Rewind         1     15    0                    00
+5       Column         1     2     1                    00  r[1]=DEPARTMENT.EMP_ID
+6       Affinity       1     1     0     D              00  affinity(r[1])
+7       SeekGE         2     14    1     1              00  key=r[1]
+8       IdxGT          2     14    1     1              00  key=r[1]
+9       DeferredSeek   2     0     0                    00  Move 0 to 2.rowid if needed
+10      Column         1     2     2                    00  r[2]=DEPARTMENT.EMP_ID
+11      Column         0     1     3                    00  r[3]=COMPANY.name
+12      Column         1     1     4                    00  r[4]=DEPARTMENT.DEPT
+13      ResultRow      2     3     0                    00  output=r[2..4]
+14    Next           1     5     0                    01
+15    Halt           0     0     0                    00
+16    Transaction    0     0     4     0              01  usesStmtJournal=0
+17    Goto           0     1     0                    00
+```
+---
+给普通的inner join加上查询条件where company.id = 'x' and dept ='y'
++ 进入循环前先过滤左表的条件company.id = 'x',直接通过`4-Integer`到`7-DeferredSeek`在索引中找到 company.id = 1 的索引行开始后面的遍历循环
++ 循环右表 department,取出每一行
+  + `9-Column`,`10-Ne` 比较dept 是否满足条件`dept = 2`, 结果为否则跳到下一循环
+  + `11-Column` --> `13-Ne` 比较连接条件是否满足, 结构为否则跳到下一循环
+  + `14-Copy` --> `17-Result` 将满足条件的列拼成结果存入output
++ 从上面循环的逻辑可以看出当右表Department有多行匹配同一连接条件时, 结果会包含多条(即左表 1vN 右表)
+```
+sqlite> explain SELECT EMP_ID, NAME, DEPT FROM COMPANY INNER JOIN DEPARTMENT ON COMPANY.ID = DEPARTMENT.EMP_ID where company.id =1 and dept = '2';
+addr  opcode         p1    p2    p3    p4             p5  comment
+----  -------------  ----  ----  ----  -------------  --  -------------
+0     Init           0     20    0                    00  Start at 20
+1     OpenRead       0     2     0     2              00  root=2 iDb=0; COMPANY
+2     OpenRead       2     3     0     k(1,)          02  root=3 iDb=0; sqlite_autoindex_COMPANY_1
+3     OpenRead       1     4     0     3              00  root=4 iDb=0; DEPARTMENT
+4     Integer        1     1     0                    00  r[1]=1
+5     SeekGE         2     19    1     1              00  key=r[1]
+6     IdxGT          2     19    1     1              00  key=r[1]
+7     DeferredSeek   2     0     0                    00  Move 0 to 2.rowid if needed
+8     Rewind         1     19    0                    00
+9       Column         1     1     2                    00  r[2]=DEPARTMENT.DEPT
+10      Ne             3     18    2     (BINARY)       52  if r[2]!=r[3] goto 18
+11      Column         2     0     4                    00  r[4]=COMPANY.id
+12      Column         1     2     5                    00  r[5]=DEPARTMENT.EMP_ID
+13      Ne             5     18    4     (BINARY)       53  if r[4]!=r[5] goto 18
+14      Copy           5     6     0                    00  r[6]=r[5]
+15      Column         0     1     7                    00  r[7]=COMPANY.name
+16      Copy           2     8     0                    00  r[8]=r[2]
+17      ResultRow      6     3     0                    00  output=r[6..8]
+18    Next           1     9     0                    01
+19    Halt           0     0     0                    00
+20    Transaction    0     0     4     0              01  usesStmtJournal=0
+21    String8        0     3     0     2              00  r[3]='2'
+22    Goto           0     1     0                    00
+```
+
+---
+#### Outer join
++ Outer join 是 Inner join 超集
++ Sqlite 只支持左连接(left out join)
++ outer join 不仅把满足连接条件的行返回,还会返回没有满足连接条件的行
+  + 如再`left outer join`时, 左表行x在右表中没有匹配的行,则返回左表的行x加上右表的列全为`null`的`合成行`
+##### 查询explain
++ 外循环`3-Rewind` --> `27-Next` 循环遍历左表
+  + 在第一次外循环时,`4-Once` --> `12-Next` 遍历一次右表,构造一个临时的关于右表的`联合+覆盖索引`
+  + `13-Integer`初始化一个右表是否匹配到连接条件的标记
+  + `14-Column`,`15-Affinity`保存当前外循环左表行的 company.id 的值
+  + `16-SeekGE` 将右表 `department` 的游标指到与左表company.id匹配的索引行
+  + `17-IdxGT`-`22-ResultRow`,遍历前面生成的`联合+覆盖索引`取出与连接条件想匹配的行存入output
+    +  内循环中有分支`17-IdxGT`,即右表没有与连接条件想匹配的行时跳到 `24-Ifpos`生成一个右表字段全为null的行
+```
+sqlite> explain SELECT EMP_ID, NAME, DEPT FROM COMPANY LEFT OUTER JOIN DEPARTMENT
+   ...>         ON COMPANY.ID = DEPARTMENT.EMP_ID;
+addr  opcode         p1    p2    p3    p4             p5  comment
+----  -------------  ----  ----  ----  -------------  --  -------------
+0     Init           0     29    0                    00  Start at 29
+1     OpenRead       0     2     0     2              00  root=2 iDb=0; COMPANY
+2     OpenRead       1     4     0     3              00  root=4 iDb=0; DEPARTMENT
+3     Rewind         0     28    0                    00
+4       Once           0     13    0                    00
+5       OpenAutoindex  2     3     0     k(3,B,,)       00  nColumn=3; for DEPARTMENT
+6       Rewind         1     13    0                    00
+7         Column         1     2     2                    00  r[2]=DEPARTMENT.EMP_ID
+8         Column         1     1     3                    00  r[3]=DEPARTMENT.DEPT
+9         Rowid          1     4     0                    00  r[4]=rowid
+10        MakeRecord     2     3     1                    00  r[1]=mkrec(r[2..4])
+11        IdxInsert      2     1     0                    10  key=r[1]
+12      Next           1     7     0                    03
+13      Integer        0     5     0                    00  r[5]=0; init LEFT JOIN no-match flag
+14      Column         0     0     6                    00  r[6]=COMPANY.id
+15      Affinity       6     1     0     D              00  affinity(r[6])
+16      SeekGE         2     24    6     1              00  key=r[6]
+17        IdxGT          2     24    6     1              00  key=r[6]
+18        Integer        1     5     0                    00  r[5]=1; record LEFT JOIN hit
+19        Column         2     0     7                    00  r[7]=DEPARTMENT.EMP_ID
+20        Column         0     1     8                    00  r[8]=COMPANY.name
+21        Column         2     1     9                    00  r[9]=DEPARTMENT.DEPT
+22        ResultRow      7     3     0                    00  output=r[7..9]
+23      Next           2     17    0                    00
+24      IfPos          5     27    0                    00  if r[5]>0 then r[5]-=0, goto 27
+25      NullRow        2     0     0                    00
+26      Goto           0     18    0                    00
+27    Next           0     4     0                    01
+28    Halt           0     0     0                    00
+29    Transaction    0     0     4     0              01  usesStmtJournal=0
+30    Goto           0     1     0                    00
+```
