@@ -109,6 +109,95 @@ Vue.prototype._update = function (vnode: VNode, hydrating?: boolean) {
 
 ```
 
+patch VNode 通常有3种情况
+1. 新增,即prevVnode 不存在, vnode存在;
+2. 修改,即prevVnode 和 vnode 都存在;
+3. 删除,即prevVnode 存在, vnode不存在;
+```js
+// patch.js
+ if (isUndef(oldVnode)) {
+     // ...
+     // 新增
+      createElm(vnode, insertedVnodeQueue, parentElm, refElm)
+    } else {
+      const isRealElement = isDef(oldVnode.nodeType)
+      if (!isRealElement && sameVnode(oldVnode, vnode)) {
+        // 修改(包括删除)
+        patchVnode(oldVnode, vnode, insertedVnodeQueue, removeOnly)
+      } else {
+        // ...
+      }
+    }
+```
+
+##### createElm 新增
+通常有4种类型的vnode
+1. component,即VNode本身代表的是个Vue的Component结构,调用createComponent
+2. 普通的html tag,如"div","span"之类的,创建自身后再调用createChildren(),递归调用createElm创建子节点
+3. 注释节点
+4. 文字节点
+
+上面这些操作都是会实装生成(或修改)了DOM,并将新DOM插入父DOM,即调用
+`insert(parentElm, vnode.elm, refElm)`
+```js
+  function createElm (
+    vnode,
+    insertedVnodeQueue,
+    parentElm,
+    refElm,
+    nested,
+    ownerArray,
+    index
+  ) {
+    // ...
+    if (createComponent(vnode, insertedVnodeQueue, parentElm, refElm)) {
+      return
+    }
+    // ...
+    if (isDef(tag)) {
+
+      vnode.elm = vnode.ns
+        ? nodeOps.createElementNS(vnode.ns, tag)
+        : nodeOps.createElement(tag, vnode)
+      setScope(vnode)
+      if (__WEEX__) {
+        // ...
+      }
+      else {
+        createChildren(vnode, children, insertedVnodeQueue)
+        if (isDef(data)) {
+          invokeCreateHooks(vnode, insertedVnodeQueue)
+        }
+        insert(parentElm, vnode.elm, refElm)
+      }
+
+    } else if (isTrue(vnode.isComment)) {
+      vnode.elm = nodeOps.createComment(vnode.text)
+      insert(parentElm, vnode.elm, refElm)
+    } else {
+      vnode.elm = nodeOps.createTextNode(vnode.text)
+      insert(parentElm, vnode.elm, refElm)
+    }
+  }
+
+  // ...
+  function createChildren (vnode, children, insertedVnodeQueue) {
+    if (Array.isArray(children)) {
+      // ...
+      for (let i = 0; i < children.length; ++i) {
+        createElm(children[i], insertedVnodeQueue, vnode.elm, null, true, children, i)
+      }
+    } else if (isPrimitive(vnode.text)) {
+      nodeOps.appendChild(vnode.elm, nodeOps.createTextNode(String(vnode.text)))
+    }
+  }
+```
+
+##### createComponent
+
+##### patchVnode 修改
+
+
 
 
 
