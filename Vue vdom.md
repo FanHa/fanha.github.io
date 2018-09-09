@@ -78,11 +78,13 @@ Vue改变Dom的方式
 2. 通过patch函数更新DOM
     + patch函数会根据新旧VNode的差异对更新DOM的方式进行优化,减少实际更新DOM的次数
 #### create
-`create-component.js`,`create-element.js`,`create-functional-component.js`用来创建不同类型的Vnode.
+`create-component.js`,`create-element.js`,`create-functional-component.js`用来创建不同类型的初始Vnode.这个Vnode包含了必要的信息(和一个占位但暂时没有实际意义的DOM?)
+
 #### patch
 patch.js 中createPatchFunction 返回一个patch函数,外部通过调用`patch(oldVnode, newVnode, ...)`:
-+ 更新Vnode;
-+ 经过处理后,更新该Vnode中必要更新的DOM;
++ 解析VNode里的信息
++ 根据解析的信息递归创建子VNode 或 更新实际DOM;
+  + 递归创建的子VNode的解析和处理
 
 ```js
 // patch.js
@@ -192,10 +194,121 @@ patch VNode 通常有3种情况
     }
   }
 ```
+##### patchVnode 修改
+//TODO
 
 ##### createComponent
+通常使用Vue时是抽象了一个虚的tag,如`el-table`,这样生成的VNode不能直接对应一个DOM,此时调用的是CreateComponent建立的Component类型的VNode.
+>> 注: 这里的`createComponent` 与 接口`create-component.js`不同,接口`create-component.js` 是新建了一个VNode(并新建了没有实际意义的占位置的DOM),但并没有把VNode代表的内容落实到真正的DOM里,这里的`createComponent`才把VNode里的内容实装到DOM里;
 
-##### patchVnode 修改
+从代码里,createComponent取出了vnode里的data,`let i = vnode.data`,然后
+1. 执行了`i(vnode, false /* hydrating */, parentElm, refElm)`,`(isDef(i = i.hook) && isDef(i = i.init))`;
+2. `initComponent(vnode, insertedVnodeQueue)`;
+3. `reactivateComponent(vnode, insertedVnodeQueue, parentElm, refElm)`;
+可以看出这个createComponent其实是对一个已有的vnode做操作
+
+```js
+// patch.js
+function createComponent (vnode, insertedVnodeQueue, parentElm, refElm) {
+    let i = vnode.data
+    if (isDef(i)) {
+      const isReactivated = isDef(vnode.componentInstance) && i.keepAlive
+      if (isDef(i = i.hook) && isDef(i = i.init)) {
+        i(vnode, false /* hydrating */, parentElm, refElm)
+      }
+      // after calling the init hook, if the vnode is a child component
+      // it should've created a child instance and mounted it. the child
+      // component also has set the placeholder vnode's elm.
+      // in that case we can just return the element and be done.
+      if (isDef(vnode.componentInstance)) {
+        initComponent(vnode, insertedVnodeQueue)
+        if (isTrue(isReactivated)) {
+          reactivateComponent(vnode, insertedVnodeQueue, parentElm, refElm)
+        }
+        return true
+      }
+    }
+  }
+```
+##### init vnode
+上面的i指向的是vnode.data.init, 而init函数是在create-component.js新建vnode时挂到的vnode.data上的,
+调用该init函数会将初始VNode里的信息转换成实例,然后$mount 该实例,递归到了下一个
+`创建VNode`->`patch VNode`的流程
+```ts
+// create-component.js
+const componentVNodeHooks = {
+  init (
+    vnode: VNodeWithData,
+    hydrating: boolean,
+    parentElm: ?Node,
+    refElm: ?Node
+  ): ?boolean {
+    if (
+      //...
+    ) {
+      // ...
+    } else {
+      const child = vnode.componentInstance = createComponentInstanceForVnode(
+        vnode,
+        activeInstance,
+        parentElm,
+        refElm
+      )
+      child.$mount(hydrating ? vnode.elm : undefined, hydrating)
+    }
+  },
+  //...
+}
+
+export function createComponentInstanceForVnode (
+  vnode: any, // we know it's MountedComponentVNode but flow doesn't
+  parent: any, // activeInstance in lifecycle state
+  parentElm?: ?Node,
+  refElm?: ?Node
+): Component {
+  const options: InternalComponentOptions = {
+    _isComponent: true,
+    parent,
+    _parentVnode: vnode,
+    _parentElm: parentElm || null,
+    _refElm: refElm || null
+  }
+  // check inline-template render functions
+  const inlineTemplate = vnode.data.inlineTemplate
+  if (isDef(inlineTemplate)) {
+    options.render = inlineTemplate.render
+    options.staticRenderFns = inlineTemplate.staticRenderFns
+  }
+  return new vnode.componentOptions.Ctor(options)
+}
+```
+
+### VNode(Component)使用流程
+通常我们使用Vue时是用A包含一个B,而B组件本身也是一个包含C,D的组件这样的组合方式
+```html
+/* A.vue */
+<A>
+  <B></B>
+</A>
+
+/* B.vue */
+<B>
+  <C></C>
+  <D></D>
+</B>
+```
+
++ 创建一个A 的VNode,里面带有A的元信息;
++ patch A的VNode,这是根据A的元信息 发现有B(以及其他的data,prop,on,回调等等),初始化这些信息,创建B的初始Vnode,并附上B的元信息;
+  + 触发B 的patch;
+    + 创建C 的初始VNode;
+      + 触发C 的patch
+        + ...
+    + 创建D 的初始Vnode;
+      + 触发D 的patch  
+        + ...
+
+更新页面时也是通过先改变VNode里的信息,然后通过patch ,一层层将信息推进到底层的实际DOM并更新
 
 
 
