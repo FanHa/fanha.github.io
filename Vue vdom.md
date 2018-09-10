@@ -72,13 +72,177 @@ export default class VNode {
 }
 ```
 
+
 ### 外部使用接口
 Vue改变Dom的方式
-1. 通过create里的方法构建新的VNode
+1. 通过create-xxx.js里的方法构建新的VNode
 2. 通过patch函数更新DOM
     + patch函数会根据新旧VNode的差异对更新DOM的方式进行优化,减少实际更新DOM的次数
+
+### VNode(Component)使用流程
+通常我们使用Vue时是用A包含一个B,而B组件本身也是一个包含C,D的组件这样的组合方式
+```html
+/* A.vue */
+<A>
+  <B></B>
+</A>
+
+/* B.vue */
+<B>
+  <C></C>
+  <D></D>
+</B>
+```
+
++ 创建一个A 的VNode,里面带有A的元信息;
++ patch A的VNode,这是根据A的元信息 发现有B(以及其他的data,prop,on,回调等等),初始化这些信息,创建B的初始Vnode,并附上B的元信息;
+  + 触发B 的patch;
+    + 创建C 的初始VNode;
+      + 触发C 的patch
+        + ...
+    + 创建D 的初始Vnode;
+      + 触发D 的patch  
+        + ...
+
+更新页面时也是通过先改变VNode里的信息,然后通过patch ,一层层将信息推进到底层的实际DOM并更新
+
 #### create
 `create-component.js`,`create-element.js`,`create-functional-component.js`用来创建不同类型的初始Vnode.这个Vnode包含了必要的信息(和一个占位但暂时没有实际意义的DOM?)
+
+
+```js
+// core/instance/render.js
+// 这个_render函数实际调用的是编写vue组件时下载<script>里的render函数,如果没有render函数,vue也会在上一层先把<template>里的内容统一转换成render函数,便于这里的Vue.prototype._render调用
+  Vue.prototype._render = function (): VNode {
+    const vm: Component = this
+    const { render, _parentVnode } = vm.$options
+
+    let vnode
+    try {
+      vnode = render.call(vm._renderProxy, vm.$createElement)
+    } catch (e) {
+
+    }
+    // set parent
+    vnode.parent = _parentVnode
+    return vnode
+  }
+```
+
+render函数的格式和实际调用如下,初始化了一些信息,并新建了VNode
+>> createComponent也是新建一种Component类型的Vnode,调用的就是create-component.js里的接口
+```js
+// core/vdom/create-element.js
+export function createElement (
+  context: Component,
+  tag: any,
+  data: any,
+  children: any,
+  normalizationType: any,
+  alwaysNormalize: boolean
+): VNode | Array<VNode> {
+  if (Array.isArray(data) || isPrimitive(data)) {
+    normalizationType = children
+    children = data
+    data = undefined
+  }
+  if (isTrue(alwaysNormalize)) {
+    normalizationType = ALWAYS_NORMALIZE
+  }
+  return _createElement(context, tag, data, children, normalizationType)
+}
+
+export function _createElement (
+  context: Component,
+  tag?: string | Class<Component> | Function | Object,
+  data?: VNodeData,
+  children?: any,
+  normalizationType?: number
+): VNode | Array<VNode> {
+
+  if (!tag) {
+    // in case of component :is set to falsy value
+    return createEmptyVNode()
+  }
+  // support single function children as default scoped slot
+  if (Array.isArray(children) &&
+    typeof children[0] === 'function'
+  ) {
+    data = data || {}
+    data.scopedSlots = { default: children[0] }
+    children.length = 0
+  }
+  if (normalizationType === ALWAYS_NORMALIZE) {
+    children = normalizeChildren(children)
+  } else if (normalizationType === SIMPLE_NORMALIZE) {
+    children = simpleNormalizeChildren(children)
+  }
+  let vnode, ns
+  if (typeof tag === 'string') {
+    let Ctor
+    ns = (context.$vnode && context.$vnode.ns) || config.getTagNamespace(tag)
+    if (config.isReservedTag(tag)) {
+      // platform built-in elements
+      vnode = new VNode(
+        config.parsePlatformTagName(tag), data, children,
+        undefined, undefined, context
+      )
+    } else if (isDef(Ctor = resolveAsset(context.$options, 'components', tag))) {
+      // component
+      vnode = createComponent(Ctor, data, context, children, tag)
+    } else {
+      vnode = new VNode(
+        tag, data, children,
+        undefined, undefined, context
+      )
+    }
+  } else {
+    // direct component options / constructor
+    vnode = createComponent(tag, data, context, children)
+  }
+  if (Array.isArray(vnode)) {
+    return vnode
+  } else if (isDef(vnode)) {
+
+    return vnode
+  } else {
+    return createEmptyVNode()
+  }
+}
+```
+
+又了新建VNode的入口后,在组件的mount阶段调用`vm._render`新建VNode,然后作为参数放在`vm._update`回调里,供程序的其他部分(观察者)在某个时刻(新建或更新)时调用
+```js
+// platforms/web/runtime/index.js
+// public mount method
+Vue.prototype.$mount = function (
+  el?: string | Element,
+  hydrating?: boolean
+): Component {
+  el = el && inBrowser ? query(el) : undefined
+  return mountComponent(this, el, hydrating)
+}
+
+// core/instance/lifecycle.js
+export function mountComponent (
+  vm: Component,
+  el: ?Element,
+  hydrating?: boolean
+): Component {
+  // ...
+    updateComponent = () => {
+      vm._update(vm._render(), hydrating)
+    }
+
+  new Watcher(vm, updateComponent, noop, {
+    before () {
+      if (vm._isMounted) {
+        callHook(vm, 'beforeUpdate')
+      }
+    }
+  }, true /* isRenderWatcher */)
+}
+```
 
 #### patch
 patch.js 中createPatchFunction 返回一个patch函数,外部通过调用`patch(oldVnode, newVnode, ...)`:
@@ -92,14 +256,13 @@ export function createPatchFunction (backend) {
     /* 一系列供下面组装调用的内部函数
     ... 
     */
-
     return function patch (oldVnode, vnode, hydrating, removeOnly, parentElm, refElm) {
         // ...
     }
 }
 ```
 
-Vue 解析了template生成了一个新的`VNode`时,后者运行中被其他方式(如wartch变量变动)改变了`VNode`,就会调用`_update`执行`__patch__`(即上面生成的patch函数);  
+Vue 解析了template生成了一个新的`VNode`时,后者运行中被其他方式(如watch变量变动)改变了`VNode`,就会调用`_update`执行`__patch__`(即上面生成的patch函数);  
 
 ```js
 // /core/instance/lifecycle.js
@@ -139,8 +302,8 @@ patch VNode 通常有3种情况
 3. 注释节点
 4. 文字节点
 
-上面这些操作都是会实装生成(或修改)了DOM,并将新DOM插入父DOM,即调用
-`insert(parentElm, vnode.elm, refElm)`
+上面这些操作都是会实装生成(或修改)了DOM,并将新DOM插入父DOM(调用
+`insert(parentElm, vnode.elm, refElm)`)
 ```js
   function createElm (
     vnode,
@@ -283,32 +446,7 @@ export function createComponentInstanceForVnode (
 }
 ```
 
-### VNode(Component)使用流程
-通常我们使用Vue时是用A包含一个B,而B组件本身也是一个包含C,D的组件这样的组合方式
-```html
-/* A.vue */
-<A>
-  <B></B>
-</A>
 
-/* B.vue */
-<B>
-  <C></C>
-  <D></D>
-</B>
-```
-
-+ 创建一个A 的VNode,里面带有A的元信息;
-+ patch A的VNode,这是根据A的元信息 发现有B(以及其他的data,prop,on,回调等等),初始化这些信息,创建B的初始Vnode,并附上B的元信息;
-  + 触发B 的patch;
-    + 创建C 的初始VNode;
-      + 触发C 的patch
-        + ...
-    + 创建D 的初始Vnode;
-      + 触发D 的patch  
-        + ...
-
-更新页面时也是通过先改变VNode里的信息,然后通过patch ,一层层将信息推进到底层的实际DOM并更新
 
 
 
