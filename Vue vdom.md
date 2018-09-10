@@ -79,7 +79,7 @@ Vue改变Dom的方式
 2. 通过patch函数更新DOM
     + patch函数会根据新旧VNode的差异对更新DOM的方式进行优化,减少实际更新DOM的次数
 
-### VNode(Component)使用流程
+### VNode(Component)使用流程 组合模式
 通常我们使用Vue时是用A包含一个B,而B组件本身也是一个包含C,D的组件这样的组合方式
 ```html
 /* A.vue */
@@ -93,6 +93,8 @@ Vue改变Dom的方式
   <D></D>
 </B>
 ```
+
+深度优先递归创建
 
 + 创建一个A 的VNode,里面带有A的元信息;
 + patch A的VNode,这是根据A的元信息 发现有B(以及其他的data,prop,on,回调等等),初始化这些信息,创建B的初始Vnode,并附上B的元信息;
@@ -211,7 +213,7 @@ export function _createElement (
 }
 ```
 
-又了新建VNode的入口后,在组件的mount阶段调用`vm._render`新建VNode,然后作为参数放在`vm._update`回调里,供程序的其他部分(观察者)在某个时刻(新建或更新)时调用
+有了新建VNode的入口后,在组件的mount阶段将`vm._render`作为参数放在`vm._update`回调里,供程序的其他部分(观察者)在某个时刻(新建或更新)时调用(即patch)
 ```js
 // platforms/web/runtime/index.js
 // public mount method
