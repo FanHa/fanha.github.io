@@ -15,9 +15,7 @@ void mysqli_common_connect(INTERNAL_FUNCTION_PARAMETERS, zend_bool is_real_conne
 {
     // ...
     // 解析参数
-    if (zend_parse_method_parameters(ZEND_NUM_ARGS(), getThis(), "O|sssslsl", &object, mysqli_link_class_entry,
-										&hostname, &hostname_len, &username, &username_len, &passwd, &passwd_len, &dbname, &dbname_len, &port, &socket, &socket_len,
-										&flags) == FAILURE) {
+    if (zend_parse_method_parameters(...) {
 			return;
 		}
     
