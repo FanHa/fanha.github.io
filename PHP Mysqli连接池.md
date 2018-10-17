@@ -11,13 +11,13 @@ PHP_FUNCTION(mysqli_real_connect)
 
 ```c
 // mysqli_noapi.c
-void mysqli_common_connect(INTERNAL_FUNCTION_PARAMETERS, zend_bool is_real_connect, zend_bool in_ctor) /* {{{ */
+void mysqli_common_connect(INTERNAL_FUNCTION_PARAMETERS, zend_bool is_real_connect, zend_bool in_ctor)
 {
     // ...
     // 解析参数
     if (zend_parse_method_parameters(...) {
-			return;
-		}
+		return;
+	}
     
     // ...
     // 如果连接制定了'p:'持久连接,则进入连接池逻辑
