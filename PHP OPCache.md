@@ -14,7 +14,7 @@ PHPAPI int php_execute_script(zend_file_handle *primary_file)
 
 ```c
 // Zend/zend.c
-ZEND_API int zend_execute_scripts(int type, zval *retval, int file_count, ...) /* {{{ */
+ZEND_API int zend_execute_scripts(int type, zval *retval, int file_count, ...) 
 {
     // ...
     // 这里调用zend_compile_file将文件解析成zend引擎可以执行的OPCODE(s);
