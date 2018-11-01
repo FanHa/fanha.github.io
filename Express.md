@@ -108,7 +108,6 @@ var app = function(req, res, next) {
 ```
 + 因此,所有发往http服务器的请求的处理都封装在`app.handle()`处理后面;
 
-
 ### app.handle
 ```js
 app.handle = function handle(req, res, callback) {
@@ -130,3 +129,10 @@ app.handle = function handle(req, res, callback) {
   router.handle(req, res, done);
 };
 ```
++ 疑问,这个`handle`方法是怎么根据路由里的不同配置转发到不同的处理流程里?
++ 由上面的`handle`流程可以看出请求的处理是链式的经过了一个个callback,应该是有某种机制在处理链上加入了路由器,然后由路由器根据路由选择相应的`下一跳`处理方法;
++ 这个方式由`middleeware`实现;
+
+### 中间件
+
+
