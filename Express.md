@@ -25,7 +25,7 @@ function createApplication() {
     app.handle(req, res, next);
   };
 
-  //混入事件处理方法
+  //混入事件处理方法,让app支持'on', 'emit'等方法
   mixin(app, EventEmitter.prototype, false);
 
   //混入基本的调用方法,如上面使用方使用的'get','listen', 和下面初始化过程时的'init'
@@ -126,13 +126,85 @@ app.handle = function handle(req, res, callback) {
     return;
   }
 
+  // 逻辑处理转到Router的handle方法,这样用户可以对Router进行编程,实现不同的路由转不同的处理逻辑,和中间件执行链等
   router.handle(req, res, done);
 };
 ```
-+ 疑问,这个`handle`方法是怎么根据路由里的不同配置转发到不同的处理流程里?
-+ 由上面的`handle`流程可以看出请求的处理是链式的经过了一个个callback,应该是有某种机制在处理链上加入了路由器,然后由路由器根据路由选择相应的`下一跳`处理方法;
-+ 这个方式由`middleeware`实现;
 
-### 中间件
+### 路由,中间件
+路由主要有 `Router.use()` 和 `Router.handle()`
+#### Router.use
+前面懒加载路由时
+```js
+// application.js
+app.lazyrouter = function lazyrouter() {
+  this._router.use(query(this.get('query parser fn')));
+  this._router.use(middleware.init(this));
+}
+```
+
+```js
+// router/index.js
+proto.use = function use(fn) {
+  // ...
+  var callbacks = flatten(slice.call(arguments, offset));
+
+  for (var i = 0; i < callbacks.length; i++) {
+    var fn = callbacks[i];
+
+    var layer = new Layer(path, {
+      sensitive: this.caseSensitive,
+      strict: false,
+      end: false
+    }, fn);
+
+    layer.route = undefined;
+
+    // 这里stack是Router的公共变量,Router通过多次调用use()方法,将请求的处理回调压入公共变量stack,这样可以use不同的回调件依次处理请求
+    this.stack.push(layer);
+  }
+
+  return this;
+};
+```
+
+#### Router.handle
+前面use了对请求处理的middleware后,请求的handle阶段,handle 通过while循环遍历stack,并根据配置的路径(route)和回调进行相应处理
+```js
+proto.handle = function handle(req, res, out) {
+  var self = this;
+
+  // middleware and routes
+  var stack = self.stack;
+  // setup next layer
+  req.next = next;
+
+  next();
+
+  function next(err) {
+    while (match !== true && idx < stack.length) {
+      layer = stack[idx++];
+      match = matchLayer(layer, path);
+      route = layer.route;
+
+      var method = req.method;
+      var has_method = route._handles_method(method);
+
+    }
+
+    // store route for dispatch on change
+    if (route) {
+      req.route = route;
+    }
+
+    // this should be done for the layer
+    self.process_params(layer, paramcalled, req, res, function (err) {
+      if (route) {
+        return layer.handle_request(req, res, next);
+      }
+    });
+  }
+};
+```
 
 
