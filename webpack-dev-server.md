@@ -127,9 +127,7 @@ function Server(compiler, options) {
       // ...
     },
     before: () => {
-      if (typeof options.before === 'function') {
-        options.before(app, this);
-      }
+      // ...
     },
     // 前面生成的wabpack-compiler-middleware就是在这里作为一个中间件传入express
     middleware: () => {
@@ -137,19 +135,16 @@ function Server(compiler, options) {
       app.use(this.middleware);
     },
     after: () => {
-      if (typeof options.after === 'function') { options.after(app, this); }
+      // ...
     },
     headers: () => {
-      app.all('*', this.setContentHeaders.bind(this));
+      // ...
     },
     magicHtml: () => {
-      app.get('*', this.serveMagicHtml.bind(this));
+      // ...
     },
     setup: () => {
-      if (typeof options.setup === 'function') {
-        log('The `setup` option is deprecated and will be removed in v3. Please update your config to use `before`');
-        options.setup(app, this);
-      }
+      // ...
     }
   };
 
@@ -158,7 +153,7 @@ function Server(compiler, options) {
     features[feature]();
   });
 
-  //启动http服务器
+  //启动http(s)服务器
   if (options.https) {
     this.listeningApp = spdy.createServer(options.https, app);
   } else {
@@ -173,7 +168,11 @@ function Server(compiler, options) {
 ```
 
 ### webpack-dev-middleware
-`webpack-dev-server` 通过生成一个`webpack-dev-middleware`中间件 传入 express,httpDev服务器收到http请求时会把请求交给这个中间件处理;
++ `webpack-dev-server` 通过生成一个`webpack-dev-middleware`中间件(this.middleware);
++ 然后通过`app.use(this.middleware)` 传入express;
++ httpDev服务器收到http请求时会把请求交给这个中间件处理;
+
+middleware中间件内容如下
 ```js
 // webpack-dev-middleware/middleware.js
 module.exports = function(compiler, options) {
@@ -187,70 +186,31 @@ module.exports = function(compiler, options) {
 		watching: undefined,
 		forceRebuild: false
 	};
+
+  // 初始化环境,使context.fs不直接访问文件系统,而交给compiler(即webpack解析器)
 	var shared = Shared(context);
 
-	// The middleware function
+	// 这个函数就是要返回给express做回调的函数
 	function webpackDevMiddleware(req, res, next) {
-		function goNext() {
-			if(!context.options.serverSideRender) return next();
-			return new Promise(function(resolve) {
-				shared.ready(function() {
-					res.locals.webpackStats = context.webpackStats;
-					resolve(next());
-				}, req);
-			});
-		}
-
-		if(req.method !== "GET") {
-			return goNext();
-		}
 
 		var filename = getFilenameFromUrl(context.options.publicPath, context.compiler, req.url);
-		if(filename === false) return goNext();
 
 		return new Promise(function(resolve) {
+      // 这里懒加载,需要让compiler检查文件状态,预先准备好文件的内容,然后后面才能使用context.fs.readFileSync(filename)
 			shared.handleRequest(filename, processRequest, req);
 			function processRequest() {
 				try {
+
 					var stat = context.fs.statSync(filename);
-					if(!stat.isFile()) {
-						if(stat.isDirectory()) {
-							var index = context.options.index;
-
-							if(index === undefined || index === true) {
-								index = "index.html";
-							} else if(!index) {
-								throw "next";
-							}
-
-							filename = pathJoin(filename, index);
-							stat = context.fs.statSync(filename);
-							if(!stat.isFile()) throw "next";
-						} else {
-							throw "next";
-						}
-					}
+					//...
 				} catch(e) {
 					return resolve(goNext());
 				}
 
-				// server content
+				// 读取要get的文件
 				var content = context.fs.readFileSync(filename);
-				content = shared.handleRangeHeaders(content, req, res);
-				var contentType = mime.lookup(filename);
-				// do not add charset to WebAssembly files, otherwise compileStreaming will fail in the client
-				if(!/\.wasm$/.test(filename)) {
-					contentType += "; charset=UTF-8";
-				}
-				res.setHeader("Content-Type", contentType);
-				res.setHeader("Content-Length", content.length);
-				if(context.options.headers) {
-					for(var name in context.options.headers) {
-						res.setHeader(name, context.options.headers[name]);
-					}
-				}
-				// Express automatically sets the statusCode to 200, but not all servers do (Koa).
-				res.statusCode = res.statusCode || 200;
+				
+        // 返回结果
 				if(res.send) res.send(content);
 				else res.end(content);
 				resolve();
@@ -258,11 +218,53 @@ module.exports = function(compiler, options) {
 		});
 	}
 
-	webpackDevMiddleware.getFilenameFromUrl = getFilenameFromUrl.bind(this, context.options.publicPath, context.compiler);
-	webpackDevMiddleware.waitUntilValid = shared.waitUntilValid;
-	webpackDevMiddleware.invalidate = shared.invalidate;
-	webpackDevMiddleware.close = shared.close;
-	webpackDevMiddleware.fileSystem = context.fs;
+  //...
 	return webpackDevMiddleware;
 };
 ```
+
+ + 中间件通过Shared方法把访问文件的文件系统指向了一个新生成的`MemoryFileSystem`;
+ + 然后通过在读取文件前,先调用`handleRequest`方法,让`compiler`按需准备好文件;
+ + 再读文件,返回给客户端;
+```js
+// webpack-dev-middleware/lib/Shared.js
+module.exports = function Shared(context) {
+	var share = {
+		setFs: function(compiler) {
+			
+			fs = compiler.outputFileSystem = new MemoryFileSystem();
+			context.fs = fs;
+		},
+    // ...
+		handleRequest: function(filename, processRequest, req) {
+			// in lazy mode, rebuild on bundle request
+			if(context.options.lazy && (!context.options.filename || context.options.filename.test(filename)))
+        //这个里面会调用compiler来生成虚拟的文件
+				share.rebuild();
+			if(HASH_REGEXP.test(filename)) {
+				try {
+					if(context.fs.statSync(filename).isFile()) {
+						processRequest();
+						return;
+					}
+				} catch(e) {
+				}
+			}
+			share.ready(processRequest, req);
+		},
+    rebuild: function rebuild() {
+			if(context.state) {
+				context.state = false;
+				context.compiler.run(share.handleCompilerCallback);
+			} else {
+				context.forceRebuild = true;
+			}
+		},
+	};
+  // 设置context的文件系统,使读取文件从webpackCompiler生成的MemoryFileSystem里读
+	share.setFs(context.compiler);
+	return share;
+};
+```
+
+### 服务器怎样在文件改动时自动rebuild 和 通知前端页面刷新
