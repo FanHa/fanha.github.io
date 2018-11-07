@@ -14,7 +14,6 @@
 ```js
 // webpack-dev-server/bin/webpack-dev-server.js
 
-
 // ...
 // 解析配置文件生成wpOpt,然后传入processOptions
 processOptions(wpOpt);
@@ -62,7 +61,7 @@ function startDevServer(webpackOptions, options) {
     //...
   }
   //...
-  // 启动
+  // 启动(并附带启动了一个websocket服务)
   server.listen(options.socket, options.host, (err) => {
     //...
   });
@@ -267,4 +266,47 @@ module.exports = function Shared(context) {
 };
 ```
 
-### 服务器怎样在文件改动时自动rebuild 和 通知前端页面刷新
+### 开发时服务器怎样通知前端页面访问的文件发生了变化,以便让前端js做出相应的操作(刷新页面)
+服务在`startDevServer`阶段,调用`listen`方法时
+```js
+// webpack-dev-server/lib/Server.js
+Server.prototype.listen = function (port, hostname, fn) {
+
+  const returnValue = this.listeningApp.listen(port, hostname, (err) => {
+
+    // sockjs时对websocket的一层封装,兼容了一些不能使用websocket机制的浏览器
+    const sockServer = sockjs.createServer({
+      //...
+    });
+    sockServer.on('connection', (conn) => {
+      // 收到客户端的连接后将该连接push到sockets中,后面有什么事件触发时用来发送消息给客户端(如开服时改了服务端代码,通知浏览器,浏览器收到通知后刷新页面)
+      this.sockets.push(conn);
+    });
+    // 客户端请求建立连接的入口
+    sockServer.installHandlers(this.listeningApp, {
+      prefix: '/sockjs-node'
+    });
+  });
+
+  return returnValue;
+}
+
+```
+
+```js
+// webpack-dev-server/lib/Server.js
+function Server(compiler, options) {
+  // ...
+  // 新建Server实例时,向compiler(webpack)注册监听了事件done,即webpack重新编译好开发的改动后,会触发;
+  compiler.plugin('done', (stats) => {
+    this._sendStats(this.sockets, stats.toJson(clientStats));
+    this._stats = stats;
+  });
+  // ...
+}
+Server.prototype._sendStats = function (sockets, stats, force) {
+  // 发送给所有连接此服服务器的开发的浏览器
+  this.sockWrite(sockets, 'hash', stats.hash);
+
+};
+```
