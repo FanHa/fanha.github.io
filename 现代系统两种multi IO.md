@@ -1,0 +1,2 @@
+1. Have the system provide a method for asking which descriptors are capable of performing the I/O [select, poll, epoll]
+1. Have the process register with the [operating] system all the events including I/O on descriptors that it is interested in tracking.[kqueue, Windows IOCP]
