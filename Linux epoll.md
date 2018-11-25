@@ -100,6 +100,41 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 	}
 
 }
+
+static int ep_insert(struct eventpoll *ep, const struct epoll_event *event,
+		     struct file *tfile, int fd, int full_check)
+{
+    struct epitem *epi;
+	// 这里使用了一个回调ep_ptable_queue_proc,ep_item_poll将这个回调注册到监听的文件中,这样当该文件触发事件时,会调用ep_ptable_queue_proc,这样就实现了事件信息从硬件到eventpoll结构的传送
+	epq.epi = epi;
+	init_poll_funcptr(&epq.pt, ep_ptable_queue_proc);
+	revents = ep_item_poll(epi, &epq.pt, 1);
+
+	// 将已经准备好的eventpoll_item插入eventpoll结构中便于管理和搜寻
+	ep_rbtree_insert(ep, epi);
+}
+
+static void ep_ptable_queue_proc(struct file *file, wait_queue_head_t *whead,
+				 poll_table *pt)
+{
+	struct epitem *epi = ep_item_from_epqueue(pt);
+	struct eppoll_entry *pwq;
+
+    // 这里whead是系统底层的事件内容,就是在这里系统把事件内容复制给了eventpoll结构的队列里,后面的epoll_wait就可以根据eventpoll结构里的事件信息来操作
+	if (epi->nwait >= 0 && (pwq = kmem_cache_alloc(pwq_cache, GFP_KERNEL))) {
+		init_waitqueue_func_entry(&pwq->wait, ep_poll_callback);
+		pwq->whead = whead;
+		pwq->base = epi;
+		if (epi->event.events & EPOLLEXCLUSIVE)
+			add_wait_queue_exclusive(whead, &pwq->wait);
+		else
+			add_wait_queue(whead, &pwq->wait);
+		list_add_tail(&pwq->llink, &epi->pwqlist);
+		epi->nwait++;
+	} else {
+
+	}
+}
 ```
 
 ### epoll_wait
@@ -156,6 +191,6 @@ static int ep_send_events(struct eventpoll *ep,
 
 ### Linux 怎么把事件让eventpoll结构知晓
 + epoll_create初始化ep;
-+ epoll_ctl 控制事件监听;
++ epoll_ctl 控制事件监听,并对要监听的文件符设置回调;
++ linux 怎么把硬件底层触发的事件通过前面设置回调返回给eventpoll结构;
 + epoll_wait 取出eventpoll里的已经就绪的ready_list;
-+ linux 怎么把硬件底层触发的事件返回给eventpoll结构,并设置ready_list呢?
