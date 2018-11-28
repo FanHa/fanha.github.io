@@ -208,7 +208,6 @@ __rb_insert(struct rb_node *node, struct rb_root *root,
 			}
 
 			// 当前节点是父节点的右子节点时,祖父节点向左翻转,并翻转当前节点的父,叔父节点为红,祖父节点为黑
-			/* Case 3 - left rotate at gparent */
 			WRITE_ONCE(gparent->rb_right, tmp); /* == parent->rb_left */
 			WRITE_ONCE(parent->rb_left, gparent);
 			if (tmp)
