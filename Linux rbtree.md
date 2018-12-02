@@ -221,6 +221,7 @@ __rb_insert(struct rb_node *node, struct rb_root *root,
 ```
 
 #### 删除操作 
+删除操作先通过普通的二叉树查找找到要删除的node节点的位置
 ```c
 void rb_erase_cached(struct rb_node *node, struct rb_root_cached *root)
 {
@@ -236,12 +237,15 @@ void rb_erase_cached(struct rb_node *node, struct rb_root_cached *root)
 ```
 
 ```c
+// 这里传进来的 "const struct rb_augment_callbacks *augment" 是个哑的 dummy_rotate,所以后面遇到augment相关调用直接省略
 static __always_inline struct rb_node *
 __rb_erase_augmented(struct rb_node *node, struct rb_root *root,
 		     struct rb_node **leftmost,
 		     const struct rb_augment_callbacks *augment)
 {
+	// child 指向要删除的节点node 的右子孩子
 	struct rb_node *child = node->rb_right;
+	// tmp 指向要删除的节点node 的左子孩子
 	struct rb_node *tmp = node->rb_left;
 	struct rb_node *parent, *rebalance;
 	unsigned long pc;
@@ -250,36 +254,44 @@ __rb_erase_augmented(struct rb_node *node, struct rb_root *root,
 		*leftmost = rb_next(node);
 
 	if (!tmp) {
-		/*
-		 * Case 1: node to erase has no more than 1 child (easy!)
-		 *
-		 * Note that if there is one child it must be red due to 5)
-		 * and node must be black due to 4). We adjust colors locally
-		 * so as to bypass __rb_erase_color() later on.
-		 */
+		// 左子孩子节点为NULL节点
 		pc = node->__rb_parent_color;
 		parent = __rb_parent(pc);
+		// 用node节点的右子节点替换到node的位置
 		__rb_change_child(node, child, parent, root);
 		if (child) {
+
+			// 如果本来的右子节点不是NULL节点,则将右子节点的父节点指针 和 颜色变换为了要删除的节点的父节点指针和颜色;
 			child->__rb_parent_color = pc;
+
+			// 此时没有改变红黑树的特性,所以不需要平衡
 			rebalance = NULL;
 		} else
+
+			// 当右子节点也为NULL节点时,如果要删除的节点时黑,则红黑树的特性失效,需要rebalance
 			rebalance = __rb_is_black(pc) ? parent : NULL;
 		tmp = parent;
 	} else if (!child) {
-		/* Still case 1, but this time the child is node->rb_left */
+		// 左孩子节点不为NULL, 右孩子节点为NULL,和前面左子NULL,右子不为NULL类似
 		tmp->__rb_parent_color = pc = node->__rb_parent_color;
 		parent = __rb_parent(pc);
 		__rb_change_child(node, tmp, parent, root);
 		rebalance = NULL;
 		tmp = parent;
 	} else {
+
+		// 两个子节点都不为NULL时;
+		// successor指向右子节点;
 		struct rb_node *successor = child, *child2;
 
+		// tmp指向右子节点的左孩子节点
 		tmp = child->rb_left;
+
+		// 这里是找node节点的右子树的最小值来继承被删除的node节点
 		if (!tmp) {
+			
+			//node 节点右子节点successor的左子节点为NULL时,successor就是被删除的节点的继承节点
 			/*
-			 * Case 2: node's successor is its right child
 			 *
 			 *    (n)          (s)
 			 *    / \          / \
@@ -289,13 +301,9 @@ __rb_erase_augmented(struct rb_node *node, struct rb_root *root,
 			 */
 			parent = successor;
 			child2 = successor->rb_right;
-
-			augment->copy(node, successor);
 		} else {
+			// successor 节点的左子节点不为NULL时,则往左子树里找继承节点
 			/*
-			 * Case 3: node's successor is leftmost under
-			 * node's right child subtree
-			 *
 			 *    (n)          (s)
 			 *    / \          / \
 			 *  (x) (y)  ->  (x) (y)
@@ -315,11 +323,9 @@ __rb_erase_augmented(struct rb_node *node, struct rb_root *root,
 			WRITE_ONCE(parent->rb_left, child2);
 			WRITE_ONCE(successor->rb_right, child);
 			rb_set_parent(child, successor);
-
-			augment->copy(node, successor);
-			augment->propagate(parent, successor);
 		}
 
+		// 用新的successor节点替代旧的node节点
 		tmp = node->rb_left;
 		WRITE_ONCE(successor->rb_left, tmp);
 		rb_set_parent(tmp, successor);
@@ -328,19 +334,215 @@ __rb_erase_augmented(struct rb_node *node, struct rb_root *root,
 		tmp = __rb_parent(pc);
 		__rb_change_child(node, successor, tmp, root);
 
+		// 因为继承节点肯定没有左子节点,所以如果继承节点的 右子节点不为NULL, 则一定是红色节点
 		if (child2) {
+			// 当继承节点的右子节点不为NULL时,继承节点一定是黑色节点,所以替换掉继承节点的右子节点要变成黑色;然后继承节点变成被删除的节点node的颜色
 			successor->__rb_parent_color = pc;
 			rb_set_parent_color(child2, parent, RB_BLACK);
 			rebalance = NULL;
 		} else {
+
+			// 当继承节点的右子节点为NULL时,继承节点变为被删除节点的颜色
 			unsigned long pc2 = successor->__rb_parent_color;
 			successor->__rb_parent_color = pc;
+			// 如果继承节点本身是黑色,则树失去了特性,需要被重新平衡,
+			// 从继承节点本来的parent节点开始(实际这里是从这个parent以下,少了个黑色节点)
 			rebalance = __rb_is_black(pc2) ? parent : NULL;
 		}
 		tmp = successor;
 	}
-
-	augment->propagate(tmp, NULL);
 	return rebalance;
+}
+```
+#### 再平衡
+这里传进来的augment_rotate参数同样是个哑函数,后面省略;
+在执行这个函数前的背景是:
++ parent的左子树的路径少了一个黑色节点;
++ parent本身是黑色节点;(如果是红色,早再上一步就已经翻转成黑色,不需要接着执行到这里);
+
+```c
+static __always_inline void
+____rb_erase_color(struct rb_node *parent, struct rb_root *root,
+	void (*augment_rotate)(struct rb_node *old, struct rb_node *new))
+{
+	struct rb_node *node = NULL, *sibling, *tmp1, *tmp2;
+
+	while (true) {
+		// 用递归向上冒泡
+		// 取sibling指针为parent节点的右子节点(node 为 parent的左子节点)
+		sibling = parent->rb_right;
+		if (node != sibling) {	/* node == parent->rb_left */
+			if (rb_is_red(sibling)) {
+				// sibling节点为红色时,把parent节点向左翻转,这时整个在下图中的子树的红P节点到左子树的叶子节点的黑色数并没有变化,依然比预定目标少1;
+				//我们把sibling节点指向本来的Sl,这样就形成了sibling为黑色节点的条件,
+				/*
+				 *
+				 *      黑P               黑S
+				 *     /  \              /  \
+				 *   黑N  红S    -->    红P  黑Sr
+				 *        /  \         /  \
+				 *      黑Sl 黑Sr     黑N  黑Sl --->新sibling指向这个位置
+				 */
+				tmp1 = sibling->rb_left;
+				WRITE_ONCE(parent->rb_right, tmp1);
+				WRITE_ONCE(sibling->rb_left, parent);
+				rb_set_parent_color(tmp1, parent, RB_BLACK);
+				__rb_rotate_set_parents(parent, sibling, root,
+							RB_RED);
+				augment_rotate(parent, sibling);
+				sibling = tmp1;
+			}
+			// sibling为黑色节点时的执行逻辑如下
+			tmp1 = sibling->rb_right;
+			if (!tmp1 || rb_is_black(tmp1)) {
+				//sibling 的右子节点是黑色时;
+				tmp2 = sibling->rb_left;
+				if (!tmp2 || rb_is_black(tmp2)) {
+					// sibling 的左右子节点都是黑色时
+					/*
+					 *
+					 *    (p)             (p)
+					 *    / \             / \
+					 *  黑N  黑S    --> 黑N  红s
+					 *      / \             /  \
+					 *    黑Sl 黑Sr       黑Sl  黑Sr
+					 */
+					 // 将sibling节点由红变黑
+					rb_set_parent_color(sibling, parent,
+							    RB_RED);
+
+					if (rb_is_red(parent))
+						// 如果parent节点本来是红的,则转黑;
+						// 此时p节点往左子树方向的路径+1,右子树方向不变,平衡了前面左子树路径少1的缺憾,树已平衡,可以直接break;
+						rb_set_black(parent);
+					else {
+						// 如果parent本来是黑的;
+						// 此时parent的左子树路径黑色依然少1,右子树路径经过黑转红后也少1,整个parent子树的路径黑色都少1;
+						// 把node指向parent节点,parent指向parent的父节点;
+						// 可以看成一个新的子树路径黑色少1 的情况,continue递归向上冒泡再走一遍逻辑;
+						node = parent;
+						parent = rb_parent(node);
+						if (parent)
+							continue;
+					}
+					break;
+				}
+				// sibling右子节点为黑色,左子节点为红色时;
+				// 此时依然是parent的左子树N节点的路径黑色少1;
+				/*
+				 * Case 3 - right rotate at sibling
+				 * (p could be either color here)
+				 *
+				 *   (p)           (p)
+				 *   / \           / \
+				 *  N   S    -->  N   sl
+				 *     / \             \
+				 *    sl  Sr            S
+				 *                       \
+				 *                        Sr
+				 *
+				 * Note: p might be red, and then both
+				 * p and sl are red after rotation(which
+				 * breaks property 4). This is fixed in
+				 * Case 4 (in __rb_rotate_set_parents()
+				 *         which set sl the color of p
+				 *         and set p RB_BLACK)
+				 *
+				 *   (p)            (sl)
+				 *   / \            /  \
+				 *  N   sl   -->   P    S
+				 *       \        /      \
+				 *        S      N        Sr
+				 *         \
+				 *          Sr
+				 */
+				tmp1 = tmp2->rb_right;
+				WRITE_ONCE(sibling->rb_left, tmp1);
+				WRITE_ONCE(tmp2->rb_right, sibling);
+				WRITE_ONCE(parent->rb_right, tmp2);
+				if (tmp1)
+					rb_set_parent_color(tmp1, sibling,
+							    RB_BLACK);
+				augment_rotate(sibling, tmp2);
+				tmp1 = sibling;
+				sibling = tmp2;
+			}
+			/*
+			 * Case 4 - left rotate at parent + color flips
+			 * (p and sl could be either color here.
+			 *  After rotation, p becomes black, s acquires
+			 *  p's color, and sl keeps its color)
+			 *
+			 *      (p)             (s)
+			 *      / \             / \
+			 *     N   S     -->   P   Sr
+			 *        / \         / \
+			 *      (sl) sr      N  (sl)
+			 */
+			tmp2 = sibling->rb_left;
+			WRITE_ONCE(parent->rb_right, tmp2);
+			WRITE_ONCE(sibling->rb_left, parent);
+			rb_set_parent_color(tmp1, sibling, RB_BLACK);
+			if (tmp2)
+				rb_set_parent(tmp2, parent);
+			__rb_rotate_set_parents(parent, sibling, root,
+						RB_BLACK);
+			augment_rotate(parent, sibling);
+			break;
+		} else {
+			sibling = parent->rb_left;
+			if (rb_is_red(sibling)) {
+				/* Case 1 - right rotate at parent */
+				tmp1 = sibling->rb_right;
+				WRITE_ONCE(parent->rb_left, tmp1);
+				WRITE_ONCE(sibling->rb_right, parent);
+				rb_set_parent_color(tmp1, parent, RB_BLACK);
+				__rb_rotate_set_parents(parent, sibling, root,
+							RB_RED);
+				augment_rotate(parent, sibling);
+				sibling = tmp1;
+			}
+			tmp1 = sibling->rb_left;
+			if (!tmp1 || rb_is_black(tmp1)) {
+				tmp2 = sibling->rb_right;
+				if (!tmp2 || rb_is_black(tmp2)) {
+					/* Case 2 - sibling color flip */
+					rb_set_parent_color(sibling, parent,
+							    RB_RED);
+					if (rb_is_red(parent))
+						rb_set_black(parent);
+					else {
+						node = parent;
+						parent = rb_parent(node);
+						if (parent)
+							continue;
+					}
+					break;
+				}
+				/* Case 3 - left rotate at sibling */
+				tmp1 = tmp2->rb_left;
+				WRITE_ONCE(sibling->rb_right, tmp1);
+				WRITE_ONCE(tmp2->rb_left, sibling);
+				WRITE_ONCE(parent->rb_left, tmp2);
+				if (tmp1)
+					rb_set_parent_color(tmp1, sibling,
+							    RB_BLACK);
+				augment_rotate(sibling, tmp2);
+				tmp1 = sibling;
+				sibling = tmp2;
+			}
+			/* Case 4 - right rotate at parent + color flips */
+			tmp2 = sibling->rb_right;
+			WRITE_ONCE(parent->rb_left, tmp2);
+			WRITE_ONCE(sibling->rb_right, parent);
+			rb_set_parent_color(tmp1, sibling, RB_BLACK);
+			if (tmp2)
+				rb_set_parent(tmp2, parent);
+			__rb_rotate_set_parents(parent, sibling, root,
+						RB_BLACK);
+			augment_rotate(parent, sibling);
+			break;
+		}
+	}
 }
 ```
