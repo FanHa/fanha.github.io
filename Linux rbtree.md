@@ -392,9 +392,11 @@ ____rb_erase_color(struct rb_node *parent, struct rb_root *root,
 				augment_rotate(parent, sibling);
 				sibling = tmp1;
 			}
+
 			// sibling为黑色节点时的执行逻辑如下
 			tmp1 = sibling->rb_right;
 			if (!tmp1 || rb_is_black(tmp1)) {
+
 				//sibling 的右子节点是黑色时;
 				tmp2 = sibling->rb_left;
 				if (!tmp2 || rb_is_black(tmp2)) {
@@ -418,7 +420,7 @@ ____rb_erase_color(struct rb_node *parent, struct rb_root *root,
 					else {
 						// 如果parent本来是黑的;
 						// 此时parent的左子树路径黑色依然少1,右子树路径经过黑转红后也少1,整个parent子树的路径黑色都少1;
-						// 把node指向parent节点,parent指向parent的父节点;
+						// 把node指向parent节点,parent指向parent的父节点,
 						// 可以看成一个新的子树路径黑色少1 的情况,continue递归向上冒泡再走一遍逻辑;
 						node = parent;
 						parent = rb_parent(node);
@@ -433,51 +435,57 @@ ____rb_erase_color(struct rb_node *parent, struct rb_root *root,
 				 * Case 3 - right rotate at sibling
 				 * (p could be either color here)
 				 *
-				 *   (p)           (p)
-				 *   / \           / \
-				 *  N   S    -->  N   sl
-				 *     / \             \
-				 *    sl  Sr            S
-				 *                       \
-				 *                        Sr
+				 *    (p)             (p)
+				 *    / \             / \
+				 * 黑N   黑S    -->  黑N  红sl     
+				 *      /  \               \
+				 *    红sl  黑Sr            黑S
+				 *                           \
+				 *                            黑Sr
 				 *
-				 * Note: p might be red, and then both
-				 * p and sl are red after rotation(which
-				 * breaks property 4). This is fixed in
-				 * Case 4 (in __rb_rotate_set_parents()
-				 *         which set sl the color of p
-				 *         and set p RB_BLACK)
-				 *
-				 *   (p)            (sl)
-				 *   / \            /  \
-				 *  N   sl   -->   P    S
-				 *       \        /      \
-				 *        S      N        Sr
-				 *         \
-				 *          Sr
 				 */
+				 //这里情况有点绕,因为经过这次转变后:
+				 // 黑N子树路径黑色少1;
+				 // 红sl左子树路径黑色少1;
+				 // 但是经过接下来执行的逻辑一样是可以使这些路径黑色少1的子树恢复平衡.....
 				tmp1 = tmp2->rb_right;
 				WRITE_ONCE(sibling->rb_left, tmp1);
 				WRITE_ONCE(tmp2->rb_right, sibling);
 				WRITE_ONCE(parent->rb_right, tmp2);
 				if (tmp1)
-					rb_set_parent_color(tmp1, sibling,
-							    RB_BLACK);
-				augment_rotate(sibling, tmp2);
+					rb_set_parent_color(tmp1, sibling,RB_BLACK);
+
 				tmp1 = sibling;
 				sibling = tmp2;
 			}
+			// 这里右两种可能:
+			// 1.
+			// sibling 的 右子节点为红色时,把p向左翻转(和颜色);
+			// 此时子树左边的路径黑色+1;
+			// 右边先-1(黑S),然后又+1(sr由红转黑);
+			// 左右维持平衡,可以break;
 			/*
-			 * Case 4 - left rotate at parent + color flips
-			 * (p and sl could be either color here.
-			 *  After rotation, p becomes black, s acquires
-			 *  p's color, and sl keeps its color)
 			 *
-			 *      (p)             (s)
-			 *      / \             / \
-			 *     N   S     -->   P   Sr
-			 *        / \         / \
-			 *      (sl) sr      N  (sl)
+			 *        (p)               (s)
+			 *        / \               / \
+			 *     黑N   黑S     -->  黑P  黑Sr
+			 *           / \         / \
+			 *        (sl) 红sr    黑N (sl)
+			 */
+
+			 // 2.
+			 // 经过前面的"sibling右子节点为黑色,左子节点为红色时"操作得到的结果如下并且:
+			 // 2.1 黑N子树路径黑色少1;
+			 // 2.2 红sl左子树路径黑色少1.
+			 // 对p向左翻转并变色黑,这些路径黑色少1的子树恢复了正常,也可以break出循环
+			 /*
+			 *    (p)             (sl)
+			 *    / \             /  \
+			 *  黑N  红sl   -->  黑P  黑S
+			 *        \         /      \
+			 *        黑S      黑N      黑Sr
+			 *         \
+			 *          黑Sr
 			 */
 			tmp2 = sibling->rb_left;
 			WRITE_ONCE(parent->rb_right, tmp2);
@@ -490,6 +498,8 @@ ____rb_erase_color(struct rb_node *parent, struct rb_root *root,
 			augment_rotate(parent, sibling);
 			break;
 		} else {
+			// 这个与上面的逻辑基本镜像,即node为parent的右子节点,sibling为parent的左子节点;
+			// 因为上面的循环可能会递归冒泡到上一层,而上一层的node 和 sibling的左右顺序并不一定是第一次进来时的左右顺序;
 			sibling = parent->rb_left;
 			if (rb_is_red(sibling)) {
 				/* Case 1 - right rotate at parent */
