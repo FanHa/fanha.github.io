@@ -444,10 +444,7 @@ ____rb_erase_color(struct rb_node *parent, struct rb_root *root,
 				 *                            黑Sr
 				 *
 				 */
-				 //这里情况有点绕,因为经过这次转变后:
-				 // 黑N子树路径黑色少1;
-				 // 红sl左子树路径黑色少1;
-				 // 但是经过接下来执行的逻辑一样是可以使这些路径黑色少1的子树恢复平衡.....
+				 
 				tmp1 = tmp2->rb_right;
 				WRITE_ONCE(sibling->rb_left, tmp1);
 				WRITE_ONCE(tmp2->rb_right, sibling);
@@ -457,6 +454,10 @@ ____rb_erase_color(struct rb_node *parent, struct rb_root *root,
 
 				tmp1 = sibling;
 				sibling = tmp2;
+				//这里情况有点绕,因为经过这次转变后:
+				 // 1. 黑N子树路径黑色少1;
+				 // 2. 红sl左子树路径黑色少1;
+				 // 但是经过接下来执行的逻辑一样是可以使这些路径黑色少1的子树恢复平衡.....
 			}
 			// 这里右两种可能:
 			// 1.
