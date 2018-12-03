@@ -237,7 +237,7 @@ void rb_erase_cached(struct rb_node *node, struct rb_root_cached *root)
 ```
 
 ```c
-// 这里传进来的 "const struct rb_augment_callbacks *augment" 是个哑的 dummy_rotate,所以后面遇到augment相关调用直接省略
+// 这里传进来的rb_augment_callbacks是给高端玩家扩展整个红黑树的,一般使用时是个哑函数,后面省略;
 static __always_inline struct rb_node *
 __rb_erase_augmented(struct rb_node *node, struct rb_root *root,
 		     struct rb_node **leftmost,
@@ -355,8 +355,8 @@ __rb_erase_augmented(struct rb_node *node, struct rb_root *root,
 }
 ```
 #### 再平衡
-这里传进来的augment_rotate参数同样是个哑函数,后面省略;
-在执行这个函数前的背景是:
+这里传进来的augment_rotate是给高端玩家扩展整个红黑树的,一般使用时是个哑函数,后面省略;
+在执行这个`____rb_erase_color`前的背景是:
 + parent的左子树的路径少了一个黑色节点;
 + parent本身是黑色节点;(如果是红色,早再上一步就已经翻转成黑色,不需要接着执行到这里);
 
@@ -459,7 +459,7 @@ ____rb_erase_color(struct rb_node *parent, struct rb_root *root,
 				 // 2. 红sl左子树路径黑色少1;
 				 // 但是经过接下来执行的逻辑一样是可以使这些路径黑色少1的子树恢复平衡.....
 			}
-			// 这里右两种可能:
+			// 这里有两种可能:
 			// 1.
 			// sibling 的 右子节点为红色时,把p向左翻转(和颜色);
 			// 此时子树左边的路径黑色+1;
@@ -478,7 +478,7 @@ ____rb_erase_color(struct rb_node *parent, struct rb_root *root,
 			 // 经过前面的"sibling右子节点为黑色,左子节点为红色时"操作得到的结果如下并且:
 			 // 2.1 黑N子树路径黑色少1;
 			 // 2.2 红sl左子树路径黑色少1.
-			 // 对p向左翻转并变色黑,这些路径黑色少1的子树恢复了正常,也可以break出循环
+			 // 对p向左翻转并变色后,这些路径黑色少1的子树恢复了正常,也可以break出循环
 			 /*
 			 *    (p)             (sl)
 			 *    / \             /  \
