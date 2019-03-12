@@ -97,9 +97,20 @@ static SUB_STATE_RETURN write_state_machine(SSL *s)
             switch (st->write_state_work = pre_work(s, st->write_state_work)) {
                 //...
             }
+            // 根据当前的hand_state选择构造消息的函数,并调用该函数将要发回客户端的信息准备好
+            if (!get_construct_message_f(s, &pkt, &confunc, &mt)) {
+                /* SSLfatal() already called */
+                return SUB_STATE_ERROR;
+            }
+            // ...
+            if (confunc != NULL && !confunc(s, &pkt)) {
+                WPACKET_cleanup(&pkt);
+                check_fatal(s, SSL_F_WRITE_STATE_MACHINE);
+                return SUB_STATE_ERROR;
+            }
 
         case WRITE_STATE_SEND:
-            // 这里是写操作里的主逻辑
+            // 这里将构造号的内容发回客户端
             ret = statem_do_write(s);
 
             //...
@@ -162,8 +173,8 @@ static SUB_STATE_RETURN read_state_machine(SSL *s)
     }
 ```
 
-#### 握手交互
-服务端在实际的握手中需要进行多次读和多次写,且读写所调用的函数不尽相同,需要通过另一个状态变量来决定
+#### 握手状态机交互
+服务端在实际的握手中需要进行多次读和多次写,且读写所调用的函数不尽相同,需要通过另一个状态变量(hand_state)来决定
 当前连接的握手到了哪一步,并调用哪个函数处理当前的请求
 比如下面同样是读从客户端发来的包,但因为当前所处的握手状态不同而转向了不同的处理逻辑
 ```c
@@ -217,7 +228,9 @@ MSG_PROCESS_RETURN ossl_statem_server_process_message(SSL *s, PACKET *pkt)
 ```
 
 ##### 解析clientHello
-服务端最开始的状态是‘等待clientHello’,这个时候调用的函数是解析从客户端发来的clientHello握手请求
+服务端最开始的状态是‘为定义’,收到客户端发来的clientHello后,  
+服务端在读状态机的‘READ_STATE_HEADER’阶段将hand_state设置为TLS_ST_SR_CLNT_HELLO,  
+并在‘READ_STATE_BODY’阶段调用函数tls_process_client_hello解析从客户端发来的clientHello握手请求  
 ```c
 // ssl/statem/statem_srvr.c
 MSG_PROCESS_RETURN tls_process_client_hello(SSL *s, PACKET *pkt)
@@ -277,4 +290,56 @@ MSG_PROCESS_RETURN tls_process_client_hello(SSL *s, PACKET *pkt)
 ```
 
 ##### 服务端ServerHello
- TODO 
+ + 服务端解析完clientHello后,读写状态及切换为写状态‘MSG_FLOW_WRITING‘,  
+ + 然后在写状态的’WRITE_STATE_TRANSITION‘阶段将hand_state转换为’TLS_ST_SW_SRVR_HELLO‘,  
+ + 写状态机在‘WRITE_STATE_PRE_WORK’阶段,根据hand_state状态调用了tls_construct_server_hello来构造要写的消息内容;
+ + 构造要发的消息后,执行send阶段的函数,将消息”发“出去(这里并不一定真发出去了,优化可能会合并多个send操作)
+ ```c
+ // ssl/statem/statem_srvr.c
+int tls_construct_server_hello(SSL *s, WPACKET *pkt)
+{
+    // ...
+    // 服务端的版本和随机数
+    version = usetls13 ? TLS1_2_VERSION : s->version;
+    if (!WPACKET_put_bytes_u16(pkt, version)
+               /*
+                * Random stuff. Filling of the server_random takes place in
+                * tls_process_client_hello()
+                */
+            || !WPACKET_memcpy(pkt,
+                               s->hello_retry_request == SSL_HRR_PENDING
+                                   ? hrrrandom : s->s3->server_random,
+                               SSL3_RANDOM_SIZE)) {
+        //...
+    }
+    // sessionId 及 服务端选择的 加密方式
+    if (!WPACKET_sub_memcpy_u8(pkt, session_id, sl)
+            || !s->method->put_cipher_by_char(s->s3->tmp.new_cipher, pkt, &len)
+            || !WPACKET_put_bytes_u8(pkt, compm)) {
+        // ...
+    }
+}
+ ```
+
+ ##### 服务端ServerCertificate
+ + 服务端写完clientHello后,读写状态机依然处于写状态,这时会重复一次写状态的流程;
+ + 但这次写状态及在’WRITE_STATE_TRANSITION‘阶段根据当前的hand_state转变为‘TLS_ST_SW_CERT’;
+ + 然后在写状态机‘WRITE_STATE_PRE_WORK’阶段时,根据新的hand_state状态,调用了构造消息的函数tls_construct_server_certificate;
+ + send;
+```c
+ // ssl/statem/statem_srvr.c
+int tls_construct_server_certificate(SSL *s, WPACKET *pkt)
+{
+    CERT_PKEY *cpk = s->s3->tmp.cert;
+
+    // 准备好服务端要发的证书
+    if (!ssl3_output_cert_chain(s, pkt, cpk)) {
+        /* SSLfatal() already called */
+        return 0;
+    }
+
+    return 1;
+}
+```
+
+##### 服务端
