@@ -342,4 +342,86 @@ int tls_construct_server_certificate(SSL *s, WPACKET *pkt)
 }
 ```
 
-##### 服务端
+##### 服务端HelloDone
++ 服务端发送完ServerCertificate后还有一些“客户端服务端”双向认证的选项;
++ 但一般常见的ssl握手服务端的Hello到发送完ServerCertificate就结束并将读写状态机置为读状态,hand_state变为'TLS_ST_SW_SRVR_DONE',等待客户端验证完成再次发来的消息
+```c
+
+    case TLS_ST_SW_CERT:
+        // ...
+        /* Fall through */
+
+    case TLS_ST_SW_CERT_STATUS:
+        // ...
+        /* Fall through */
+
+    case TLS_ST_SW_KEY_EXCH:
+        // ...
+        /* Fall through */
+
+    case TLS_ST_SW_CERT_REQ:
+        st->hand_state = TLS_ST_SW_SRVR_DONE;
+        return WRITE_TRAN_CONTINUE;
+```
+
+
+##### 服务端收到KeyExchangeMessage
+服务端再次收到客户端的消息是客户端认证了服务端的证书后,用服务端的公钥加密的KeyExchangeMessage信息,里面附带了客户端新生成的随机数(学名pre-master secret);
+>> 注1: 前面服务端和客户端各生成了一个随机数,但这两个随机数的传输是明文的,而这里客户端新生成的随机数的传输是通过了公钥加密的
+>> 注2: 既然只有最后一个随机数是加密的,那前面两个随机数的意义是什么? 使随机数更随机?
+
++ 服务端将hand_state状态变为'TLS_ST_SR_KEY_EXCH';
++ processes_message阶段,根据当前的hand_state状态,调用tls_process_client_key_exchange
+```c
+// ssl/statem/statem_srvr.c
+    case TLS_ST_SW_SRVR_DONE:
+        // ...
+        st->hand_state = TLS_ST_SR_KEY_EXCH;
+    break;
+```
+```c
+switch (st->hand_state) {
+    // ...
+
+    case TLS_ST_SR_KEY_EXCH:
+        return tls_process_client_key_exchange(s, pkt);
+    // ...
+```
+```c
+// ssl/statem/statem_srvr.c
+// 以rsa算法为例
+MSG_PROCESS_RETURN tls_process_client_key_exchange(SSL *s, PACKET *pkt)
+{
+    // ...
+    if (alg_k & SSL_kPSK) {
+        
+    } else if (alg_k & (SSL_kRSA | SSL_kRSAPSK)) {
+        if (!tls_process_cke_rsa(s, pkt)) {
+            /* SSLfatal() already called */
+            goto err;
+        }
+    }
+    // ...
+```
+```c
+static int tls_process_cke_rsa(SSL *s, PACKET *pkt)
+{
+    // 得到服务器的私钥
+    rsa = EVP_PKEY_get0_RSA(s->cert->pkeys[SSL_PKEY_RSA].privatekey);
+    // ...
+    
+    // 用私钥解密客户端发来的消息
+    decrypt_len = (int)RSA_private_decrypt((int)PACKET_remaining(&enc_premaster),
+                                           PACKET_data(&enc_premaster),
+                                           rsa_decrypt, rsa, RSA_NO_PADDING);
+
+    // 用解密后的pre_master_secret生成一个新的密码,这个密码就是接下来用来和客户端交互时加密的
+    // 握手完成
+    // 1. 因为客户端也是用同样的信息的同样的方法来生成这个密码,所以服务端和客户端的密码是一致的;
+    // 2. 接下来对传输内容的加密是对称的,服务端客户端用同一个密码,同一种加解密方式对交互信息进行处理;
+    
+    if (!ssl_generate_master_secret(s, rsa_decrypt + padding_len,sizeof(rand_premaster_secret), 0)) {
+
+    }
+}
+```
