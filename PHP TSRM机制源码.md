@@ -165,7 +165,7 @@ TSRM_API void *ts_resource_ex(ts_rsrc_id id, THREAD_T *th_id)
 ```
 
 #### allocate_new_resource
-因为懒加载,线程第一次用到某个全局变量时才会去初始化这个全局变量在当前线程的复制
+因为懒加载,线程第一次用到全局变量时才会去初始化全局变量在当前线程的复制
 ```c
 static void allocate_new_resource(tsrm_tls_entry **thread_resources_ptr, THREAD_T thread_id)
 {
