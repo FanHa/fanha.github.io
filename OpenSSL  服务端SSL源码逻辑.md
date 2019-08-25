@@ -69,7 +69,7 @@ ngx_ssl_handshake(ngx_connection_t *c)
 ### SSL_do_handshake
 
 #### 读,写操作机制
-openssl分为读操作(解析从客户端发来的包)和写操作(发送消息到客户端);
+openssl握手分为读操作(解析从客户端发来的包)和写操作(发送消息到客户端);
 这两个操作通过挂钩函数一步步向前推进,完成一次交互;
 
 ```c
