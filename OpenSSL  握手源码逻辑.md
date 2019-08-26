@@ -80,11 +80,19 @@ static SUB_STATE_RETURN write_state_machine(SSL *s)
     OSSL_STATEM *st = &s->statem;
 
     if (s->server) {
+        // 作为ssl服务端的情况
         transition = ossl_statem_server_write_transition;
         pre_work = ossl_statem_server_pre_work;
         post_work = ossl_statem_server_post_work;
         get_construct_message_f = ossl_statem_server_construct_message;
-    } 
+    } else {
+        // 作为ssl客户端(发起者)的情况
+        transition = ossl_statem_client_write_transition;
+        pre_work = ossl_statem_client_pre_work;
+        post_work = ossl_statem_client_post_work;
+        get_construct_message_f = ossl_statem_client_construct_message;
+    }
+    
     while (1) {
         switch (st->write_state) {
         case WRITE_STATE_TRANSITION:
@@ -135,11 +143,18 @@ static SUB_STATE_RETURN read_state_machine(SSL *s)
     OSSL_STATEM *st = &s->statem;
 
     if (s->server) {
+        // 作为ssl服务端的情况
         transition = ossl_statem_server_read_transition;
         process_message = ossl_statem_server_process_message;
         max_message_size = ossl_statem_server_max_message_size;
         post_process_message = ossl_statem_server_post_process_message;
-    } 
+    } else {
+        // 作为ssl客户端(发起者)的情况
+        transition = ossl_statem_client_read_transition;
+        process_message = ossl_statem_client_process_message;
+        max_message_size = ossl_statem_client_max_message_size;
+        post_process_message = ossl_statem_client_post_process_message;
+    }
     while (1) {
         switch (st->read_state) {
         case READ_STATE_HEADER:
@@ -173,7 +188,7 @@ static SUB_STATE_RETURN read_state_machine(SSL *s)
     }
 ```
 
-#### 握手状态机交互
+#### 服务端握手状态机
 服务端在实际的握手中需要进行多次读和多次写,且读写所调用的函数不尽相同,需要通过另一个状态变量(hand_state)来决定
 当前连接的握手到了哪一步,并调用哪个函数处理当前的请求
 比如下面同样是读从客户端发来的包,但因为当前所处的握手状态不同而转向了不同的处理逻辑
@@ -228,7 +243,7 @@ MSG_PROCESS_RETURN ossl_statem_server_process_message(SSL *s, PACKET *pkt)
 ```
 
 ##### 解析clientHello
-服务端最开始的状态是‘为定义’,收到客户端发来的clientHello后,  
+服务端最开始的状态是‘未定义’,收到客户端发来的clientHello后,  
 服务端在读状态机的‘READ_STATE_HEADER’阶段将hand_state设置为TLS_ST_SR_CLNT_HELLO,  
 并在‘READ_STATE_BODY’阶段调用函数tls_process_client_hello解析从客户端发来的clientHello握手请求  
 ```c
@@ -291,7 +306,7 @@ MSG_PROCESS_RETURN tls_process_client_hello(SSL *s, PACKET *pkt)
 
 ##### 服务端ServerHello
  + 服务端解析完clientHello后,读写状态及切换为写状态‘MSG_FLOW_WRITING‘,  
- + 然后在写状态的’WRITE_STATE_TRANSITION‘阶段将hand_state转换为’TLS_ST_SW_SRVR_HELLO‘,  
+ + 然后在写状态的’WRITE_STATE_TRANSITION‘阶段将hand_state转换为'TLS_ST_SW_SRVR_HELLO',  
  + 写状态机在‘WRITE_STATE_PRE_WORK’阶段,根据hand_state状态调用了tls_construct_server_hello来构造要写的消息内容;
  + 构造要发的消息后,执行send阶段的函数,将消息”发“出去(这里并不一定真发出去了,优化可能会合并多个send操作)
  ```c
@@ -424,4 +439,89 @@ static int tls_process_cke_rsa(SSL *s, PACKET *pkt)
 
     }
 }
+```
+
+#### 客户端握手状态机
+```c
+// ssl/statem/statem.c
+static int state_machine(SSL *s, int server)
+{
+    /* Initialise state machine */
+    if (st->state == MSG_FLOW_UNINITED
+            || st->state == MSG_FLOW_FINISHED) {
+        if (st->state == MSG_FLOW_UNINITED) {
+
+            // 状态机的初始状态从TLS_ST_BEFORE开始
+            st->hand_state = TLS_ST_BEFORE;
+            st->request_state = TLS_ST_BEFORE;
+        }
+    }
+}
+```
+```c
+// ssl/statem/statem_clnt.c
+WRITE_TRAN ossl_statem_client_write_transition(SSL *s)
+{
+    OSSL_STATEM *st = &s->statem;
+
+    switch (st->hand_state) {
+
+    case TLS_ST_BEFORE:
+        // transition阶段将初始的握手状态置为 TLS_ST_CW_CLNT_HELLO
+        st->hand_state = TLS_ST_CW_CLNT_HELLO;
+        return WRITE_TRAN_CONTINUE;
+    }
+}
+```
+```c
+// ssl/statem/statem_clnt.c
+int ossl_statem_client_construct_message(SSL *s, WPACKET *pkt,
+                                         confunc_f *confunc, int *mt)
+{
+    OSSL_STATEM *st = &s->statem;
+
+    switch (st->hand_state) {
+    case TLS_ST_CW_CLNT_HELLO:
+        // 调用tls_construct_client_hello构造握手的hello包
+        *confunc = tls_construct_client_hello;
+        *mt = SSL3_MT_CLIENT_HELLO;
+        break;
+    }
+}
+
+```
+发完clientHello后,读写状态的状态置为读,收到回信后转入read_state_machine处理
+```c
+// ssl/statem/statem_clnt.c
+int ossl_statem_client_read_transition(SSL *s, int mt)
+{
+
+    case TLS_ST_CW_CLNT_HELLO:
+        if (mt == SSL3_MT_SERVER_HELLO) {
+            // transition阶段把握手状态置为 TLS_ST_CR_SRVR_HELLO
+            st->hand_state = TLS_ST_CR_SRVR_HELLO;
+            return 1;
+        }
+        break;
+    }
+}
+```
+```c
+// ssl/statem/statem_clnt.c
+MSG_PROCESS_RETURN ossl_statem_client_process_message(SSL *s, PACKET *pkt)
+{
+
+    case TLS_ST_CR_SRVR_HELLO:
+        // process_message阶段,调用tls_process_server_hello
+        return tls_process_server_hello(s, pkt);
+    }
+}
+
+MSG_PROCESS_RETURN tls_process_server_hello(SSL *s, PACKET *pkt)
+{
+    
+}
+```
+```c
+
 ```
