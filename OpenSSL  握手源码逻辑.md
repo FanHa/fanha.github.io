@@ -489,8 +489,42 @@ int ossl_statem_client_construct_message(SSL *s, WPACKET *pkt,
     }
 }
 
+int tls_construct_client_hello(SSL *s, WPACKET *pkt)
+{
+    unsigned char *session_id;
+
+    // 生成客户端随机数
+    if (i && ssl_fill_hello_random(s, 0, p, sizeof(s->s3->client_random),
+                                   DOWNGRADE_NONE) <= 0) {
+    }
+
+    // sessionId(从其他资料得知得知sessionId在客户端一直为0)
+    session_id = s->session->session_id;
+
+    // 客户端支持的加密算法
+    if (!ssl_cipher_list_to_bytes(s, SSL_get_ciphers(s), pkt)) {
+        /* SSLfatal() already called */
+        return 0;
+    }
+
+    // 压缩方式
+    if (ssl_allow_compression(s)
+            && s->ctx->comp_methods
+            && (SSL_IS_DTLS(s) || s->s3->tmp.max_ver < TLS1_3_VERSION)) {
+        int compnum = sk_SSL_COMP_num(s->ctx->comp_methods);
+
+    }
+
+    // tls扩展
+    if (!tls_construct_extensions(s, pkt, SSL_EXT_CLIENT_HELLO, NULL, 0)) {
+        /* SSLfatal() already called */
+        return 0;
+    }
+
+}
+
 ```
-发完clientHello后,读写状态的状态置为读,收到回信后转入read_state_machine处理
+将一些基本信息附在clientHello包发送完后,读写状态的状态置为读,收到回信后转入read_state_machine处理
 ```c
 // ssl/statem/statem_clnt.c
 int ossl_statem_client_read_transition(SSL *s, int mt)
@@ -519,9 +553,50 @@ MSG_PROCESS_RETURN ossl_statem_client_process_message(SSL *s, PACKET *pkt)
 
 MSG_PROCESS_RETURN tls_process_server_hello(SSL *s, PACKET *pkt)
 {
+    // 读取服务端生成的随机数
+    if (s->version == TLS1_3_VERSION
+            && sversion == TLS1_2_VERSION
+            && PACKET_remaining(pkt) >= SSL3_RANDOM_SIZE
+            && memcmp(hrrrandom, PACKET_data(pkt), SSL3_RANDOM_SIZE) == 0) {
+        s->hello_retry_request = SSL_HRR_PENDING;
+        hrr = 1;
+        if (!PACKET_forward(pkt, SSL3_RANDOM_SIZE)) {
+        }
+    } else {
+        if (!PACKET_copy_bytes(pkt, s->s3->server_random, SSL3_RANDOM_SIZE)) {
+        }
+    }
+
+    // 获取服务端生成的sessionId
+    if (!PACKET_get_length_prefixed_1(pkt, &session_id)) {
+    }
+
+    // 获取服务端选择的加密算法
+    if (!PACKET_get_bytes(pkt, &cipherchars, TLS_CIPHER_LEN)) {
     
+    }
+
+    // 获取服务端选择的压缩方式
+    if (!PACKET_get_1(pkt, &compression)) {
+    }
+
+
 }
 ```
+客户端获取了服务端的"选择"后,机修处于读状态机,到下一轮transition阶段
 ```c
+// ssl/statem/statem_clnt.c
+static int ossl_statem_client13_read_transition(SSL *s, int mt)
+{
+
+    case TLS_ST_CR_SRVR_HELLO:
+        if (mt == SSL3_MT_ENCRYPTED_EXTENSIONS) {
+            // 将握手阶段变为 TLS_ST_CR_ENCRYPTED_EXTENSIONS
+            st->hand_state = TLS_ST_CR_ENCRYPTED_EXTENSIONS;
+            return 1;
+        }
+        break;
+}
+// 这里暂时略过非主线的 TLS_ST_CR_ENCRYPTED_EXTENSIONS 处理,假设处理完
 
 ```
