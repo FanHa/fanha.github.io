@@ -337,7 +337,7 @@ int tls_construct_server_hello(SSL *s, WPACKET *pkt)
  ```
 
  ##### 服务端ServerCertificate
- + 服务端写完clientHello后,读写状态机依然处于写状态,这时会重复一次写状态的流程;
+ + 服务端写完ServerHello后,读写状态机依然处于写状态,这时会重复一次写状态的流程;
  + 但这次写状态及在’WRITE_STATE_TRANSITION‘阶段根据当前的hand_state转变为‘TLS_ST_SW_CERT’;
  + 然后在写状态机‘WRITE_STATE_PRE_WORK’阶段时,根据新的hand_state状态,调用了构造消息的函数tls_construct_server_certificate;
  + send;
@@ -586,17 +586,82 @@ MSG_PROCESS_RETURN tls_process_server_hello(SSL *s, PACKET *pkt)
 客户端获取了服务端的"选择"后,机修处于读状态机,到下一轮transition阶段
 ```c
 // ssl/statem/statem_clnt.c
-static int ossl_statem_client13_read_transition(SSL *s, int mt)
+int ossl_statem_client_read_transition(SSL *s, int mt)
+{
+    case TLS_ST_CR_SRVR_HELLO:
+        if (mt == SSL3_MT_CERTIFICATE) {
+            // transition阶段将hand_state置为TLS_ST_CR_CERT
+            st->hand_state = TLS_ST_CR_CERT;
+                return 1;
+        }
+}
+
+MSG_PROCESS_RETURN ossl_statem_client_process_message(SSL *s, PACKET *pkt)
+{
+    case TLS_ST_CR_CERT:
+        // process阶段调用 tls_process_server_certificate 解析服务端发来的包
+        return tls_process_server_certificate(s, pkt);
+}
+
+MSG_PROCESS_RETURN tls_process_server_certificate(SSL *s, PACKET *pkt)
 {
 
-    case TLS_ST_CR_SRVR_HELLO:
-        if (mt == SSL3_MT_ENCRYPTED_EXTENSIONS) {
-            // 将握手阶段变为 TLS_ST_CR_ENCRYPTED_EXTENSIONS
-            st->hand_state = TLS_ST_CR_ENCRYPTED_EXTENSIONS;
+    // X.509是密码学里公钥证书的格式标准
+    X509 *x = NULL;
+    STACK_OF(X509) *sk = NULL;
+
+    // 解析读取服务端发来的证书链,压入本地的证书链stack中供后面验证
+    for (chainidx = 0; PACKET_remaining(pkt); chainidx++) {
+        x = d2i_X509(NULL, (const unsigned char **)&certbytes, cert_len);
+        if (!sk_X509_push(sk, x)) {
+
+        }
+    }
+
+    // 逐级验证证书链的有效性
+    i = ssl_verify_cert_chain(s, sk);
+
+    // 从证书链的stack中取出服务器的公钥
+    x = sk_X509_value(sk, 0);
+    sk = NULL;
+
+    pkey = X509_get0_pubkey(x);
+} 
+```
+验证完服务端发来的证书后,客户端仍处于read machine状态
+```c
+// ssl/statem/statem_clnt.c
+int ossl_statem_client_read_transition(SSL *s, int mt)
+{
+    // 这里中间的几个状态是某些应用场景需要服务端与客户端都交换证书,暂不细纠这种情况,只接着一般的浏览器https的情况
+    case TLS_ST_CR_CERT:
+        /* Fall through */
+
+    case TLS_ST_CR_CERT_STATUS:
+        /* Fall through */
+
+    case TLS_ST_CR_KEY_EXCH:
+        /* Fall through */
+
+    case TLS_ST_CR_CERT_REQ:
+        if (mt == SSL3_MT_SERVER_DONE) {
+            // 将握手状态置为 TLS_ST_CR_SRVR_DONE
+            st->hand_state = TLS_ST_CR_SRVR_DONE;
             return 1;
         }
         break;
 }
-// 这里暂时略过非主线的 TLS_ST_CR_ENCRYPTED_EXTENSIONS 处理,假设处理完
+MSG_PROCESS_RETURN ossl_statem_client_process_message(SSL *s, PACKET *pkt)
+{
+    case TLS_ST_CR_SRVR_DONE:
+        // process 阶段调用tls_process_server_done
+        return tls_process_server_done(s, pkt);
+}
 
+MSG_PROCESS_RETURN tls_process_server_done(SSL *s, PACKET *pkt)
+{
+    // 返回MSG_PROCESS_FINISHED_READING,表明这次的读状态结束,下一轮外层循环进入写状态机制
+    return MSG_PROCESS_FINISHED_READING;
+}
 ```
+
