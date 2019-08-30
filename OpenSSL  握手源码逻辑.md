@@ -665,3 +665,100 @@ MSG_PROCESS_RETURN tls_process_server_done(SSL *s, PACKET *pkt)
 }
 ```
 
+```c
+WRITE_TRAN ossl_statem_client_write_transition(SSL *s)
+{
+    case TLS_ST_CR_SRVR_DONE:
+        //transition 阶段将握手状态置为TLS_ST_CW_KEY_EXCH
+        st->hand_state = TLS_ST_CW_KEY_EXCH;
+        return WRITE_TRAN_CONTINUE;
+}
+
+int ossl_statem_client_construct_message(SSL *s, WPACKET *pkt,
+                                         confunc_f *confunc, int *mt)
+{
+    case TLS_ST_CW_KEY_EXCH:
+        // construct_message阶段调用tls_constrict_client_key_exchange
+        *confunc = tls_construct_client_key_exchange;
+        *mt = SSL3_MT_CLIENT_KEY_EXCHANGE;
+        break;
+}
+
+
+int tls_construct_client_key_exchange(SSL *s, WPACKET *pkt)
+{
+    // 根据商量好的加密算法调用相应的构造函数
+    alg_k = s->s3->tmp.new_cipher->algorithm_mkey;
+
+    if ((alg_k & SSL_PSK)
+        && !tls_construct_cke_psk_preamble(s, pkt))
+        goto err;
+
+    if (alg_k & (SSL_kRSA | SSL_kRSAPSK)) {
+        if (!tls_construct_cke_rsa(s, pkt))
+            goto err;
+    } else if (alg_k & (SSL_kDHE | SSL_kDHEPSK)) {
+        if (!tls_construct_cke_dhe(s, pkt))
+            goto err;
+    } else if (alg_k & (SSL_kECDHE | SSL_kECDHEPSK)) {
+        if (!tls_construct_cke_ecdhe(s, pkt))
+            goto err;
+    } else if (alg_k & SSL_kGOST) {
+        if (!tls_construct_cke_gost(s, pkt))
+            goto err;
+    } else if (alg_k & SSL_kSRP) {
+        if (!tls_construct_cke_srp(s, pkt))
+            goto err;
+    } else if (!(alg_k & SSL_kPSK)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR,
+                 SSL_F_TLS_CONSTRUCT_CLIENT_KEY_EXCHANGE, ERR_R_INTERNAL_ERROR);
+        goto err;
+    }
+}
+
+// 以cke rsa为例
+static int tls_construct_cke_rsa(SSL *s, WPACKET *pkt)
+{
+    // 取出公钥
+    pkey = X509_get0_pubkey(s->session->peer);
+    pmslen = SSL_MAX_MASTER_KEY_LENGTH;
+    pms = OPENSSL_malloc(pmslen);
+
+    pms[0] = s->client_version >> 8;
+    pms[1] = s->client_version & 0xff;
+
+    // 生成一个新的随机数pms
+    if (RAND_bytes(pms + 2, (int)(pmslen - 2)) <= 0) {
+    }
+
+    // 将这个新的随机数用公钥加密构造要发给服务端的包
+    if (!WPACKET_allocate_bytes(pkt, enclen, &encdata)
+            || EVP_PKEY_encrypt(pctx, encdata, &enclen, pms, pmslen) <= 0) {
+
+    }
+}
+
+WORK_STATE ossl_statem_client_post_work(SSL *s, WORK_STATE wst)
+{
+    case TLS_ST_CW_KEY_EXCH:
+        // post_work 阶段调用 tls_client_key_exchange_post_work
+        if (tls_client_key_exchange_post_work(s) == 0) {
+        }
+        break;
+}
+
+int tls_client_key_exchange_post_work(SSL *s)
+{
+    // 取出上一步生成的随机数pms
+    pms = s->s3->tmp.pms;
+    pmslen = s->s3->tmp.pmslen;
+
+    // 生成接下来用于和服务器交流消息加密解密的密码,
+    // 服务器得到前面生成的pms后也会用同样的方法生成master secret,
+    // 因此客户端和服务端对接下来的消息加密解密锁使用的密码达成了默契和一致
+    // 握手阶段完成
+    // 接下来两边的交互消息都使用这个master secret加密和解密
+    if (!ssl_generate_master_secret(s, pms, pmslen, 1)) {}
+}
+```
+
