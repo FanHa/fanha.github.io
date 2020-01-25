@@ -146,3 +146,112 @@ export default [
 ```
 
 #### attrs
+```ts
+// src/platforms/web/runtime/modules/attrs.js
+// 注册了create 和 update 两个hook函数,都指向updateAttrs
+export default {
+  create: updateAttrs,
+  update: updateAttrs
+}
+
+function updateAttrs (oldVnode: VNodeWithData, vnode: VNodeWithData) {
+
+  let key, cur, old
+  const elm = vnode.elm
+  const oldAttrs = oldVnode.data.attrs || {}
+  let attrs: any = vnode.data.attrs || {}
+  // clone observed objects, as the user probably wants to mutate it
+  if (isDef(attrs.__ob__)) {
+    attrs = vnode.data.attrs = extend({}, attrs)
+  }
+
+  // 新的属性与旧的属性比较,不同则替换
+  for (key in attrs) {
+    cur = attrs[key]
+    old = oldAttrs[key]
+    if (old !== cur) {
+      setAttr(elm, key, cur)
+    }
+  }
+  // #4391: in IE9, setting type can reset value for input[type=radio]
+  // #6666: IE/Edge forces progress value down to 1 before setting a max
+  /* istanbul ignore if */
+  if ((isIE || isEdge) && attrs.value !== oldAttrs.value) {
+    setAttr(elm, 'value', attrs.value)
+  }
+  // 移除element中的过时属性
+  for (key in oldAttrs) {
+    if (isUndef(attrs[key])) {
+      if (isXlink(key)) {
+        elm.removeAttributeNS(xlinkNS, getXlinkProp(key))
+      } else if (!isEnumeratedAttr(key)) {
+        elm.removeAttribute(key)
+      }
+    }
+  }
+}
+
+```
+
+#### class
+```ts
+// src/platforms/web/runtime/modules/class.js
+export default {
+  // 注册了create 和 update 两个hook 为updateClass
+  create: updateClass,
+  update: updateClass
+}
+
+function updateClass (oldVnode: any, vnode: any) {
+  const el = vnode.elm
+  const data: VNodeData = vnode.data
+  const oldData: VNodeData = oldVnode.data
+  if (
+    isUndef(data.staticClass) &&
+    isUndef(data.class) && (
+      isUndef(oldData) || (
+        isUndef(oldData.staticClass) &&
+        isUndef(oldData.class)
+      )
+    )
+  ) {
+    return
+  }
+
+  let cls = genClassForVnode(vnode)
+
+  // handle transition classes
+  const transitionClass = el._transitionClasses
+  if (isDef(transitionClass)) {
+    cls = concat(cls, stringifyClass(transitionClass))
+  }
+
+  // set the class
+  if (cls !== el._prevClass) {
+    el.setAttribute('class', cls)
+    el._prevClass = cls
+  }
+}
+```
+
+#### events
+```ts
+// src/platforms/web/runtime/modules/events.js
+// 注册了create 与 update 两个hook 为updateDomListeners函数
+export default {
+  create: updateDOMListeners,
+  update: updateDOMListeners
+}
+
+function updateDOMListeners (oldVnode: VNodeWithData, vnode: VNodeWithData) {
+  if (isUndef(oldVnode.data.on) && isUndef(vnode.data.on)) {
+    return
+  }
+  const on = vnode.data.on || {}
+  const oldOn = oldVnode.data.on || {}
+  target = vnode.elm
+  normalizeEvents(on)
+  updateListeners(on, oldOn, add, remove, createOnceHandler, vnode.context)
+  target = undefined
+}
+```
