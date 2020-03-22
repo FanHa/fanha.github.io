@@ -151,7 +151,7 @@ const promise1 = new Promise(function(resolve, reject) {
 ```
 
 ### 执行executor
-
+这里的执行应该不是同步,只是把工作内容发给某个执行器
 ```tq
   try {
       // 先按正常执行传入的参数executor里的内容,这里resolve,reject也作为参数传进了调用里,因为executor里可以手动调用resolve 和 reject 函数
@@ -160,5 +160,12 @@ const promise1 = new Promise(function(resolve, reject) {
       // 捕获并执行reject 函数
       Call(context, reject, Undefined, e);
     }
+```
+
+### 返回
+返回了生成的Promise实例,这个时候executor里的内容应该还没执行,但Promise实例里包含了这个信息,先行返回
+```tq
+    return result;
+
 ```
 
