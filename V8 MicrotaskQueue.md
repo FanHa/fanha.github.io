@@ -119,17 +119,25 @@ int MicrotaskQueue::RunMicrotasks(Isolate* isolate) {
   MaybeHandle<Object> maybe_result;
 
   int processed_microtask_count;
-  {
+  { 
+    // 设置一些信息表明当前microtaskQueue实例正在running
     SetIsRunningMicrotasks scope(&is_running_microtasks_);
+
+    // ??这里官方的文档注释是说抑制当前Isolate 的microtask执行?觉得可能是在关键节点上加锁,防止某些临界条件,一个microtask执行过程中,另一个地方同样队macrotaskQueue做操作而产生错误
     v8::Isolate::SuppressMicrotaskExecutionScope suppress(
         reinterpret_cast<v8::Isolate*>(isolate));
+    // ??这里官方的文档注释是与 “多线程”运行相关,需要保存一些线程环境信息
+    // 猜想平时从各种资料上看到的js引擎单线程执行其实应该是不太准确的,应该是js引擎保证代码按es规则“顺序”执行,但并不一定就是完全放在一个线程里,有些js语法上的顺序串行其实可以分拆成并行并且不会影响最终结果,这里可能就是与这个有关的处理
     HandleScopeImplementer::EnteredContextRewindScope rewind_scope(
         isolate->handle_scope_implementer());
     TRACE_EVENT_BEGIN0("v8.execute", "RunMicrotasks");
     {
       TRACE_EVENT_CALL_STATS_SCOPED(isolate, "v8", "V8.RunMicrotasks");
+      // 把自己(this)作为参数,交由Execution实例来执行isolate里的microtask
+      // 这是个同步调用,必定要把当前miacroQueue里的事情执行完,或者发生异常
       maybe_result = Execution::TryRunMicrotasks(isolate, this,
                                                  &maybe_exception);
+      //统计信息
       processed_microtask_count =
           static_cast<int>(finished_microtask_count_ - base_count);
     }
@@ -138,18 +146,22 @@ int MicrotaskQueue::RunMicrotasks(Isolate* isolate) {
   }
 
   // If execution is terminating, clean up and propagate that to TryCatch scope.
+  // 异常终止时的情况
   if (maybe_result.is_null() && maybe_exception.is_null()) {
+    // 清空队列
     delete[] ring_buffer_;
     ring_buffer_ = nullptr;
     capacity_ = 0;
     size_ = 0;
     start_ = 0;
     DCHECK(isolate->has_scheduled_exception());
+    // 设置异常信息及处理
     isolate->SetTerminationOnExternalTryCatch();
     OnCompleted(isolate);
     return -1;
   }
   DCHECK_EQ(0, size());
+  // 调用OnComplete 的hook
   OnCompleted(isolate);
 
   return processed_microtask_count;
