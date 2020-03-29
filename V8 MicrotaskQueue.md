@@ -167,3 +167,40 @@ int MicrotaskQueue::RunMicrotasks(Isolate* isolate) {
   return processed_microtask_count;
 }
 ```
+
+### OnComplete hook
+```cpp
+// src/execution/microtask-queue.cc
+// 清空一次microtask队列后的 hook函数注册与触发;
+// 猜想浏览器可能在这个hook里定义了些东西去处理那些事件,或者异步等等的初始化,然后组装成一个个的microtask,等待下一个RunMiacroTask调用循环
+void MicrotaskQueue::AddMicrotasksCompletedCallback(
+    MicrotasksCompletedCallbackWithData callback, void* data) {
+  CallbackWithData callback_with_data(callback, data);
+  auto pos =
+      std::find(microtasks_completed_callbacks_.begin(),
+                microtasks_completed_callbacks_.end(), callback_with_data);
+  if (pos != microtasks_completed_callbacks_.end()) return;
+  microtasks_completed_callbacks_.push_back(callback_with_data);
+}
+
+void MicrotaskQueue::RemoveMicrotasksCompletedCallback(
+    MicrotasksCompletedCallbackWithData callback, void* data) {
+  CallbackWithData callback_with_data(callback, data);
+  auto pos =
+      std::find(microtasks_completed_callbacks_.begin(),
+                microtasks_completed_callbacks_.end(), callback_with_data);
+  if (pos == microtasks_completed_callbacks_.end()) return;
+  microtasks_completed_callbacks_.erase(pos);
+}
+
+void MicrotaskQueue::FireMicrotasksCompletedCallback(Isolate* isolate) const {
+  std::vector<CallbackWithData> callbacks(microtasks_completed_callbacks_);
+  for (auto& callback : callbacks) {
+    callback.first(reinterpret_cast<v8::Isolate*>(isolate), callback.second);
+  }
+}
+
+void MicrotaskQueue::OnCompleted(Isolate* isolate) {
+  FireMicrotasksCompletedCallback(isolate);
+}
+```
