@@ -151,7 +151,6 @@ const promise1 = new Promise(function(resolve, reject) {
 ```
 
 ### 执行executor
-这里的执行应该不是同步,只是把工作内容发给某个执行器
 ```tq
   try {
       // 先按正常执行传入的参数executor里的内容,这里resolve,reject也作为参数传进了调用里,因为executor里可以手动调用resolve 和 reject 函数
