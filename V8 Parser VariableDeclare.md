@@ -90,7 +90,7 @@ void ParserBase<Impl>::ParseVariableDeclarations(
 
     IdentifierT name;
     ExpressionT pattern;
-    // 判断下一个token是不是合规的Identifier
+    // 判断下一个token是不是普通的Identifier
     if (V8_LIKELY(Token::IsAnyIdentifier(peek()))) {
       // 取出要声明的变量名
       name = ParseAndClassifyIdentifier(Next());
@@ -101,19 +101,21 @@ void ParserBase<Impl>::ParseVariableDeclarations(
                                 MessageTemplate::kStrictEvalArguments);
         return;
       }
-      // 声明变量有时直接后接 ‘=’直接定义变量的内容,也有不解‘=’只占声明位置,暂时不定义
+      // 声明变量有时直接后接 ‘=’直接定义变量的内容,也有不接‘=’只占声明位置,暂时不定义
       if (peek() == Token::ASSIGN ||
           (var_context == kForStatement && PeekInOrOf()) ||
           parsing_result->descriptor.mode == VariableMode::kLet) {
-        // Assignments need the variable expression for the assignment LHS, and
-        // for of/in will need it later, so create the expression now.
+        // 解析变量名,解析变量名(Identifier)的位置,如果找不到则在当前scope新增一个变量;
+        // 猜想这个pattern可能是对变量形式的一种初始化
         pattern = impl()->ExpressionFromIdentifier(name, decl_pos);
       } else {
-        // Otherwise, elide the variable expression and just declare it.
+        // 在合适的scope声明变量
         impl()->DeclareIdentifier(name, decl_pos);
+        // 因为只声明,默认的变量的形式是Null
         pattern = impl()->NullExpression();
       }
     } else {
+      // 存在解构声明和定义的情况
       name = impl()->NullIdentifier();
       pattern = ParseBindingPattern();
       DCHECK(!impl()->IsIdentifier(pattern));
@@ -121,13 +123,17 @@ void ParserBase<Impl>::ParseVariableDeclarations(
 
     Scanner::Location variable_loc = scanner()->location();
 
+    // 对变量的值(value)的初始化
     ExpressionT value = impl()->NullExpression();
     int value_beg_pos = kNoSourcePosition;
+
+    // 如果接下来的token是“=”,表明要对变量进行赋值
     if (Check(Token::ASSIGN)) {
       DCHECK(!impl()->IsNull(pattern));
       {
         value_beg_pos = peek_position();
         AcceptINScope scope(this, var_context != kForStatement);
+        // 解析值的表达式
         value = ParseAssignmentExpression();
       }
       variable_loc.end_pos = end_position();
@@ -135,8 +141,7 @@ void ParserBase<Impl>::ParseVariableDeclarations(
       if (!parsing_result->first_initializer_loc.IsValid()) {
         parsing_result->first_initializer_loc = variable_loc;
       }
-
-      // Don't infer if it is "a = function(){...}();"-like expression.
+      // 这里是对匿名函数的信息的处理
       if (impl()->IsIdentifier(pattern)) {
         if (!value->IsCall() && !value->IsCallNew()) {
           fni_.Infer();
@@ -145,29 +150,11 @@ void ParserBase<Impl>::ParseVariableDeclarations(
         }
       }
 
+      // 通过前面生成的变量pattern 给值value一个命名;
+      // 猜想用于引擎查找该值,或打印调试信息?
       impl()->SetFunctionNameFromIdentifierRef(value, pattern);
     } else {
-#ifdef DEBUG
-      // We can fall through into here on error paths, so don't DCHECK those.
-      if (!has_error()) {
-        // We should never get identifier patterns for the non-initializer path,
-        // as those expressions should be elided.
-        DCHECK_EQ(!impl()->IsNull(name),
-                  Token::IsAnyIdentifier(scanner()->current_token()));
-        DCHECK_IMPLIES(impl()->IsNull(pattern), !impl()->IsNull(name));
-        // The only times we have a non-null pattern are:
-        //   1. This is a destructuring declaration (with no initializer, which
-        //      is immediately an error),
-        //   2. This is a declaration in a for in/of loop, or
-        //   3. This is a let (which has an implicit undefined initializer)
-        DCHECK_IMPLIES(
-            !impl()->IsNull(pattern),
-            !impl()->IsIdentifier(pattern) ||
-                (var_context == kForStatement && PeekInOrOf()) ||
-                parsing_result->descriptor.mode == VariableMode::kLet);
-      }
-#endif
-
+      // 只声明变量时需要给变量一个undefined的初始值
       if (var_context != kForStatement || !PeekInOrOf()) {
         // ES6 'const' and binding patterns require initializers.
         if (parsing_result->descriptor.mode == VariableMode::kConst ||
