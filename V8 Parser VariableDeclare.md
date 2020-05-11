@@ -3,7 +3,7 @@
 +   var
 +   const
 
-## 
+## 变量statement语句解析
 ```cpp
 // src/parsing/parser-base.h
 template <typename Impl>
@@ -32,11 +32,11 @@ typename ParserBase<Impl>::StatementT ParserBase<Impl>::ParseVariableStatement(
   
   // 初始化一个变量声明结果结构 parsing_result
   DeclarationParsingResult parsing_result;
-  // 执行变量声明的解析,并将信息写入&parsing_result
+  // 执行变量声明的解析,并将解析结果写入&parsing_result
   ParseVariableDeclarations(var_context, &parsing_result, names);
-  // js 的 语句“;”结尾处理
+  // js语句的“;”结尾处理
   ExpectSemicolon();
-  // 将声明的解析结果绑定到合适的scope(block)里?
+  // 将声明的解析结果初始化一个Block ??
   return impl()->BuildInitializationBlock(&parsing_result);
 }
 
@@ -70,7 +70,7 @@ void ParserBase<Impl>::ParseVariableDeclarations(
       break;
   }
 
-  // 定义变量需要声明在哪个scope里;
+  // 找到变量需要声明在哪个scope里;
   // LexicalMode的判断,这里就是 let/const(IsLexcialVariableMode) 与 var 声明的不同;
   // let/const声明是 “块级”声明,声明所在的scope即为当前的scope;
   // var则需要忽略“块级”scope,往外层一层层寻找,直到合适的scope
@@ -154,9 +154,8 @@ void ParserBase<Impl>::ParseVariableDeclarations(
       // 猜想用于引擎查找该值,或打印调试信息?
       impl()->SetFunctionNameFromIdentifierRef(value, pattern);
     } else {
-      // 只声明变量时需要给变量一个undefined的初始值
       if (var_context != kForStatement || !PeekInOrOf()) {
-        // ES6 'const' and binding patterns require initializers.
+        // const必须有初始值
         if (parsing_result->descriptor.mode == VariableMode::kConst ||
             impl()->IsNull(name)) {
           impl()->ReportMessageAt(
@@ -165,31 +164,29 @@ void ParserBase<Impl>::ParseVariableDeclarations(
               impl()->IsNull(name) ? "destructuring" : "const");
           return;
         }
-        // 'let x' initializes 'x' to undefined.
+        // 用let只声明变量时需要给变量一个undefined的初始值
         if (parsing_result->descriptor.mode == VariableMode::kLet) {
           value = factory()->NewUndefinedLiteral(position());
         }
       }
     }
 
+    // 给新声明的变量Varaible设置初始position属性
     int initializer_position = end_position();
     auto declaration_end = target_scope->declarations()->end();
     for (; declaration_it != declaration_end; ++declaration_it) {
       declaration_it->var()->set_initializer_position(initializer_position);
     }
 
-    // Patterns should be elided iff. they don't have an initializer.
-    DCHECK_IMPLIES(impl()->IsNull(pattern),
-                   impl()->IsNull(value) ||
-                       (var_context == kForStatement && PeekInOrOf()));
-
+    // 创建一个声明的描述,并push到解析结果中
     typename DeclarationParsingResult::Declaration decl(pattern, value);
     decl.value_beg_pos = value_beg_pos;
 
     parsing_result->declarations.push_back(decl);
-  } while (Check(Token::COMMA));
+  } while (Check(Token::COMMA)); // 同时声明多个变量时的处理
 
   parsing_result->bindings_loc =
       Scanner::Location(bindings_start, end_position());
+  // 这个parsing_result是函数的传址参数,解析结果的信息通过属性设置保存在这个result里,供后面的流程使用这个result实装变量的声明和定义
 }
 ```
