@@ -142,32 +142,21 @@ FunctionLiteral* Parser::ParseFunctionLiteral(
 
   // This Scope lives in the main zone. We'll migrate data into that zone later.
   Zone* parse_zone = should_preparse ? &preparser_zone_ : zone();
-  // 为函数创建一个新的Scope
+  // 为函数创建一个新的Scope, GC相关??
   DeclarationScope* scope = NewFunctionScope(kind, parse_zone);
   SetLanguageMode(scope, language_mode);
-#ifdef DEBUG
-  scope->SetScopeName(function_name);
-#endif
 
-  if (!is_wrapped && V8_UNLIKELY(!Check(Token::LPAREN))) {
-    ReportUnexpectedToken(Next());
-    return nullptr;
-  }
   scope->set_start_position(position());
 
-  // Eager or lazy parse? If is_lazy_top_level_function, we'll parse
-  // lazily. We'll call SkipFunction, which may decide to
-  // abort lazy parsing if it suspects that wasn't a good idea. If so (in
-  // which case the parser is expected to have backtracked), or if we didn't
-  // try to lazy parse in the first place, we'll have to parse eagerly.
+  // 如果上面的分析决定应该使用延迟(preparse),则调用SkipFunction;
+  // 但是这个SkipFunction依然需要参考当前的各个中泰条件,是不确定能否延迟解析成功,仍然会有返回false的情况
   bool did_preparse_successfully =
       should_preparse &&
       SkipFunction(function_name, kind, function_syntax_kind, scope,
                    &num_parameters, &function_length, &produced_preparse_data);
 
   if (!did_preparse_successfully) {
-    // If skipping aborted, it rewound the scanner until before the LPAREN.
-    // Consume it in that case.
+    // 实在不能延迟了,消费掉‘(’,开始动手解析(ParseFunction)
     if (should_preparse) Consume(Token::LPAREN);
     should_post_parallel_task = false;
     ParseFunction(&body, function_name, pos, kind, function_syntax_kind, scope,
