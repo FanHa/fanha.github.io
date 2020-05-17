@@ -179,7 +179,7 @@ FunctionLiteral* Parser::ParseFunctionLiteral(
 
   // ...
   if (should_post_parallel_task) {
-    // 当前面采用平行解析(即当前只preparse,然后把具体parse分配给另一个线程去作)方案时,把任务入队
+    // 当前面决定采用平行解析(即当前只preparse,然后把具体parse分配给另一个线程去作)方案时,把任务入队
     info()->parallel_tasks()->Enqueue(info(), function_name, function_literal);
   }
 
@@ -191,3 +191,127 @@ FunctionLiteral* Parser::ParseFunctionLiteral(
 #### 延迟(SkipFunction)
 
 #### 贪心(ParseFunction)
+```cpp
+void Parser::ParseFunction(
+    ScopedPtrList<Statement>* body, const AstRawString* function_name, int pos,
+    FunctionKind kind, FunctionSyntaxKind function_syntax_kind,
+    DeclarationScope* function_scope, int* num_parameters, int* function_length,
+    bool* has_duplicate_parameters, int* expected_property_count,
+    int* suspend_count,
+    ZonePtrList<const AstRawString>* arguments_for_wrapped_function) {
+  // 猜想延迟解析是个比较新的特性,可能有开关控制无论什么情况都不允许延迟解析
+  ParsingModeScope mode(this, allow_lazy_ ? PARSE_LAZILY : PARSE_EAGERLY);
+
+  FunctionState function_state(&function_state_, &scope_, function_scope);
+
+  bool is_wrapped = function_syntax_kind == FunctionSyntaxKind::kWrapped;
+
+  int expected_parameters_end_pos = parameters_end_pos_;
+
+  // 初始化函数参数结构,为解析函数的参数作准备
+  ParserFormalParameters formals(function_scope);
+
+  {
+    // 新建一块scope用来保存函数参数
+    ParameterDeclarationParsingScope formals_scope(this);
+    if (is_wrapped) {
+      // ...
+    } else {
+      // 解析函数的参数
+      ParseFormalParameterList(&formals);
+      // ...
+    }
+    formals.duplicate_loc = formals_scope.duplicate_location();
+  }
+
+  *num_parameters = formals.num_parameters();
+  *function_length = formals.function_length;
+
+  AcceptINScope scope(this, true);
+  // 解析函数内容
+  ParseFunctionBody(body, function_name, pos, formals, kind,
+                    function_syntax_kind, FunctionBodyType::kBlock);
+
+  *has_duplicate_parameters = formals.has_duplicate();
+
+  *expected_property_count = function_state.expected_property_count();
+  *suspend_count = function_state.suspend_count();
+}
+
+```
+##### 解析function参数(ParseFormalParameterList)
+```cpp
+// src/parsing/parser-base.h
+template <typename Impl>
+void ParserBase<Impl>::ParseFormalParameterList(FormalParametersT* parameters) {
+  // 新建一块scope用来解析参数
+  ParameterParsingScope scope(impl(), parameters);
+  if (peek() != Token::RPAREN) {
+    // 函数可能有多个参数,需要循环解析函数的每一个参数
+    while (true) {
+      // ...
+      // 判断函数参数中是否有“...”形式
+      parameters->has_rest = Check(Token::ELLIPSIS);
+      // 解析参数, 这里应该调用应该只解析一个参数,对多个参数的解析是外面那层循环实现的
+      ParseFormalParameter(parameters);
+
+      if (parameters->has_rest) {
+        // 函数参数是“...”形式时,标记函数参数的is_simple标记为false,并break参数解析流程
+        parameters->is_simple = false;
+        if (peek() == Token::COMMA) {
+          impl()->ReportMessageAt(scanner()->peek_location(),
+                                  MessageTemplate::kParamAfterRest);
+          return;
+        }
+        break;
+      }
+      if (!Check(Token::COMMA)) break;
+      if (peek() == Token::RPAREN) {
+        // allow the trailing comma
+        break;
+      }
+    }
+  }
+  // 将参数解析结果进行声明
+  impl()->DeclareFormalParameters(parameters);
+}
+
+
+template <typename Impl>
+void ParserBase<Impl>::ParseFormalParameter(FormalParametersT* parameters) {
+  FuncNameInferrerState fni_state(&fni_);
+  int pos = peek_position();
+  auto declaration_it = scope()->declarations()->end();
+  // 参数名
+  ExpressionT pattern = ParseBindingPattern();
+  if (impl()->IsIdentifier(pattern)) {
+    ClassifyParameter(impl()->AsIdentifier(pattern), pos, end_position());
+  } else {
+    parameters->is_simple = false;
+  }
+
+  // 默认参数
+  ExpressionT initializer = impl()->NullExpression();
+  if (Check(Token::ASSIGN)) {
+    // 参数名后接“=”时,参数有默认参数
+    parameters->is_simple = false;
+
+    if (parameters->has_rest) {
+      ReportMessage(MessageTemplate::kRestDefaultInitializer);
+      return;
+    }
+
+    AcceptINScope accept_in_scope(this, true);
+    // 解析指定的默认参数形式
+    initializer = ParseAssignmentExpression();
+    impl()->SetFunctionNameFromIdentifierRef(initializer, pattern);
+  }
+  // ...
+  // add解析后的参数名和参数值
+  impl()->AddFormalParameter(parameters, pattern, initializer, end_position(),
+                             parameters->has_rest);
+}
+
+```
+
+##### 解析functionBody(ParseFunctionBody)
