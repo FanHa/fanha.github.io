@@ -130,6 +130,7 @@ FunctionLiteral* Parser::ParseFunctionLiteral(
   bool should_preparse = (parse_lazily() && is_lazy_top_level_function) ||
                          should_preparse_inner || should_post_parallel_task;
 
+  // 初始化函数body里的基本信息;
   // 将function的body里的内容初始化为ScopedPtrList
   ScopedPtrList<Statement> body(pointer_buffer());
   int expected_property_count = 0;
@@ -165,42 +166,9 @@ FunctionLiteral* Parser::ParseFunctionLiteral(
                   arguments_for_wrapped_function);
   }
 
-  if (V8_UNLIKELY(FLAG_log_function_events)) {
-    double ms = timer.Elapsed().InMillisecondsF();
-    const char* event_name =
-        should_preparse
-            ? (is_top_level ? "preparse-no-resolution" : "preparse-resolution")
-            : "full-parse";
-    logger_->FunctionEvent(
-        event_name, script_id(), ms, scope->start_position(),
-        scope->end_position(),
-        reinterpret_cast<const char*>(function_name->raw_data()),
-        function_name->byte_length());
-  }
-  if (V8_UNLIKELY(TracingFlags::is_runtime_stats_enabled()) &&
-      did_preparse_successfully) {
-    if (runtime_call_stats_) {
-      runtime_call_stats_->CorrectCurrentCounterId(
-          RuntimeCallCounterId::kPreParseWithVariableResolution,
-          RuntimeCallStats::kThreadSpecific);
-    }
-  }
+  // ...
 
-  // Validate function name. We can do this only after parsing the function,
-  // since the function can declare itself strict.
-  language_mode = scope->language_mode();
-  CheckFunctionName(language_mode, function_name, function_name_validity,
-                    function_name_location);
-
-  if (is_strict(language_mode)) {
-    CheckStrictOctalLiteral(scope->start_position(), scope->end_position());
-  }
-
-  FunctionLiteral::ParameterFlag duplicate_parameters =
-      has_duplicate_parameters ? FunctionLiteral::kHasDuplicateParameters
-                               : FunctionLiteral::kNoDuplicateParameters;
-
-  // Note that the FunctionLiteral needs to be created in the main Zone again.
+  // 以前面的解析结果初始化一个需要返回的FunctionLiteral 数据结构
   FunctionLiteral* function_literal = factory()->NewFunctionLiteral(
       function_name, scope, body, expected_property_count, num_parameters,
       function_length, duplicate_parameters, function_syntax_kind,
@@ -209,17 +177,17 @@ FunctionLiteral* Parser::ParseFunctionLiteral(
   function_literal->set_function_token_position(function_token_pos);
   function_literal->set_suspend_count(suspend_count);
 
-  RecordFunctionLiteralSourceRange(function_literal);
-
+  // ...
   if (should_post_parallel_task) {
-    // Start a parallel parse / compile task on the compiler dispatcher.
+    // 当前面采用平行解析(即当前只preparse,然后把具体parse分配给另一个线程去作)方案时,把任务入队
     info()->parallel_tasks()->Enqueue(info(), function_name, function_literal);
   }
 
-  if (should_infer_name) {
-    fni_.AddFunction(function_literal);
-  }
   return function_literal;
 }
 
 ```
+
+#### 延迟(SkipFunction)
+
+#### 贪心(ParseFunction)
