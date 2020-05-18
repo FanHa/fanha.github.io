@@ -189,9 +189,12 @@ FunctionLiteral* Parser::ParseFunctionLiteral(
 ```
 
 #### 延迟(SkipFunction)
+```cpp
+```
 
 #### 贪心(ParseFunction)
 ```cpp
+// src/parsing/parser.cc
 void Parser::ParseFunction(
     ScopedPtrList<Statement>* body, const AstRawString* function_name, int pos,
     FunctionKind kind, FunctionSyntaxKind function_syntax_kind,
@@ -307,7 +310,7 @@ void ParserBase<Impl>::ParseFormalParameter(FormalParametersT* parameters) {
     impl()->SetFunctionNameFromIdentifierRef(initializer, pattern);
   }
   // ...
-  // add解析后的参数名和参数值
+  // 正式把解析后的参数名和参数值加入到存放参数信息的区域
   impl()->AddFormalParameter(parameters, pattern, initializer, end_position(),
                              parameters->has_rest);
 }
@@ -315,3 +318,112 @@ void ParserBase<Impl>::ParseFormalParameter(FormalParametersT* parameters) {
 ```
 
 ##### 解析functionBody(ParseFunctionBody)
+```cpp
+// src/parsing/parser-base.h
+template <typename Impl>
+void ParserBase<Impl>::ParseFunctionBody(
+    StatementListT* body, IdentifierT function_name, int pos,
+    const FormalParametersT& parameters, FunctionKind kind,
+    FunctionSyntaxKind function_syntax_kind, FunctionBodyType body_type) {
+  // 创建一个函数Body解析的Scope
+  FunctionBodyParsingScope body_parsing_scope(impl());
+
+  // async, generator 和 module 类型的处理
+  if (IsResumableFunction(kind)) impl()->PrepareGeneratorVariables();
+
+  // 创建function_scope 和 inner_scope, 暂时都指向参数的scope
+  DeclarationScope* function_scope = parameters.scope;
+  DeclarationScope* inner_scope = function_scope;
+
+  if (V8_UNLIKELY(!parameters.is_simple)) { // ...让人猝不及防的否定的否定
+    // 当参数is_simple为true(即不带...),需要给函数体初始化一块区域用来存放调用函数时的参数
+    if (has_error()) return;
+    // 创建一个block,并用传进来的参数初始化
+    BlockT init_block = impl()->BuildParameterInitializationBlock(parameters);
+    if (IsAsyncFunction(kind) && !IsAsyncGeneratorFunction(kind)) {
+      init_block = impl()->BuildRejectPromiseOnException(init_block);
+    }
+    // 
+    body->Add(init_block);
+    if (has_error()) return;
+
+    inner_scope = NewVarblockScope();
+    inner_scope->set_start_position(scanner()->location().beg_pos);
+  }
+
+  // 新建一个内部的body,内容为函数body内的内容
+  StatementListT inner_body(pointer_buffer());
+
+  {
+    BlockState block_state(&scope_, inner_scope);
+
+    if (body_type == FunctionBodyType::kExpression) {
+      // sinple arrow function expression 的处理?
+    } else {
+      // 定义函数body解析的结束TOKEN
+      Token::Value closing_token =
+          function_syntax_kind == FunctionSyntaxKind::kWrapped ? Token::EOS
+                                                               : Token::RBRACE;
+
+      if (IsAsyncGeneratorFunction(kind)) {
+        // ...
+      } else if (IsGeneratorFunction(kind)) {
+        // ...
+      } else if (IsAsyncFunction(kind)) {
+        P// ...
+      } else {
+        // 逻辑进入了ParseStatementList了,就和当初进入function的解析前的流程一样,只是这一次的解析结果放入了生成的inner_body里,
+        // 这个inner_body后面会再用到
+        ParseStatementList(&inner_body, closing_token);
+      }
+      // ...
+      Expect(closing_token);
+    }
+  }
+
+  scope()->set_end_position(end_position());
+
+  bool allow_duplicate_parameters = false;
+
+  CheckConflictingVarDeclarations(inner_scope);
+
+  if (V8_LIKELY(parameters.is_simple)) {
+    // ...
+  } else {
+    //当函数参数是带“...”的形式时的处理,需要为“...”指定一块区域供函数body里可以访问到
+    // ...
+
+    inner_scope->set_end_position(end_position());
+    if (inner_scope->FinalizeBlockScope() != nullptr) {
+      BlockT inner_block = factory()->NewBlock(true, inner_body);
+      inner_body.Rewind();
+      inner_body.Add(inner_block);
+      inner_block->set_scope(inner_scope);
+      impl()->RecordBlockSourceRange(inner_block, scope()->end_position());
+      if (!impl()->HasCheckedSyntax()) {
+        const AstRawString* conflict = inner_scope->FindVariableDeclaredIn(
+            function_scope, VariableMode::kLastLexicalVariableMode);
+        if (conflict != nullptr) {
+          impl()->ReportVarRedeclarationIn(conflict, inner_scope);
+        }
+      }
+      impl()->InsertShadowingVarBindingInitializers(inner_block);
+    }
+  }
+
+  ValidateFormalParameters(language_mode(), parameters,
+                           allow_duplicate_parameters);
+
+  if (!IsArrowFunction(kind)) {
+    // 非箭头函数,需要在函数的function_scope里对函数体的参数声明作处理,比如有些参数需要hoist之类的
+    function_scope->DeclareArguments(ast_value_factory());
+  }
+
+  // 猜想这里是函数内部可能会递归调用自己,所以需要在这里function_scope里再声明一次这个函数?
+  impl()->DeclareFunctionNameVar(function_name, function_syntax_kind,
+                                 function_scope);
+  // 将inner_body里的信息整合入(父)body,至此完成对函数体的解析
+  inner_body.MergeInto(body);
+}
+
+```
