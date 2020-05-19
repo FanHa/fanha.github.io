@@ -190,6 +190,176 @@ FunctionLiteral* Parser::ParseFunctionLiteral(
 
 #### 延迟(SkipFunction)
 ```cpp
+bool Parser::SkipFunction(const AstRawString* function_name, FunctionKind kind,
+                          FunctionSyntaxKind function_syntax_kind,
+                          DeclarationScope* function_scope, int* num_parameters,
+                          int* function_length,
+                          ProducedPreparseData** produced_preparse_data) {
+  FunctionState function_state(&function_state_, &scope_, function_scope);
+  function_scope->set_zone(&preparser_zone_);
+
+  if (consumed_preparse_data_) {
+    // 似乎存在某种机制缓存preparse_data ??
+    // 这里直接从consumed_preparse_data中取出要lazyParse的数据,做好处理,然后return true了
+    int end_position;
+    LanguageMode language_mode;
+    int num_inner_functions;
+    bool uses_super_property;
+    if (stack_overflow()) return true;
+    *produced_preparse_data =
+        consumed_preparse_data_->GetDataForSkippableFunction(
+            main_zone(), function_scope->start_position(), &end_position,
+            num_parameters, function_length, &num_inner_functions,
+            &uses_super_property, &language_mode);
+
+    function_scope->outer_scope()->SetMustUsePreparseData();
+    function_scope->set_is_skipped_function(true);
+    function_scope->set_end_position(end_position);
+    scanner()->SeekForward(end_position - 1);
+    Expect(Token::RBRACE);
+    SetLanguageMode(function_scope, language_mode);
+    if (uses_super_property) {
+      function_scope->RecordSuperPropertyUsage();
+    }
+    SkipFunctionLiterals(num_inner_functions);
+    function_scope->ResetAfterPreparsing(ast_value_factory_, false);
+    return true;
+  }
+
+  // ... 
+  // 调用PreParser解析器的方法,正式预解析
+  PreParser::PreParseResult result = reusable_preparser()->PreParseFunction(
+      function_name, kind, function_syntax_kind, function_scope, use_counts_,
+      produced_preparse_data, this->script_id());
+
+  if (result == PreParser::kPreParseStackOverflow) {
+    // ... 各种不能preParse的情况1
+  } else if (pending_error_handler()->has_error_unidentifiable_by_preparser()) {
+    // ... 各种不能preParse的情况2
+    return false;
+  } else if (pending_error_handler()->has_pending_error()) {
+    // ... 各种不能preParse的情况3
+  } else {
+    // 这里应该是preParse解析成功后作的一些信息记录
+    DCHECK(!pending_error_handler()->stack_overflow());
+    set_allow_eval_cache(reusable_preparser()->allow_eval_cache());
+
+    PreParserLogger* logger = reusable_preparser()->logger();
+    function_scope->set_end_position(logger->end());
+    Expect(Token::RBRACE);
+    total_preparse_skipped_ +=
+        function_scope->end_position() - function_scope->start_position();
+    *num_parameters = logger->num_parameters();
+    *function_length = logger->function_length();
+    SkipFunctionLiterals(logger->num_inner_functions());
+    if (!private_name_scope_iter.Done()) {
+      private_name_scope_iter.GetScope()->MigrateUnresolvedPrivateNameTail(
+          factory(), unresolved_private_tail);
+    }
+    function_scope->AnalyzePartially(this, factory(), MaybeParsingArrowhead());
+  }
+
+  return true;
+}
+
+```
+##### PreParseFunction
+```cpp
+// src/parsing/preparser.cc
+PreParser::PreParseResult PreParser::PreParseFunction(
+    const AstRawString* function_name, FunctionKind kind,
+    FunctionSyntaxKind function_syntax_kind, DeclarationScope* function_scope,
+    int* use_counts, ProducedPreparseData** produced_preparse_data,
+    int script_id) {
+  // ...
+  // preParse也需要初始化函数的参数
+  PreParserFormalParameters formals(function_scope);
+
+  // ...
+
+  // 先新建一个独特的DataGatheringScope用来preparse
+  PreparseDataBuilder::DataGatheringScope preparse_data_builder_scope(this);
+
+  if (IsArrowFunction(kind)) {
+    // 箭头函数的参数应该是已经在外面解析完成了
+    formals.is_simple = function_scope->has_simple_parameters();
+  } else {
+    preparse_data_builder_scope.Start(function_scope);
+    // 非箭头函数时需要新建一个Scope来解析函数参数
+    ParameterDeclarationParsingScope formals_scope(this);
+    // preparse 也需要真正的解析函数参数的形式,和检测各种可能的错误
+    ParseFormalParameterList(&formals);
+    if (formals_scope.has_duplicate()) formals.set_has_duplicate();
+    if (!formals.is_simple) {
+      BuildParameterInitializationBlock(formals);
+    }
+    // 参数包裹在括号里,需要一个‘)’表明参数解析完成
+    Expect(Token::RPAREN);
+    int formals_end_position = scanner()->location().end_pos;
+    // ...
+  }
+  // ‘{'  来表明函数体的开始
+  Expect(Token::LBRACE);
+  // 将inner_scope指向function_scope
+  DeclarationScope* inner_scope = function_scope;
+
+  if (!formals.is_simple) {
+    // 函数参数不是简单的参数时,新建一个scope存放参数
+    inner_scope = NewVarblockScope();
+    inner_scope->set_start_position(position());
+  }
+
+  {
+    BlockState block_state(&scope_, inner_scope);
+    // 这里有疑问,这个ParseStatementListAndLogFunction直接就解析了整个函数体里的内容;
+    // 这里和普通的函数解析调用的代码是一个地方,调用ParseStatementList方法;
+    // 但是在调用具体的ParseXXXLiteral时,如impl()->ParseFunctionLiteral;
+    // 正常解析 impl()返回的是Parser,而这里返回的是PreParser,即在这里走向了不同的解析路线;
+    // 这样看来preParse一个函数,依然会深入到该函数的每一个语句,取得该函数声明的一些变量,函数,类等等信息;
+    // 但大部分语句不会再递归更深入地去解析了
+    ParseStatementListAndLogFunction(&formals);
+  }
+
+  bool allow_duplicate_parameters = false;
+  CheckConflictingVarDeclarations(inner_scope);
+
+  // ...
+
+  use_counts_ = nullptr;
+  // 各种可能存在的错误处理
+  if (stack_overflow()) {
+    return kPreParseStackOverflow;
+  } else if (pending_error_handler()->has_error_unidentifiable_by_preparser()) {
+    return kPreParseNotIdentifiableError;
+  } else if (has_error()) {
+    DCHECK(pending_error_handler()->has_pending_error());
+  } else {
+    // 正常preParse
+    if (!IsArrowFunction(kind)) {
+      // 如果函数不是箭头函数,需要核查一下preParse出的变量的冲突,合规性等问题
+      ValidateFormalParameters(language_mode(), formals,
+                               allow_duplicate_parameters);
+      //...
+
+      // 尽管是preParse,外层的变量的声明还是要按部就班先占好声明位置的
+      function_scope->DeclareArguments(ast_value_factory());
+
+      DeclareFunctionNameVar(function_name, function_syntax_kind,
+                             function_scope);
+
+      if (preparse_data_builder_->HasData()) {
+        *produced_preparse_data =
+            ProducedPreparseData::For(preparse_data_builder_, main_zone());
+      }
+    }
+
+    //...
+  }
+
+  //...
+  return kPreParseSuccess;
+}
+
 ```
 
 #### 贪心(ParseFunction)
@@ -358,7 +528,7 @@ void ParserBase<Impl>::ParseFunctionBody(
     BlockState block_state(&scope_, inner_scope);
 
     if (body_type == FunctionBodyType::kExpression) {
-      // sinple arrow function expression 的处理?
+      // 简单的箭头返回一个值的那种函数的处理
     } else {
       // 定义函数body解析的结束TOKEN
       Token::Value closing_token =
