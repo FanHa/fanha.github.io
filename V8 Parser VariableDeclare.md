@@ -171,7 +171,7 @@ void ParserBase<Impl>::ParseVariableDeclarations(
       }
     }
 
-    // 给新声明的变量Varaible设置初始position属性
+    // 给新声明的变量Varaible设置一些信息
     int initializer_position = end_position();
     auto declaration_end = target_scope->declarations()->end();
     for (; declaration_it != declaration_end; ++declaration_it) {

@@ -45,8 +45,11 @@ public:
                             bool* sloppy_mode_block_scope_function_redefinition,
                             bool* ok);
 private:
-  // 实际存放当前Scope内变量声明的HashMap结构
+  // 辅助查找当前Scope内变量声明的HashMap结构(索引)
   VariableMap variables_;
+
+  // 实际存放当前Scope内变量的声明的链表
+  base::ThreadedList<Declaration> decls_;
 
 }
 ```
@@ -163,7 +166,7 @@ Variable* Scope::DeclareVariable(
   }
   DCHECK_NOT_NULL(var);
 
-  // TODO 这个declaration是指的什么?
+  // 在scope的声明链表中加入要声明的变量及内容
   decls_.Add(declaration);
   declaration->set_var(var);
   return var;
