@@ -50,6 +50,7 @@ typename ParserBase<Impl>::StatementT ParserBase<Impl>::ParseClassDeclaration(
                               end_pos);
 }
 ```
+### 解析Class内容
 ```cpp
 // src/parsing/parser-base.h
 template <typename Impl>
@@ -107,25 +108,33 @@ typename ParserBase<Impl>::ExpressionT ParserBase<Impl>::ParseClassLiteral(
     FuncNameInferrerState fni_state(&fni_);
     // 如果还没结果过constructor,假设当前要解析的语句是个constructor函数
     bool is_constructor = !class_info.has_seen_constructor;
-    
+    // 初始化化类的属性信息
     ParsePropertyInfo prop_info(this);
     prop_info.position = PropertyPosition::kClassLiteral;
+
+    // 解析类里面的单个property;
+    // 一个while循环解析一条property;
     ClassLiteralPropertyT property =
         ParseClassPropertyDefinition(&class_info, &prop_info, has_extends);
 
     if (has_error()) return impl()->FailureExpression();
 
+    // 从前面的解析结果中取出类的属性;
+    // 类的属性有 getter,setter,method,field 四种
     ClassLiteralProperty::Kind property_kind =
         ClassPropertyKindFor(prop_info.kind);
+    // 根据当前property解析结果决定设置classInfo的has_static_computed_names属性
     if (!class_info.has_static_computed_names && prop_info.is_static &&
         prop_info.is_computed_name) {
       class_info.has_static_computed_names = true;
     }
+    // 设置当前property是不是constructor
     is_constructor &= class_info.has_seen_constructor;
-
+    // 设置当前property是不是field
     bool is_field = property_kind == ClassLiteralProperty::FIELD;
 
     if (V8_UNLIKELY(prop_info.is_private)) {
+      // 新的ES标准将会支持类的私有属性,私有属性的声明需要作特别处理,声明完后continue到下一个循环
       DCHECK(!is_constructor);
       class_info.requires_brand |= (!is_field && !prop_info.is_static);
       class_info.has_private_methods |=
@@ -138,6 +147,7 @@ typename ParserBase<Impl>::ExpressionT ParserBase<Impl>::ParseClassLiteral(
     }
 
     if (V8_UNLIKELY(is_field)) {
+      // 当前property是field时,声明该属性,并continue到下一个循环
       DCHECK(!prop_info.is_private);
       if (prop_info.is_computed_name) {
         class_info.computed_field_count++;
@@ -149,43 +159,167 @@ typename ParserBase<Impl>::ExpressionT ParserBase<Impl>::ParseClassLiteral(
       continue;
     }
 
+    // 声明公共方法
     impl()->DeclarePublicClassMethod(name, property, is_constructor,
                                      &class_info);
     impl()->InferFunctionName();
   }
-
+  // Class Body解析完
   Expect(Token::RBRACE);
   int end_pos = end_position();
   class_scope->set_end_position(end_pos);
-
-  VariableProxy* unresolvable = class_scope->ResolvePrivateNamesPartially();
-  if (unresolvable != nullptr) {
-    impl()->ReportMessageAt(Scanner::Location(unresolvable->position(),
-                                              unresolvable->position() + 1),
-                            MessageTemplate::kInvalidPrivateFieldResolution,
-                            unresolvable->raw_name());
-    return impl()->FailureExpression();
-  }
-
-  if (class_info.requires_brand) {
-    // TODO(joyee): implement static brand checking
-    class_scope->DeclareBrandVariable(
-        ast_value_factory(), IsStaticFlag::kNotStatic, kNoSourcePosition);
-  }
-
-  bool should_save_class_variable_index =
-      class_scope->should_save_class_variable_index();
-  if (!is_anonymous || should_save_class_variable_index) {
-    impl()->DeclareClassVariable(class_scope, name, &class_info,
-                                 class_token_pos);
-    if (should_save_class_variable_index) {
-      class_scope->class_variable()->set_is_used();
-      class_scope->class_variable()->ForceContextAllocation();
-    }
-  }
-
+  // ...
+  // 需要重新整理下Class的解析结果,生成一个新的结构更清晰的AST返回
   return impl()->RewriteClassLiteral(class_scope, name, &class_info,
                                      class_token_pos, end_pos);
 }
+
+```
+
+#### ParseClassPropertyDefinition
+解析Class Body里的单条Proerty
+```cpp
+// src/parsing/parser-base.h
+template <typename Impl>
+typename ParserBase<Impl>::ClassLiteralPropertyT
+ParserBase<Impl>::ParseClassPropertyDefinition(ClassInfo* class_info,
+                                               ParsePropertyInfo* prop_info,
+                                               bool has_extends) {
+  // 取出Property的名字
+  Token::Value name_token = peek();
+  int property_beg_pos = scanner()->peek_location().beg_pos;
+  int name_token_position = property_beg_pos;
+  ExpressionT name_expression;
+  if (name_token == Token::STATIC) {
+    // Property带 ‘static’标记的情况
+    Consume(Token::STATIC);
+    name_token_position = scanner()->peek_location().beg_pos;
+    if (peek() == Token::LPAREN) {
+      // 一些不常见的用法?
+      //...
+    } else if (peek() == Token::ASSIGN || peek() == Token::SEMICOLON ||
+               peek() == Token::RBRACE) {
+      //...
+    } else {
+      // 设置propInfo的is_static标记,然后调用ParseProperty解析当前property信息
+      prop_info->is_static = true;
+      // 解析Property名字;
+      // async, *, public, private , 数字转换等等等等
+      name_expression = ParseProperty(prop_info);
+    }
+  } else {
+    name_expression = ParseProperty(prop_info);
+  }
+
+  // 设置ClassInfo的has_name_static_property属性;
+  // 猜想如果一个类没有任何statc类型的Property,v8可以作些优化
+  if (!class_info->has_name_static_property && prop_info->is_static &&
+      impl()->IsName(prop_info->name)) {
+    class_info->has_name_static_property = true;
+  }
+
+  switch (prop_info->kind) {
+    case ParsePropertyKind::kAssign:
+    case ParsePropertyKind::kClassField:
+    case ParsePropertyKind::kShorthandOrClassField:
+    case ParsePropertyKind::kNotSet: {
+      // 普通Field类型的Property
+      // 几种常见的,兼容的,未来的类型等等统一设置成ClassField类型
+      prop_info->kind = ParsePropertyKind::kClassField;
+      DCHECK_IMPLIES(prop_info->is_computed_name, !prop_info->is_private);
+
+      if (!prop_info->is_computed_name) {
+        CheckClassFieldName(prop_info->name, prop_info->is_static);
+      }
+      // 解析Class的成员(Member)的内容
+      ExpressionT initializer = ParseMemberInitializer(
+          class_info, property_beg_pos, prop_info->is_static);
+      // 忽略‘:’token
+      ExpectSemicolon();
+      // 生成Property的解析结果
+      ClassLiteralPropertyT result = factory()->NewClassLiteralProperty(
+          name_expression, initializer, ClassLiteralProperty::FIELD,
+          prop_info->is_static, prop_info->is_computed_name,
+          prop_info->is_private);
+      // 给解析结果冠个名
+      impl()->SetFunctionNameFromPropertyName(result, prop_info->name);
+
+      return result;
+    }
+    case ParsePropertyKind::kMethod: {
+      // Class方法类型的解析
+      if (!prop_info->is_computed_name) {
+        CheckClassMethodName(prop_info->name, ParsePropertyKind::kMethod,
+                             prop_info->function_flags, prop_info->is_static,
+                             &class_info->has_seen_constructor);
+      }
+      // 取出前面解析的一些更细节的方法信息,比如async, *;
+      FunctionKind kind = MethodKindFor(prop_info->function_flags);
+
+      if (!prop_info->is_static && impl()->IsConstructor(prop_info->name)) {
+        // 判断当前方法名是Construcotr函数,同时当前方法不是static时,
+        // 则认为当前的方法是Constructor,需要设置ClassInfo的has_ssen_constructor为true
+        class_info->has_seen_constructor = true;
+        // 同时根据类是否是extend需要设置当前Constructor的kind 是Base 还是 Derived
+        kind = has_extends ? FunctionKind::kDerivedConstructor
+                           : FunctionKind::kBaseConstructor;
+      }
+
+      // 解析方法里的内容
+      ExpressionT value = impl()->ParseFunctionLiteral(
+          prop_info->name, scanner()->location(), kSkipFunctionNameCheck, kind,
+          name_token_position, FunctionSyntaxKind::kAccessorOrMethod,
+          language_mode(), nullptr);
+
+      // 生成Property的解析结果
+      ClassLiteralPropertyT result = factory()->NewClassLiteralProperty(
+          name_expression, value, ClassLiteralProperty::METHOD,
+          prop_info->is_static, prop_info->is_computed_name,
+          prop_info->is_private);
+      // 给解析结果冠个名
+      impl()->SetFunctionNameFromPropertyName(result, prop_info->name);
+      return result;
+    }
+
+    case ParsePropertyKind::kAccessorGetter:
+    case ParsePropertyKind::kAccessorSetter: {
+      // Class 的 ’getter' 和 ‘setter’方法的解析
+      bool is_get = prop_info->kind == ParsePropertyKind::kAccessorGetter;
+      //...
+      // 判断是 ‘getter’ 方法还是 ‘setter’ 方法
+      FunctionKind kind = is_get ? FunctionKind::kGetterFunction
+                                 : FunctionKind::kSetterFunction;
+
+      // 解析方法内容
+      FunctionLiteralT value = impl()->ParseFunctionLiteral(
+          prop_info->name, scanner()->location(), kSkipFunctionNameCheck, kind,
+          name_token_position, FunctionSyntaxKind::kAccessorOrMethod,
+          language_mode(), nullptr);
+
+      ClassLiteralProperty::Kind property_kind =
+          is_get ? ClassLiteralProperty::GETTER : ClassLiteralProperty::SETTER;
+      // 生成Property的解析结果
+      ClassLiteralPropertyT result = factory()->NewClassLiteralProperty(
+          name_expression, value, property_kind, prop_info->is_static,
+          prop_info->is_computed_name, prop_info->is_private);
+      const AstRawString* prefix =
+          is_get ? ast_value_factory()->get_space_string()
+                 : ast_value_factory()->set_space_string();
+      // 给解析结果冠个名
+      impl()->SetFunctionNameFromPropertyName(result, prop_info->name, prefix);
+      return result;
+    }
+    case ParsePropertyKind::kValue:
+    case ParsePropertyKind::kShorthand:
+    case ParsePropertyKind::kSpread:
+      // 其他现在认为是语法错误的处理
+      impl()->ReportUnexpectedTokenAt(
+          Scanner::Location(name_token_position, name_expression->position()),
+          name_token);
+      return impl()->NullLiteralProperty();
+  }
+  UNREACHABLE();
+}
+
 
 ```
