@@ -77,7 +77,7 @@ typename ParserBase<Impl>::ExpressionT ParserBase<Impl>::ParseClassLiteral(
   // 新建一个ClassScope
   ClassScope* class_scope = NewClassScope(scope(), is_anonymous);
   BlockState block_state(&scope_, class_scope);
-  // 同上,Class作为一个较新的语法,不应该兼容以前一些“不严格,不优雅”的语法,直接把languageMode升为‘严格’
+  // 同上,Class作为一个较新的语法,不想兼容以前一些“不严格,不优雅”的语法,直接把languageMode升为‘严格’
   RaiseLanguageMode(LanguageMode::kStrict);
 
   // 以当前的环境信息为蓝本,初始化一个ClassInfo结构,保存解析初的Class信息,供后面优化整理
@@ -134,7 +134,7 @@ typename ParserBase<Impl>::ExpressionT ParserBase<Impl>::ParseClassLiteral(
     bool is_field = property_kind == ClassLiteralProperty::FIELD;
 
     if (V8_UNLIKELY(prop_info.is_private)) {
-      // 新的ES标准将会支持类的私有属性,私有属性的声明需要作特别处理,声明完后continue到下一个循环
+      // 新的ES标准将会支持类的私有属性,私有属性的声明和传统的属性声明走不同的流程处理,声明完后continue到下一个循环
       DCHECK(!is_constructor);
       class_info.requires_brand |= (!is_field && !prop_info.is_static);
       class_info.has_private_methods |=
@@ -169,7 +169,7 @@ typename ParserBase<Impl>::ExpressionT ParserBase<Impl>::ParseClassLiteral(
   int end_pos = end_position();
   class_scope->set_end_position(end_pos);
   // ...
-  // 需要重新整理下Class的解析结果,生成一个新的结构更清晰的AST返回
+  // 需要重新整理下Class的解析结果,生成一个新的结构更清晰的AST节点并返回
   return impl()->RewriteClassLiteral(class_scope, name, &class_info,
                                      class_token_pos, end_pos);
 }
@@ -246,8 +246,7 @@ ParserBase<Impl>::ParseClassPropertyDefinition(ClassInfo* class_info,
 
       return result;
     }
-    case ParsePropertyKind::kMethod: {
-      // Class方法类型的解析
+    case ParsePropertyKind::kMethod: {// Class方法类型的解析
       if (!prop_info->is_computed_name) {
         CheckClassMethodName(prop_info->name, ParsePropertyKind::kMethod,
                              prop_info->function_flags, prop_info->is_static,
@@ -320,6 +319,135 @@ ParserBase<Impl>::ParseClassPropertyDefinition(ClassInfo* class_info,
   }
   UNREACHABLE();
 }
+```
 
+##### ParseMemberInitializer
+
+#### DeclarePrivateClassMember
+```cpp
+// src/parsing/parser.cc
+void Parser::DeclarePrivateClassMember(ClassScope* scope,
+                                       const AstRawString* property_name,
+                                       ClassLiteralProperty* property,
+                                       ClassLiteralProperty::Kind kind,
+                                       bool is_static, ClassInfo* class_info) {
+  if (kind == ClassLiteralProperty::Kind::FIELD) {
+    // 根据Property是否为static类型将Property加到ClassInfo的不同fields里;
+    // static_fields用于类;
+    // instance_fields用于由类生成的实例
+    if (is_static) {
+      class_info->static_fields->Add(property, zone());
+    } else {
+      class_info->instance_fields->Add(property, zone());
+    }
+  }
+
+  // 创建一个用来保存私有非匿名变量的Varaible结构,即在scope(ClassScope)里作变量声明;
+  // 并将信息设置如Property
+  Variable* private_name_var = CreatePrivateNameVariable(
+      scope, GetVariableMode(kind),
+      is_static ? IsStaticFlag::kStatic : IsStaticFlag::kNotStatic,
+      property_name);
+  int pos = property->value()->position();
+  if (pos == kNoSourcePosition) {
+    pos = property->key()->position();
+  }
+  private_name_var->set_initializer_position(pos);
+  property->set_private_name_var(private_name_var);
+  // 将Property加入到ClassInfo的private_members里
+  class_info->private_members->Add(property, zone());
+}
+
+```
+
+#### DeclarePublicClassField
+```cpp
+// src/parsing/parser.cc
+void Parser::DeclarePublicClassField(ClassScope* scope,
+                                     ClassLiteralProperty* property,
+                                     bool is_static, bool is_computed_name,
+                                     ClassInfo* class_info) {
+  // 由is_static标记决定加入不同的容器
+  if (is_static) {
+    class_info->static_fields->Add(property, zone());
+  } else {
+    class_info->instance_fields->Add(property, zone());
+  }
+  // ...
+}
+```
+
+#### DeclarePublicClassMethod
+constructor和其他public method都走这一流程
+```cpp
+// src/parsing/parser.cc
+void Parser::DeclarePublicClassMethod(const AstRawString* class_name,
+                                      ClassLiteralProperty* property,
+                                      bool is_constructor,
+                                      ClassInfo* class_info) {
+  if (is_constructor) {
+    // constructor的情况,在ClassInfo里设置constructor为当前Property
+    class_info->constructor = property->value()->AsFunctionLiteral();
+    // 规范统一下constructor的名字
+    class_info->constructor->set_raw_name(
+        class_name != nullptr ? ast_value_factory()->NewConsString(class_name)
+                              : nullptr);
+    return;
+  }
+  // 普通的public method 直接把Property加入到ClassInfo的public_members容器里
+  class_info->public_members->Add(property, zone());
+}
+```
+
+#### RewriteClassLiteral
+整理前面解析出来的ClassInfo, 优化生成一个新的Class Ast节点
+```cpp
+// src/parsing/parser.cc
+Expression* Parser::RewriteClassLiteral(ClassScope* block_scope,
+                                        const AstRawString* name,
+                                        ClassInfo* class_info, int pos,
+                                        int end_pos) 
+
+  bool has_extends = class_info->extends != nullptr;
+  bool has_default_constructor = class_info->constructor == nullptr;
+  // 没有显式知名constructor时生成一个默认的constructor方法
+  if (has_default_constructor) {
+    class_info->constructor =
+        DefaultConstructor(name, has_extends, pos, end_pos);
+  }
+
+  if (name != nullptr) {
+    DCHECK_NOT_NULL(block_scope->class_variable());
+    block_scope->class_variable()->set_initializer_position(end_pos);
+  }
+
+  FunctionLiteral* static_fields_initializer = nullptr;
+  if (class_info->has_static_class_fields) {
+    static_fields_initializer = CreateInitializerFunction(
+        "<static_fields_initializer>", class_info->static_fields_scope,
+        class_info->static_fields);
+  }
+
+  FunctionLiteral* instance_members_initializer_function = nullptr;
+  if (class_info->has_instance_members) {
+    instance_members_initializer_function = CreateInitializerFunction(
+        "<instance_members_initializer>", class_info->instance_members_scope,
+        class_info->instance_fields);
+    class_info->constructor->set_requires_instance_members_initializer(true);
+    class_info->constructor->add_expected_properties(
+        class_info->instance_fields->length());
+  }
+  // 根据前面的信息生成一个AST节点并返回
+  ClassLiteral* class_literal = factory()->NewClassLiteral(
+      block_scope, class_info->extends, class_info->constructor,
+      class_info->public_members, class_info->private_members,
+      static_fields_initializer, instance_members_initializer_function, pos,
+      end_pos, class_info->has_name_static_property,
+      class_info->has_static_computed_names, class_info->is_anonymous,
+      class_info->has_private_methods);
+
+  AddFunctionForNameInference(class_info->constructor);
+  return class_literal;
+}
 
 ```
