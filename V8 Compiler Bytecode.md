@@ -50,7 +50,7 @@ MaybeHandle<SharedFunctionInfo> GenerateUnoptimizedCodeForToplevel(
     if (shared_info->is_compiled()) continue;
     // ...
 
-    // 新建一个“UnoptimizedCompilationJob”实例;
+    // 新建一个“InterpreterCompilationJob(继承自UnoptimizedCompilationJob)”实例;
     // 这里把“&functions_to_compile”当成参数传入了实例,因为在某些贪婪算法下,编译的同时又会将新的需要编译的函数literal push到这个functions_to_compile中,
     // 那么下一个while循环时判断不为空,则会继续编译
     std::unique_ptr<UnoptimizedCompilationJob> job(
@@ -71,6 +71,71 @@ MaybeHandle<SharedFunctionInfo> GenerateUnoptimizedCodeForToplevel(
   parse_info->ResetCharacterStream();
 
   return top_level;
+}
+```
+
+### ExecuteJob
+```cpp
+// src/codegen/compiler.cc
+CompilationJob::Status UnoptimizedCompilationJob::ExecuteJob() {
+  DisallowHeapAccess no_heap_access;
+  // ...
+  return UpdateState(ExecuteJobImpl(), State::kReadyToFinalize);
+}
+```
+
+```cpp
+// src/interpreter/interpreter.cc
+InterpreterCompilationJob::Status InterpreterCompilationJob::ExecuteJobImpl() {
+  // 调用内部generator的GenerateBytecode方法生成Bytecode;
+  // 注: generotor() 返回一个 “BytecodeGenerator”实例
+  generator()->GenerateBytecode(stack_limit());
+
+  if (generator()->HasStackOverflow()) {
+    return FAILED;
+  }
+  return SUCCEEDED;
+}
+```
+
+```cpp
+// src/interpreter/bytecode-generator.cc
+void BytecodeGenerator::GenerateBytecode(uintptr_t stack_limit) {
+  DisallowHeapAllocation no_allocation;
+  DisallowHandleAllocation no_handles;
+  DisallowHandleDereference no_deref;
+
+  InitializeAstVisitor(stack_limit);
+
+  // Initialize the incoming context.
+  ContextScope incoming_context(this, closure_scope());
+
+  // Initialize control scope.
+  ControlScopeForTopLevel control(this);
+
+  RegisterAllocationScope register_scope(this);
+
+  AllocateTopLevelRegisters();
+
+  // Perform a stack-check before the body.
+  builder()->StackCheck(info()->literal()->start_position());
+
+  if (info()->literal()->CanSuspend()) {
+    BuildGeneratorPrologue();
+  }
+
+  if (closure_scope()->NeedsContext() && !closure_scope()->is_script_scope()) {
+    // Push a new inner context scope for the function.
+    BuildNewLocalActivationContext();
+    ContextScope local_function_context(this, closure_scope());
+    BuildLocalActivationContextInitialization();
+    GenerateBytecodeBody();
+  } else {
+    GenerateBytecodeBody();
+  }
+
+  // Check that we are not falling off the end.
+  DCHECK(builder()->RemainderOfBlockIsDead());
 }
 ```
 
