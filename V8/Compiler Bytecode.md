@@ -101,41 +101,61 @@ InterpreterCompilationJob::Status InterpreterCompilationJob::ExecuteJobImpl() {
 ```cpp
 // src/interpreter/bytecode-generator.cc
 void BytecodeGenerator::GenerateBytecode(uintptr_t stack_limit) {
-  DisallowHeapAllocation no_allocation;
-  DisallowHandleAllocation no_handles;
-  DisallowHandleDereference no_deref;
-
-  InitializeAstVisitor(stack_limit);
-
-  // Initialize the incoming context.
-  ContextScope incoming_context(this, closure_scope());
-
-  // Initialize control scope.
-  ControlScopeForTopLevel control(this);
-
-  RegisterAllocationScope register_scope(this);
-
-  AllocateTopLevelRegisters();
-
-  // Perform a stack-check before the body.
-  builder()->StackCheck(info()->literal()->start_position());
-
-  if (info()->literal()->CanSuspend()) {
-    BuildGeneratorPrologue();
-  }
-
-  if (closure_scope()->NeedsContext() && !closure_scope()->is_script_scope()) {
-    // Push a new inner context scope for the function.
-    BuildNewLocalActivationContext();
-    ContextScope local_function_context(this, closure_scope());
-    BuildLocalActivationContextInitialization();
+  //...
     GenerateBytecodeBody();
-  } else {
-    GenerateBytecodeBody();
-  }
-
-  // Check that we are not falling off the end.
-  DCHECK(builder()->RemainderOfBlockIsDead());
+  //...
 }
+
+void BytecodeGenerator::GenerateBytecodeBody() {
+  // 如果当前要生成的内容是包裹在一个function里面的,则需要生成function的参数的Bytecode
+  // 注:最外层的node解析没有这个东西
+  VisitArgumentsObject(closure_scope()->arguments());
+  Variable* rest_parameter = closure_scope()->rest_parameter();
+  VisitRestArgumentsArray(rest_parameter);
+
+  // 生成JS语法里的显示的,隐式的“this”的Bytecode,
+  // 即当遇到一个变量,当前AST节点的Scope找不到,需要通过Bytecode里的信息跳转到哪一块代码来搜索这个变量
+  VisitThisFunctionVariable(closure_scope()->function_var());
+  VisitThisFunctionVariable(closure_scope()->this_function_var());
+
+  // Build assignment to {new.target} variable if it is used.
+  VisitNewTargetVariable(closure_scope()->new_target_var());
+
+  //...
+
+  // 当前AST节点的Scope的变量声明的Bytecode
+  if (closure_scope()->is_script_scope()) {
+    VisitGlobalDeclarations(closure_scope()->declarations());
+  } else {
+    VisitDeclarations(closure_scope()->declarations());
+  }
+
+  // 当前AST节点的引入的模块的Bytecode生成
+  VisitModuleNamespaceImports();
+
+  // 与Class相关的AST节点的Bytecode
+  if (IsBaseConstructor(function_kind())) {
+    if (literal->requires_brand_initialization()) {
+      BuildPrivateBrandInitialization(builder()->Receiver());
+    }
+
+    if (literal->requires_instance_members_initializer()) {
+      BuildInstanceMemberInitialization(Register::function_closure(),
+                                        builder()->Receiver());
+    }
+  }
+
+  // 当前AST节点的Statement语句的Bytecode生成
+  VisitStatements(literal->body());
+
+  // ...
+}
+
 ```
+
+#### VisitThisFunctionVariable
+
+#### VisitDeclarations
+
+#### VisitStatements
 
