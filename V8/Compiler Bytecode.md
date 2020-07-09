@@ -46,7 +46,7 @@ MaybeHandle<SharedFunctionInfo> GenerateUnoptimizedCodeForToplevel(
     // 取出前面根据literal已经建好的handle
     Handle<SharedFunctionInfo> shared_info =
         Compiler::GetSharedFunctionInfo(literal, script, isolate);
-    // 因为还未开始编译所以这里不能continue
+    // 如果节点已经被编译过了,则直接跳过
     if (shared_info->is_compiled()) continue;
     // ...
 
@@ -108,7 +108,7 @@ void BytecodeGenerator::GenerateBytecode(uintptr_t stack_limit) {
 
 void BytecodeGenerator::GenerateBytecodeBody() {
   // 如果当前要生成的内容是包裹在一个function里面的,则需要生成function的参数的Bytecode
-  // 注:最外层的node解析没有这个东西
+  // 注:AST最外层的节点没有这些
   VisitArgumentsObject(closure_scope()->arguments());
   Variable* rest_parameter = closure_scope()->rest_parameter();
   VisitRestArgumentsArray(rest_parameter);
@@ -156,6 +156,129 @@ void BytecodeGenerator::GenerateBytecodeBody() {
 #### VisitThisFunctionVariable
 
 #### VisitDeclarations
+```cpp
+// src/interpreter/bytecode-generator.cc
+void BytecodeGenerator::VisitDeclarations(Declaration::List* declarations) {
+  for (Declaration* decl : *declarations) {
+    RegisterAllocationScope register_scope(this);
+    // Visit() 是个宏,根据decl的类型决定调用的方法;
+    // JS目前有两种Declaration:
+    // FunctionDeclaration 和  VariableDeclaration;
+    // 分别调用的是VisitFunctionDeclaration 和VisitVariableDeclaration
+    // TODO Class 声明是在哪里?
+    Visit(decl);
+  }
+}
+```
+
+##### VisitVariableDeclaration
+```cpp
+// src/interpreter/bytecode-generator.cc
+void BytecodeGenerator::VisitVariableDeclaration(VariableDeclaration* decl) {
+  Variable* variable = decl->var();
+  // Unused variables don't need to be visited.
+  if (!variable->is_used()) return;
+
+  switch (variable->location()) {
+    case VariableLocation::UNALLOCATED:
+      UNREACHABLE();
+    case VariableLocation::LOCAL:
+      if (variable->binding_needs_init()) {
+        Register destination(builder()->Local(variable->index()));
+        builder()->LoadTheHole().StoreAccumulatorInRegister(destination);
+      }
+      break;
+    case VariableLocation::PARAMETER:
+      if (variable->binding_needs_init()) {
+        Register destination(builder()->Parameter(variable->index()));
+        builder()->LoadTheHole().StoreAccumulatorInRegister(destination);
+      }
+      break;
+    case VariableLocation::REPL_GLOBAL:
+      // REPL let's are stored in script contexts. They get initialized
+      // with the hole the same way as normal context allocated variables.
+    case VariableLocation::CONTEXT:
+      if (variable->binding_needs_init()) {
+        DCHECK_EQ(0, execution_context()->ContextChainDepth(variable->scope()));
+        builder()->LoadTheHole().StoreContextSlot(execution_context()->reg(),
+                                                  variable->index(), 0);
+      }
+      break;
+    case VariableLocation::LOOKUP: {
+      DCHECK_EQ(VariableMode::kDynamic, variable->mode());
+      DCHECK(!variable->binding_needs_init());
+
+      Register name = register_allocator()->NewRegister();
+
+      builder()
+          ->LoadLiteral(variable->raw_name())
+          .StoreAccumulatorInRegister(name)
+          .CallRuntime(Runtime::kDeclareEvalVar, name);
+      break;
+    }
+    case VariableLocation::MODULE:
+      if (variable->IsExport() && variable->binding_needs_init()) {
+        builder()->LoadTheHole();
+        BuildVariableAssignment(variable, Token::INIT, HoleCheckMode::kElided);
+      }
+      // Nothing to do for imports.
+      break;
+  }
+}
+```
+
+##### VisitFunctionDeclaration
+```cpp
+// src/interpreter/bytecode-generator.cc
+void BytecodeGenerator::VisitFunctionDeclaration(FunctionDeclaration* decl) {
+  Variable* variable = decl->var();
+  DCHECK(variable->mode() == VariableMode::kLet ||
+         variable->mode() == VariableMode::kVar ||
+         variable->mode() == VariableMode::kDynamic);
+  // Unused variables don't need to be visited.
+  if (!variable->is_used()) return;
+
+  switch (variable->location()) {
+    case VariableLocation::UNALLOCATED:
+      UNREACHABLE();
+    case VariableLocation::PARAMETER:
+    case VariableLocation::LOCAL: {
+      VisitFunctionLiteral(decl->fun());
+      BuildVariableAssignment(variable, Token::INIT, HoleCheckMode::kElided);
+      break;
+    }
+    case VariableLocation::REPL_GLOBAL:
+    case VariableLocation::CONTEXT: {
+      DCHECK_EQ(0, execution_context()->ContextChainDepth(variable->scope()));
+      VisitFunctionLiteral(decl->fun());
+      builder()->StoreContextSlot(execution_context()->reg(), variable->index(),
+                                  0);
+      break;
+    }
+    case VariableLocation::LOOKUP: {
+      RegisterList args = register_allocator()->NewRegisterList(2);
+      builder()
+          ->LoadLiteral(variable->raw_name())
+          .StoreAccumulatorInRegister(args[0]);
+      VisitFunctionLiteral(decl->fun());
+      builder()->StoreAccumulatorInRegister(args[1]).CallRuntime(
+          Runtime::kDeclareEvalFunction, args);
+      break;
+    }
+    case VariableLocation::MODULE:
+      DCHECK_EQ(variable->mode(), VariableMode::kLet);
+      DCHECK(variable->IsExport());
+      VisitForAccumulatorValue(decl->fun());
+      BuildVariableAssignment(variable, Token::INIT, HoleCheckMode::kElided);
+      break;
+  }
+  DCHECK_IMPLIES(
+      eager_inner_literals_ != nullptr && decl->fun()->ShouldEagerCompile(),
+      IsInEagerLiterals(decl->fun(), *eager_inner_literals_));
+}
+
+```
+
 
 #### VisitStatements
 
