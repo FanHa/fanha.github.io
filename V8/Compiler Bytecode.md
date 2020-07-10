@@ -1,6 +1,6 @@
 ## Bytecode
 V8在parse阶段先将源码解析成了AST之后,需要再进一步将AST的编译成更靠近底层汇编语言的Bytecode
-
+--- 
 ## 入口
 V8 在CompileTopLevel时先解析了最外层的信息,并将解析结果存在了parse_info里
 ```cpp
@@ -73,7 +73,7 @@ MaybeHandle<SharedFunctionInfo> GenerateUnoptimizedCodeForToplevel(
   return top_level;
 }
 ```
-
+---
 ### ExecuteJob
 ```cpp
 // src/codegen/compiler.cc
@@ -152,9 +152,9 @@ void BytecodeGenerator::GenerateBytecodeBody() {
 }
 
 ```
-
+---
 #### VisitThisFunctionVariable
-
+---
 #### VisitDeclarations
 ```cpp
 // src/interpreter/bytecode-generator.cc
@@ -272,6 +272,6 @@ void BytecodeGenerator::BuildVariableAssignment(
 
 ```
 
-
+---
 #### VisitStatements
 
