@@ -184,45 +184,16 @@ void BytecodeGenerator::VisitVariableDeclaration(VariableDeclaration* decl) {
       UNREACHABLE();
     case VariableLocation::LOCAL:
       if (variable->binding_needs_init()) {
+        // 生成初始化变量的Bytecode指令;
+        // variable->index() 即变量的位置,首先初始化一个以变量位置为目的地的Register;
         Register destination(builder()->Local(variable->index()));
+        // 调用LoadTheHole给 accumulateRegister设置一个“theHole”值(占位),
+        // 然后调用StoreAccumulatorInRegister把这个“theHole”值写到前面生成的Register指向的位置,
+        // 完成变量的初始化
         builder()->LoadTheHole().StoreAccumulatorInRegister(destination);
       }
       break;
-    case VariableLocation::PARAMETER:
-      if (variable->binding_needs_init()) {
-        Register destination(builder()->Parameter(variable->index()));
-        builder()->LoadTheHole().StoreAccumulatorInRegister(destination);
-      }
-      break;
-    case VariableLocation::REPL_GLOBAL:
-      // REPL let's are stored in script contexts. They get initialized
-      // with the hole the same way as normal context allocated variables.
-    case VariableLocation::CONTEXT:
-      if (variable->binding_needs_init()) {
-        DCHECK_EQ(0, execution_context()->ContextChainDepth(variable->scope()));
-        builder()->LoadTheHole().StoreContextSlot(execution_context()->reg(),
-                                                  variable->index(), 0);
-      }
-      break;
-    case VariableLocation::LOOKUP: {
-      DCHECK_EQ(VariableMode::kDynamic, variable->mode());
-      DCHECK(!variable->binding_needs_init());
-
-      Register name = register_allocator()->NewRegister();
-
-      builder()
-          ->LoadLiteral(variable->raw_name())
-          .StoreAccumulatorInRegister(name)
-          .CallRuntime(Runtime::kDeclareEvalVar, name);
-      break;
-    }
-    case VariableLocation::MODULE:
-      if (variable->IsExport() && variable->binding_needs_init()) {
-        builder()->LoadTheHole();
-        BuildVariableAssignment(variable, Token::INIT, HoleCheckMode::kElided);
-      }
-      // Nothing to do for imports.
-      break;
+    // ...
   }
 }
 ```
@@ -232,10 +203,6 @@ void BytecodeGenerator::VisitVariableDeclaration(VariableDeclaration* decl) {
 // src/interpreter/bytecode-generator.cc
 void BytecodeGenerator::VisitFunctionDeclaration(FunctionDeclaration* decl) {
   Variable* variable = decl->var();
-  DCHECK(variable->mode() == VariableMode::kLet ||
-         variable->mode() == VariableMode::kVar ||
-         variable->mode() == VariableMode::kDynamic);
-  // Unused variables don't need to be visited.
   if (!variable->is_used()) return;
 
   switch (variable->location()) {
@@ -243,38 +210,64 @@ void BytecodeGenerator::VisitFunctionDeclaration(FunctionDeclaration* decl) {
       UNREACHABLE();
     case VariableLocation::PARAMETER:
     case VariableLocation::LOCAL: {
+      // 先为function的内容创建Bytecode
       VisitFunctionLiteral(decl->fun());
+      // 为function变量名创建Bytecode
       BuildVariableAssignment(variable, Token::INIT, HoleCheckMode::kElided);
       break;
     }
-    case VariableLocation::REPL_GLOBAL:
-    case VariableLocation::CONTEXT: {
-      DCHECK_EQ(0, execution_context()->ContextChainDepth(variable->scope()));
-      VisitFunctionLiteral(decl->fun());
-      builder()->StoreContextSlot(execution_context()->reg(), variable->index(),
-                                  0);
-      break;
-    }
-    case VariableLocation::LOOKUP: {
-      RegisterList args = register_allocator()->NewRegisterList(2);
-      builder()
-          ->LoadLiteral(variable->raw_name())
-          .StoreAccumulatorInRegister(args[0]);
-      VisitFunctionLiteral(decl->fun());
-      builder()->StoreAccumulatorInRegister(args[1]).CallRuntime(
-          Runtime::kDeclareEvalFunction, args);
-      break;
-    }
-    case VariableLocation::MODULE:
-      DCHECK_EQ(variable->mode(), VariableMode::kLet);
-      DCHECK(variable->IsExport());
-      VisitForAccumulatorValue(decl->fun());
-      BuildVariableAssignment(variable, Token::INIT, HoleCheckMode::kElided);
-      break;
+    // ...
   }
-  DCHECK_IMPLIES(
-      eager_inner_literals_ != nullptr && decl->fun()->ShouldEagerCompile(),
-      IsInEagerLiterals(decl->fun(), *eager_inner_literals_));
+
+}
+
+void BytecodeGenerator::VisitFunctionLiteral(FunctionLiteral* expr) {
+  uint8_t flags = CreateClosureFlags::Encode(
+      expr->pretenure(), closure_scope()->is_function_scope(),
+      info()->might_always_opt());
+  // 初始化一个Bytecode 入口entry
+  size_t entry = builder()->AllocateDeferredConstantPoolEntry();
+  // 调用CreateClosure创建函数的Bytecode,并绑定入口entry
+  builder()->CreateClosure(entry, GetCachedCreateClosureSlot(expr), flags);
+  // 将function的expression与入口配个队push到function_literals里,
+  // 猜想是为了后面遇到该function表达式式可以找到Bytecode的入口
+  function_literals_.push_back(std::make_pair(expr, entry));
+  // 如果function标记了Eager选项,则需要把function里面的内容
+  AddToEagerLiteralsIfEager(expr);
+}
+
+void BytecodeGenerator::BuildVariableAssignment(
+    Variable* variable, Token::Value op, HoleCheckMode hole_check_mode,
+    LookupHoistingMode lookup_hoisting_mode) {
+  VariableMode mode = variable->mode();
+  RegisterAllocationScope assignment_register_scope(this);
+  BytecodeLabel end_label;
+  switch (variable->location()) {
+    case VariableLocation::PARAMETER:
+    case VariableLocation::LOCAL: {
+      // 创建一个指向变量地址的Register
+      Register destination;
+      if (VariableLocation::PARAMETER == variable->location()) {
+        if (variable->IsReceiver()) {
+          destination = builder()->Receiver();
+        } else {
+          destination = builder()->Parameter(variable->index());
+        }
+      } else {
+        destination = builder()->Local(variable->index());
+      }
+
+      // ...
+      if (mode != VariableMode::kConst || op == Token::INIT) {
+        // 将AccumulateRegister里的值写入前面的Register指向的位置,
+        // 猜想这个AccumulateRegister的值是上一步生成的Closure的入口
+        builder()->StoreAccumulatorInRegister(destination);
+      } else if (variable->throw_on_const_assignment(language_mode())) {
+        // ...
+      }
+      break;
+    }
+  }
 }
 
 ```
