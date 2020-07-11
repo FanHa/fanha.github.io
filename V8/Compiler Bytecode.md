@@ -1,5 +1,6 @@
-## Bytecode
+## Bytecode 
 V8在parse阶段先将源码解析成了AST之后,需要再进一步将AST的编译成更靠近底层汇编语言的Bytecode
+
 --- 
 ## 入口
 V8 在CompileTopLevel时先解析了最外层的信息,并将解析结果存在了parse_info里
@@ -154,6 +155,53 @@ void BytecodeGenerator::GenerateBytecodeBody() {
 ```
 ---
 #### VisitThisFunctionVariable
+js 的‘this’也是一个Variable实例
+```cpp
+// src/interpreter/bytecode-generator.cc
+void BytecodeGenerator::VisitThisFunctionVariable(Variable* variable) {
+  if (variable == nullptr) return;
+
+  // ‘Register::function_closure()’用来新建一个指向functionClosure的Register,
+  // 然后生成一个把这个Register的值加载到AccumulateRegister的Bytecode
+  builder()->LoadAccumulatorWithRegister(Register::function_closure());
+  // 生成 将当前AccumulateRegister的内容(即functionClosure) 移动(写入)variable所指向的位置
+  BuildVariableAssignment(variable, Token::INIT, HoleCheckMode::kElided);
+}
+```
+```cpp
+void BytecodeGenerator::BuildVariableAssignment(
+    Variable* variable, Token::Value op, HoleCheckMode hole_check_mode,
+    LookupHoistingMode lookup_hoisting_mode) {
+  VariableMode mode = variable->mode();
+  RegisterAllocationScope assignment_register_scope(this);
+  BytecodeLabel end_label;
+  switch (variable->location()) {
+    case VariableLocation::PARAMETER:
+    case VariableLocation::LOCAL: {
+      // 创建一个指向变量地址的Register
+      Register destination;
+      if (VariableLocation::PARAMETER == variable->location()) {
+        if (variable->IsReceiver()) {
+          destination = builder()->Receiver();
+        } else {
+          destination = builder()->Parameter(variable->index());
+        }
+      } else {
+        destination = builder()->Local(variable->index());
+      }
+
+      // ...
+      if (mode != VariableMode::kConst || op == Token::INIT) {
+        // 将AccumulateRegister里的值写入前面的Register指向的位置,
+        builder()->StoreAccumulatorInRegister(destination);
+      } else if (variable->throw_on_const_assignment(language_mode())) {
+        // ...
+      }
+      break;
+    }
+  }
+}
+```
 ---
 #### VisitDeclarations
 ```cpp
@@ -183,6 +231,7 @@ void BytecodeGenerator::VisitVariableDeclaration(VariableDeclaration* decl) {
     case VariableLocation::UNALLOCATED:
       UNREACHABLE();
     case VariableLocation::LOCAL:
+      // 判断变量是否需要初始化一个Hole占位值
       if (variable->binding_needs_init()) {
         // 生成初始化变量的Bytecode指令;
         // variable->index() 即变量的位置,首先初始化一个以变量位置为目的地的Register;
@@ -212,7 +261,7 @@ void BytecodeGenerator::VisitFunctionDeclaration(FunctionDeclaration* decl) {
     case VariableLocation::LOCAL: {
       // 先为function的内容创建Bytecode
       VisitFunctionLiteral(decl->fun());
-      // 为function变量名创建Bytecode
+      // 为function变量名创建Bytecode,这一步会把上一步生成的Bytecode写入变量所在的Register位置
       BuildVariableAssignment(variable, Token::INIT, HoleCheckMode::kElided);
       break;
     }
@@ -235,43 +284,120 @@ void BytecodeGenerator::VisitFunctionLiteral(FunctionLiteral* expr) {
   // 如果function标记了Eager选项,则需要把function里面的内容
   AddToEagerLiteralsIfEager(expr);
 }
-
-void BytecodeGenerator::BuildVariableAssignment(
-    Variable* variable, Token::Value op, HoleCheckMode hole_check_mode,
-    LookupHoistingMode lookup_hoisting_mode) {
-  VariableMode mode = variable->mode();
-  RegisterAllocationScope assignment_register_scope(this);
-  BytecodeLabel end_label;
-  switch (variable->location()) {
-    case VariableLocation::PARAMETER:
-    case VariableLocation::LOCAL: {
-      // 创建一个指向变量地址的Register
-      Register destination;
-      if (VariableLocation::PARAMETER == variable->location()) {
-        if (variable->IsReceiver()) {
-          destination = builder()->Receiver();
-        } else {
-          destination = builder()->Parameter(variable->index());
-        }
-      } else {
-        destination = builder()->Local(variable->index());
-      }
-
-      // ...
-      if (mode != VariableMode::kConst || op == Token::INIT) {
-        // 将AccumulateRegister里的值写入前面的Register指向的位置,
-        // 猜想这个AccumulateRegister的值是上一步生成的Closure的入口
-        builder()->StoreAccumulatorInRegister(destination);
-      } else if (variable->throw_on_const_assignment(language_mode())) {
-        // ...
-      }
-      break;
-    }
-  }
-}
-
 ```
 
 ---
 #### VisitStatements
+```cpp
+// src/interpreter/bytecode-generator.cc
+void BytecodeGenerator::VisitStatements(
+    const ZonePtrList<Statement>* statements) {
+  for (int i = 0; i < statements->length(); i++) {
+    // 遍历所有statements, Visit每一个stmt生成Bytecode
+    RegisterAllocationScope allocation_scope(this);
+    Statement* stmt = statements->at(i);
+    Visit(stmt);
+    // 遇到了需要退出的情况(某些语法?)则无需继续生成Bytecode
+    if (builder()->RemainderOfBlockIsDead()) break;
+  }
+}
+```
+以下是Statement的类型,大多是js语法保留的关键字,可以生成固定的Bytecode;
+ExpressionStatement是个例外,比如前面声明并定义了function func();
+然后调用func(),这个调用就是一个ExpressionStatement;
+```cpp
+// src/ast/ast.h
+#define ITERATION_NODE_LIST(V) \
+  V(DoWhileStatement)          \
+  V(WhileStatement)            \
+  V(ForStatement)              \
+  V(ForInStatement)            \
+  V(ForOfStatement)
 
+#define BREAKABLE_NODE_LIST(V) \
+  V(Block)                     \
+  V(SwitchStatement)
+
+#define STATEMENT_NODE_LIST(V)    \
+  ITERATION_NODE_LIST(V)          \
+  BREAKABLE_NODE_LIST(V)          \
+  V(ExpressionStatement)          \
+  V(EmptyStatement)               \
+  V(SloppyBlockFunctionStatement) \
+  V(IfStatement)                  \
+  V(ContinueStatement)            \
+  V(BreakStatement)               \
+  V(ReturnStatement)              \
+  V(WithStatement)                \
+  V(TryCatchStatement)            \
+  V(TryFinallyStatement)          \
+  V(DebuggerStatement)            \
+  V(InitializeClassMembersStatement)
+```
+
+##### VisitExpressionStatement
+```cpp
+// src/interpreter/bytecode-generator.cc
+void BytecodeGenerator::VisitExpressionStatement(ExpressionStatement* stmt) {
+  // 保存Statement的Position信息;
+  // ?这个似乎不是生成Bytecode,只是保存信息,供后面其他情况使用
+  builder()->SetStatementPosition(stmt);
+  // 生成Bytecode
+  VisitForEffect(stmt->expression());
+}
+
+void BytecodeGenerator::VisitForEffect(Expression* expr) {
+  EffectResultScope effect_scope(this);
+  Visit(expr);
+}
+```
+ExpressionStatement列表
+```cpp
+#define LITERAL_NODE_LIST(V) \
+  V(RegExpLiteral)           \
+  V(ObjectLiteral)           \
+  V(ArrayLiteral)
+
+#define EXPRESSION_NODE_LIST(V) \
+  LITERAL_NODE_LIST(V)          \
+  V(Assignment)                 \
+  V(Await)                      \
+  V(BinaryOperation)            \
+  V(NaryOperation)              \
+  V(Call)                       \
+  V(CallNew)                    \
+  V(CallRuntime)                \
+  V(ClassLiteral)               \
+  V(CompareOperation)           \
+  V(CompoundAssignment)         \
+  V(Conditional)                \
+  V(CountOperation)             \
+  V(DoExpression)               \
+  V(EmptyParentheses)           \
+  V(FunctionLiteral)            \
+  V(GetTemplateObject)          \
+  V(ImportCallExpression)       \
+  V(Literal)                    \
+  V(NativeFunctionLiteral)      \
+  V(OptionalChain)              \
+  V(Property)                   \
+  V(Spread)                     \
+  V(StoreInArrayLiteral)        \
+  V(SuperCallReference)         \
+  V(SuperPropertyReference)     \
+  V(TemplateLiteral)            \
+  V(ThisExpression)             \
+  V(Throw)                      \
+  V(UnaryOperation)             \
+  V(VariableProxy)              \
+  V(Yield)                      \
+  V(YieldStar)
+```
+
+##### Assignment
+
+##### Await
+
+##### Call
+
+##### ThisExpression
