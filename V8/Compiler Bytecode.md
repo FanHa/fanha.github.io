@@ -394,9 +394,41 @@ ExpressionStatement列表
   V(YieldStar)
 ```
 
-##### Assignment
+##### VisitAssignment
+给变量赋值时的Bytecode
+```cpp
+// src/interpreter/bytecode-generator.cc
+void BytecodeGenerator::VisitAssignment(Assignment* expr) {
+  // 找到赋值语句的左值所在的地址
+  AssignmentLhsData lhs_data = PrepareAssignmentLhs(expr->target());
+  // 生成将右值写入accumulateRegister的Bytecode
+  VisitForAccumulatorValue(expr->value());
+  // 记录赋值语句的代码位置信息 ??TODO 这个信息用来干嘛?
+  builder()->SetExpressionPosition(expr);
+  // 生成将AccumulateRegister里的值(即右值)写入左值的Bytecode
+  BuildAssignment(lhs_data, expr->op(), expr->lookup_hoisting_mode());
+}
+```
 
-##### Await
+##### VisitAwait
+await语句的Bytecode
+```cpp
+// src/interpreter/bytecode-generator.cc
+void BytecodeGenerator::VisitAwait(Await* expr) {
+  // 记录await语句的代码位置信息
+  builder()->SetExpressionPosition(expr);
+  // 将await后面语句作为整体写入AccumulateRegister的Bytecode
+  VisitForAccumulatorValue(expr->expression());
+  // 生成Await逻辑的Bytecode
+  BuildAwait(expr->position());
+  // 
+  BuildIncrementBlockCoverageCounterIfEnabled(expr,
+                                              SourceRangeKind::kContinuation);
+}
+
+//TODO BuildAwait
+```
+
 
 ##### Call
 
