@@ -420,16 +420,161 @@ void BytecodeGenerator::VisitAwait(Await* expr) {
   // 将await后面语句作为整体写入AccumulateRegister的Bytecode
   VisitForAccumulatorValue(expr->expression());
   // 生成Await逻辑的Bytecode
+  // #ToExpand
   BuildAwait(expr->position());
   // 
   BuildIncrementBlockCoverageCounterIfEnabled(expr,
                                               SourceRangeKind::kContinuation);
 }
 
-//TODO BuildAwait
+void BytecodeGenerator::BuildAwait(int position) {
+  {
+    // Await(operand) and suspend.
+    RegisterAllocationScope register_scope(this);
+
+    Runtime::FunctionId await_intrinsic_id;
+    if (IsAsyncGeneratorFunction(function_kind())) {
+      // ...
+    } else {
+      await_intrinsic_id = catch_prediction() == HandlerTable::ASYNC_AWAIT
+                               ? Runtime::kInlineAsyncFunctionAwaitUncaught
+                               : Runtime::kInlineAsyncFunctionAwaitCaught;
+    }
+    // 新建两个Register;??TODO作用
+    RegisterList args = register_allocator()->NewRegisterList(2);
+    builder()
+        // 第一个Register用来放将来会到的结果
+        ->MoveRegister(generator_object(), args[0])
+        // 然后把当前Accumulate里的值(已经在上一层写入了await后面的具体内容)写入第二个Register
+        .StoreAccumulatorInRegister(args[1])
+        // 生成CallRuntime的Bytecode; TODO CallRuntime 和 Call有什么区别
+        .CallRuntime(await_intrinsic_id, args);
+  }
+  // 保存代码流挂起的位置信息,(await需要等待await后面表达式的结果完成了才会继续执行后面的代码)
+  // #ToExpand
+  BuildSuspendPoint(position);
+
+  // TODO
+
+  Register input = register_allocator()->NewRegister();
+  Register resume_mode = register_allocator()->NewRegister();
+
+  // Now dispatch on resume mode.
+  BytecodeLabel resume_next;
+  builder()
+      ->StoreAccumulatorInRegister(input)
+      .CallRuntime(Runtime::kInlineGeneratorGetResumeMode, generator_object())
+      .StoreAccumulatorInRegister(resume_mode)
+      .LoadLiteral(Smi::FromInt(JSGeneratorObject::kNext))
+      .CompareReference(resume_mode)
+      .JumpIfTrue(ToBooleanMode::kAlreadyBoolean, &resume_next);
+
+  // Resume with "throw" completion (rethrow the received value).
+  // TODO(leszeks): Add a debug-only check that the accumulator is
+  // JSGeneratorObject::kThrow.
+  builder()->LoadAccumulatorWithRegister(input).ReThrow();
+
+  // Resume with next.
+  builder()->Bind(&resume_next);
+  builder()->LoadAccumulatorWithRegister(input);
+}
+
+// TODO
+void BytecodeGenerator::BuildSuspendPoint(int position) {
+  // Because we eliminate jump targets in dead code, we also eliminate resumes
+  // when the suspend is not emitted because otherwise the below call to Bind
+  // would start a new basic block and the code would be considered alive.
+  if (builder()->RemainderOfBlockIsDead()) {
+    return;
+  }
+  const int suspend_id = suspend_count_++;
+
+  RegisterList registers = register_allocator()->AllLiveRegisters();
+
+  // Save context, registers, and state. This bytecode then returns the value
+  // in the accumulator.
+  builder()->SetExpressionPosition(position);
+  builder()->SuspendGenerator(generator_object(), registers, suspend_id);
+
+  // Upon resume, we continue here.
+  builder()->Bind(generator_jump_table_, suspend_id);
+
+  // Clobbers all registers and sets the accumulator to the
+  // [[input_or_debug_pos]] slot of the generator object.
+  builder()->ResumeGenerator(generator_object(), registers);
+}
 ```
 
 
 ##### Call
+函数 或 方法的Bytecode
+```cpp
+void BytecodeGenerator::VisitCall(Call* expr) {
+  Expression* callee_expr = expr->expression();
+  Call::CallType call_type = expr->GetCallType();
+
+  // ...
+  // 为函数本身 和 函数的参数们各自新建Register
+  Register callee = register_allocator()->NewRegister();
+  RegisterList args = register_allocator()->NewGrowableRegisterList();
+
+  switch (call_type) {
+    case Call::NAMED_PROPERTY_CALL:
+    case Call::KEYED_PROPERTY_CALL:
+    case Call::PRIVATE_CALL: {
+      Property* property = callee_expr->AsProperty();
+      // 因为函数可以调用自己,所以需要将函数自己(callee)作为一个属性加入到函数的参数列表中(即在参数Register列表里加一个存放callee的Register)
+      VisitAndPushIntoRegisterList(property->obj(), &args);
+      VisitPropertyLoadForRegister(args.last_register(), property, callee);
+      break;
+    }
+    // ...
+  }
+
+  // 生成将函数参数载入到前面新建的Register列表的Bytecode
+  VisitArguments(expr->arguments(), &args);
+  // ...
+  // 保存语句的位置信息
+  builder()->SetExpressionPosition(expr);
+  // 为不同类型的Call生成Bytecode
+  if (is_spread_call) {
+    // ...
+  } else if (optimize_as_one_shot) {
+    // ...
+  } else if (call_type == Call::NAMED_PROPERTY_CALL ||
+             call_type == Call::KEYED_PROPERTY_CALL) {
+    DCHECK(!implicit_undefined_receiver);
+    builder()->CallProperty(callee, args,
+                            feedback_index(feedback_spec()->AddCallICSlot()));
+  } else if (implicit_undefined_receiver) {
+    builder()->CallUndefinedReceiver(
+        callee, args, feedback_index(feedback_spec()->AddCallICSlot()));
+  } else {
+    builder()->CallAnyReceiver(
+        callee, args, feedback_index(feedback_spec()->AddCallICSlot()));
+  }
+}
+```
 
 ##### ThisExpression
+这个应该是显式的‘this’值的Bytecode生成
+```cpp
+// src/interpreter/bytecode-generator.cc
+void BytecodeGenerator::VisitThisExpression(ThisExpression* expr) {
+  BuildThisVariableLoad();
+}
+
+void BytecodeGenerator::BuildThisVariableLoad() {
+  // 向外找到可以作为ReceiverScope的Scope
+  DeclarationScope* receiver_scope = closure_scope()->GetReceiverScope();
+  // 为receiver(即this指向的地方)新建一个var
+  Variable* var = receiver_scope->receiver();
+  // 
+  HoleCheckMode hole_check_mode =
+      IsDerivedConstructor(receiver_scope->function_kind())
+          ? HoleCheckMode::kRequired
+          : HoleCheckMode::kElided;
+  // 生成加载代表receiver的var的Bytecode
+  BuildVariableLoad(var, hole_check_mode);
+}
+```
