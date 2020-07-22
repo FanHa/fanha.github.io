@@ -124,7 +124,10 @@ bool Heap::CollectGarbage(AllocationSpace space,
   return next_gc_likely_to_collect_more;
 }
 ```
+### PerformGarbageCollection
+```cpp
 
+```
 ### 附
 ```cpp
 // src/common/globals.h
