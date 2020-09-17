@@ -298,6 +298,207 @@ unsigned char *__ziplistInsert(unsigned char *zl, unsigned char *p, unsigned cha
 }
 
 ```
+#### ziplist 的压缩约解压 todo
 
+### set
+创建一个set的基本命令
+```c
+// src/t_set.c
+void saddCommand(client *c) {
+    robj *set;
+    int j, added = 0;
+
+    set = lookupKeyWrite(c->db,c->argv[1]);
+    if (set == NULL) {
+        // 创建set接口
+        set = setTypeCreate(c->argv[2]->ptr);
+        dbAdd(c->db,c->argv[1],set);
+    } else {
+        if (set->type != OBJ_SET) {
+            addReply(c,shared.wrongtypeerr);
+            return;
+        }
+    }
+
+    for (j = 2; j < c->argc; j++) {
+        // 往set里新增元素的接口
+        if (setTypeAdd(set,c->argv[j]->ptr)) added++;
+    }
+    if (added) {
+        // todo??
+        signalModifiedKey(c,c->db,c->argv[1]);
+        notifyKeyspaceEvent(NOTIFY_SET,"sadd",c->argv[1],c->db->id);
+    }
+    server.dirty += added;
+    addReplyLongLong(c,added);
+}
+```
+
+#### setTypeCreate
+```c
+// src/t_set.c
+robj *setTypeCreate(sds value) {
+    // 根据不同形式的值创建intSet 或 普通set
+    if (isSdsRepresentableAsLongLong(value,NULL) == C_OK)
+        return createIntsetObject();
+    return createSetObject();
+}
+```
++ 普通set
+```c
+// src/object.c
+robj *createSetObject(void) {
+    // 实际保存set内容的是个dict结构,调用dictCreate初始化Set,
+    // setDictType是个数据结构,保存了与set相关的操作函数信息
+    dict *d = dictCreate(&setDictType,NULL);
+    robj *o = createObject(OBJ_SET,d);
+    o->encoding = OBJ_ENCODING_HT;
+    return o;
+}
+```
+```c
+// src/dict.h
+// dict 是个封装的保存hash数据的结构
+typedef struct dict {
+    dictType *type;
+    void *privdata;
+    dictht ht[2]; // hash表并不是一层不变的,随着冲突增加需要Rehash,用两个表方便Rehash操作
+    long rehashidx; /* rehashing not in progress if rehashidx == -1 */
+    unsigned long iterators; // 猜想是redis支持多线程后需要记录正在使用该表的“用户”数量
+} dict;
+
+```
+```c
+// dictType用来给不同类型但都用到dict的数据一个SAPI,反转控制,解耦合
+// src/server.c
+dictType setDictType = {
+    dictSdsHash,               /* hash function */
+    NULL,                      /* key dup */
+    NULL,                      /* val dup */
+    dictSdsKeyCompare,         /* key compare */
+    dictSdsDestructor,         /* key destructor */
+    NULL                       /* val destructor */
+};
+```
+```c
+// src/dict.c
+// 创建dict结构,分配空间
+dict *dictCreate(dictType *type,
+        void *privDataPtr)
+{   
+    dict *d = zmalloc(sizeof(*d));
+
+    _dictInit(d,type,privDataPtr);
+    return d;
+}
+
+// 初始化dict结构
+int _dictInit(dict *d, dictType *type,
+        void *privDataPtr)
+{
+    _dictReset(&d->ht[0]);
+    _dictReset(&d->ht[1]);
+    d->type = type;
+    d->privdata = privDataPtr;
+    d->rehashidx = -1;
+    d->iterators = 0;
+    return DICT_OK;
+}
+```
+
+
++ Intset
+```c
+// Intset
+robj *createIntsetObject(void) {
+    // 实际保存Intset的是个intset结构
+    intset *is = intsetNew();
+    robj *o = createObject(OBJ_SET,is);
+    o->encoding = OBJ_ENCODING_INTSET;
+    return o;
+}
+```
+
+#### setTypeAdd 往set里加入元素
+```c
+// src/t_set.c
+int setTypeAdd(robj *subject, sds value) {
+    long long llval;
+    if (subject->encoding == OBJ_ENCODING_HT) {
+        // 普通Set情况
+        dict *ht = subject->ptr;
+        // 找到要插入的值的位置,如果值已经存在,这个函数会返回空
+        dictEntry *de = dictAddRaw(ht,value,NULL);
+        if (de) {
+            // Set的元素值其实是给dict的hash表设一个Key,并不需要设置这个key的值;
+            dictSetKey(ht,de,sdsdup(value));
+            dictSetVal(ht,de,NULL);
+            return 1;
+        }
+    } else if (subject->encoding == OBJ_ENCODING_INTSET) {
+        if (isSdsRepresentableAsLongLong(value,&llval) == C_OK) {
+            uint8_t success = 0;
+            subject->ptr = intsetAdd(subject->ptr,llval,&success);
+            if (success) {
+                /* Convert to regular set when the intset contains
+                 * too many entries. */
+                if (intsetLen(subject->ptr) > server.set_max_intset_entries)
+                    setTypeConvert(subject,OBJ_ENCODING_HT);
+                return 1;
+            }
+        } else {
+            /* Failed to get integer from object, convert to regular set. */
+            setTypeConvert(subject,OBJ_ENCODING_HT);
+
+            /* The set *was* an intset and this value is not integer
+             * encodable, so dictAdd should always work. */
+            serverAssert(dictAdd(subject->ptr,sdsdup(value),NULL) == DICT_OK);
+            return 1;
+        }
+    } else {
+        serverPanic("Unknown set encoding");
+    }
+    return 0;
+}
+
+```
+
++ dictAddRaw 找到要插入set的值的写入点(entry)
+```c
+// src/dict.c
+dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing)
+{
+    long index;
+    dictEntry *entry;
+    dictht *ht;
+    // 如果该dict处于Rehashing状态,则调用_dictRehashStep函数尝试Rehash
+    if (dictIsRehashing(d)) _dictRehashStep(d);
+
+    /* Get the index of the new element, or -1 if
+     * the element already exists. */
+    if ((index = _dictKeyIndex(d, key, dictHashKey(d,key), existing)) == -1)
+        return NULL;
+
+    /* Allocate the memory and store the new entry.
+     * Insert the element in top, with the assumption that in a database
+     * system it is more likely that recently added entries are accessed
+     * more frequently. */
+    ht = dictIsRehashing(d) ? &d->ht[1] : &d->ht[0];
+    entry = zmalloc(sizeof(*entry));
+    entry->next = ht->table[index];
+    ht->table[index] = entry;
+    ht->used++;
+
+    /* Set the hash entry fields. */
+    dictSetKey(d, entry, key);
+    return entry;
+}
+
+static void _dictRehashStep(dict *d) {
+    // 如果当前没有人(或线程)在使用这个表,才会真正调用dictRehash
+    // TODO Rehash
+    if (d->iterators == 0) dictRehash(d,1);
+}
+```
 
 
