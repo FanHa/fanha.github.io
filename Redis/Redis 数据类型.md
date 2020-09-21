@@ -436,22 +436,23 @@ int setTypeAdd(robj *subject, sds value) {
             return 1;
         }
     } else if (subject->encoding == OBJ_ENCODING_INTSET) {
+        // 如果set本身是个Intset的情况
         if (isSdsRepresentableAsLongLong(value,&llval) == C_OK) {
+            // 如果新插入的值也是Int型
             uint8_t success = 0;
             subject->ptr = intsetAdd(subject->ptr,llval,&success);
             if (success) {
-                /* Convert to regular set when the intset contains
-                 * too many entries. */
+                // 如果IntSet里面包含的元素过多,也需要转成普通的Set
                 if (intsetLen(subject->ptr) > server.set_max_intset_entries)
                     setTypeConvert(subject,OBJ_ENCODING_HT);
                 return 1;
             }
         } else {
-            /* Failed to get integer from object, convert to regular set. */
+            // 如果新插入的值不是Int型
+            // 需要将整个set转成hashTable类型
             setTypeConvert(subject,OBJ_ENCODING_HT);
 
-            /* The set *was* an intset and this value is not integer
-             * encodable, so dictAdd should always work. */
+            // 按普通类型的Set插入新值
             serverAssert(dictAdd(subject->ptr,sdsdup(value),NULL) == DICT_OK);
             return 1;
         }
@@ -472,24 +473,22 @@ dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing)
     dictEntry *entry;
     dictht *ht;
     // 如果该dict处于Rehashing状态,则调用_dictRehashStep函数尝试Rehash
+    // TODO 什么时候会处于rehashing状态
     if (dictIsRehashing(d)) _dictRehashStep(d);
 
-    /* Get the index of the new element, or -1 if
-     * the element already exists. */
+    // 当要set的值已经存在时,返回null
     if ((index = _dictKeyIndex(d, key, dictHashKey(d,key), existing)) == -1)
         return NULL;
 
-    /* Allocate the memory and store the new entry.
-     * Insert the element in top, with the assumption that in a database
-     * system it is more likely that recently added entries are accessed
-     * more frequently. */
+    // rehashing时要操作的区域在ht[1]
     ht = dictIsRehashing(d) ? &d->ht[1] : &d->ht[0];
+    // 分配空间
     entry = zmalloc(sizeof(*entry));
     entry->next = ht->table[index];
     ht->table[index] = entry;
     ht->used++;
 
-    /* Set the hash entry fields. */
+    // TODO 为什么这里调用了这个dictSetKey,外面还会再调用一次?
     dictSetKey(d, entry, key);
     return entry;
 }
@@ -501,4 +500,134 @@ static void _dictRehashStep(dict *d) {
 }
 ```
 
+### Hash
+创建一个Hash结构的基本命令
+```c
+// src/t_hash.c
+void hsetCommand(client *c) {
+    int i, created = 0;
+    robj *o;
+    // ...
+    // 查找命令中的Hash结构的key,不存在则创建
+    if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
+    hashTypeTryConversion(o,c->argv,2,c->argc-1);
 
+    // 往Hash结构里写入键值对
+    for (i = 2; i < c->argc; i += 2)
+        created += !hashTypeSet(o,c->argv[i]->ptr,c->argv[i+1]->ptr,HASH_SET_COPY);
+
+    // ...
+}
+
+robj *hashTypeLookupWriteOrCreate(client *c, robj *key) {
+    robj *o = lookupKeyWrite(c->db,key);
+    if (o == NULL) {
+        // 如果不存在当前键的数据,则需新建一个Hash结构
+        o = createHashObject();
+        dbAdd(c->db,key,o);
+    } else {
+        if (o->type != OBJ_HASH) {
+            // 如果存在,但结构不是Hash,则报错
+            addReply(c,shared.wrongtypeerr);
+            return NULL;
+        }
+    }
+    return o;
+}
+```
+
+#### Hash结构的创建与写入
++ createHashObject(创建)
+```c
+// src/object.c
+robj *createHashObject(void) {
+    // redis对外的Hash结构的内部实现其实是个ziplist
+    // 注:在刚刚开始是以ziplist形式存放,但随着Hash里的元素的增多,会相应变换数据存放方式(如HashTable);
+    unsigned char *zl = ziplistNew();
+    robj *o = createObject(OBJ_HASH, zl);
+    o->encoding = OBJ_ENCODING_ZIPLIST;
+    return o;
+}
+```
++ HashTypeSet(写入)
+```c
+// src/t_hash.c
+int hashTypeSet(robj *o, sds field, sds value, int flags) {
+    int update = 0;
+
+    if (o->encoding == OBJ_ENCODING_ZIPLIST) {
+        unsigned char *zl, *fptr, *vptr;
+        // 当Hash结构内部的编码方式还是ziplist形式时(通常是因为元素还比较少,直接用压缩的链表也不比用个真正的hash结构差)
+        zl = o->ptr;
+        fptr = ziplistIndex(zl, ZIPLIST_HEAD);
+        if (fptr != NULL) {
+            // 寻找链表中是否存在要设置的key
+            fptr = ziplistFind(fptr, (unsigned char*)field, sdslen(field), 1);
+            if (fptr != NULL) {
+                // 要设置的key已经存在了,
+                // 则把指针指向key的‘next’值(链表版Hash就是“键->值->键->值”这样顺序的存下来的),key的next就是指向的值
+                vptr = ziplistNext(zl, fptr);
+                serverAssert(vptr != NULL);
+                // 设置update=1表明这次操作是更新值,不是新写入值
+                update = 1;
+
+                // 删除原值
+                zl = ziplistDelete(zl, &vptr);
+
+                // 插入新值
+                zl = ziplistInsert(zl, vptr, (unsigned char*)value,
+                        sdslen(value));
+            }
+        }
+
+        if (!update) {
+            // 如果此次操作不是更新值,需要依次在ziplist链表尾插入键和值
+            zl = ziplistPush(zl, (unsigned char*)field, sdslen(field),
+                    ZIPLIST_TAIL);
+            zl = ziplistPush(zl, (unsigned char*)value, sdslen(value),
+                    ZIPLIST_TAIL);
+        }
+        o->ptr = zl;
+
+        /* Check if the ziplist needs to be converted to a hash table */
+        if (hashTypeLength(o) > server.hash_max_ziplist_entries)
+            hashTypeConvert(o, OBJ_ENCODING_HT);
+    } else if (o->encoding == OBJ_ENCODING_HT) {
+        dictEntry *de = dictFind(o->ptr,field);
+        if (de) {
+            sdsfree(dictGetVal(de));
+            if (flags & HASH_SET_TAKE_VALUE) {
+                dictGetVal(de) = value;
+                value = NULL;
+            } else {
+                dictGetVal(de) = sdsdup(value);
+            }
+            update = 1;
+        } else {
+            sds f,v;
+            if (flags & HASH_SET_TAKE_FIELD) {
+                f = field;
+                field = NULL;
+            } else {
+                f = sdsdup(field);
+            }
+            if (flags & HASH_SET_TAKE_VALUE) {
+                v = value;
+                value = NULL;
+            } else {
+                v = sdsdup(value);
+            }
+            dictAdd(o->ptr,f,v);
+        }
+    } else {
+        serverPanic("Unknown hash encoding");
+    }
+
+    /* Free SDS strings we did not referenced elsewhere if the flags
+     * want this function to be responsible. */
+    if (flags & HASH_SET_TAKE_FIELD && field) sdsfree(field);
+    if (flags & HASH_SET_TAKE_VALUE && value) sdsfree(value);
+    return update;
+}
+
+```
