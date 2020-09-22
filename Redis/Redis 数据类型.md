@@ -48,6 +48,79 @@ robj *createObject(int type, void *ptr) {
     return o;
 }
 ```
+### string
+使用最基本的命令 “set a b”,则会创建一个基本的string数据类型
+```c
+// src/t_string.c
+void setCommand(client *c) {
+    int j;
+    robj *expire = NULL;
+    int unit = UNIT_SECONDS;
+    int flags = OBJ_SET_NO_FLAGS;
+
+    for (j = 3; j < c->argc; j++) {
+        // 一些set衍生命令的判断
+        // ...
+    }
+    // 创建一个数据结构来编码压缩存放值
+    c->argv[2] = tryObjectEncoding(c->argv[2]);
+    setGenericCommand(c,flags,c->argv[1],c->argv[2],expire,unit,NULL,NULL);
+}
+```
+```c
+robj *tryObjectEncoding(robj *o) {
+    long value;
+    sds s = o->ptr;
+    size_t len;
+
+    len = sdslen(s);
+    if (len <= 20 && string2l(s,len,&value)) {
+        // 当字符串短到可以用一个long结构表示时,转为long
+        if ((server.maxmemory == 0 ||
+            !(server.maxmemory_policy & MAXMEMORY_FLAG_NO_SHARED_INTEGERS)) &&
+            value >= 0 &&
+            value < OBJ_SHARED_INTEGERS)
+        {   
+            // 字符串转变为一个long后,如果满足条件,可以进一步把这个这个数字保存在一个共享空间中,不必为每个相同的数字保留一份独立的数据空间
+            decrRefCount(o);
+            incrRefCount(shared.integers[value]);
+            return shared.integers[value];
+        } else {
+            if (o->encoding == OBJ_ENCODING_RAW) {
+                // 如果本身的encoding是OBJ_ENCODING_RAW,
+                // 更改相应的编码信息属性
+                sdsfree(o->ptr);
+                o->encoding = OBJ_ENCODING_INT;
+                o->ptr = (void*) value;
+                return o;
+            } else if (o->encoding == OBJ_ENCODING_EMBSTR) {    
+                // 如果本身的encoding属性是OBJ_ENCODING_EMBSTR
+                // 新建一个String结构
+                // TODO? 哪里来的
+                decrRefCount(o);
+                return createStringObjectFromLongLongForValue(value);
+            }
+        }
+    }
+
+    // 如果字符串不满足转变成long类型,但还是比较短,满足EmbeddedString的条件
+    if (len <= OBJ_ENCODING_EMBSTR_SIZE_LIMIT) {
+        robj *emb;
+
+        if (o->encoding == OBJ_ENCODING_EMBSTR) return o;
+        emb = createEmbeddedStringObject(s,sdslen(s));
+        decrRefCount(o);
+        return emb;
+    }
+
+    // 字符串实在太长,就不挣扎了,trim一下空格就好
+    trimStringObjectIfNeeded(o);
+
+    /* Return the original object. */
+    return o;
+}
+
+```
 
 ### list
 使用命令“lpush a b”,如果redis本身不存在a,则会创建一个list
@@ -589,10 +662,11 @@ int hashTypeSet(robj *o, sds field, sds value, int flags) {
         }
         o->ptr = zl;
 
-        /* Check if the ziplist needs to be converted to a hash table */
+        // 检测链表ziplist的元素数量,超过某个设定值时转为传统的HashTable结构
         if (hashTypeLength(o) > server.hash_max_ziplist_entries)
             hashTypeConvert(o, OBJ_ENCODING_HT);
     } else if (o->encoding == OBJ_ENCODING_HT) {
+        // 当hash结构已经是使用HashTable结构编码时,调用dict数据结构的操作函数做查找和插入
         dictEntry *de = dictFind(o->ptr,field);
         if (de) {
             sdsfree(dictGetVal(de));
@@ -622,12 +696,68 @@ int hashTypeSet(robj *o, sds field, sds value, int flags) {
     } else {
         serverPanic("Unknown hash encoding");
     }
-
-    /* Free SDS strings we did not referenced elsewhere if the flags
-     * want this function to be responsible. */
-    if (flags & HASH_SET_TAKE_FIELD && field) sdsfree(field);
-    if (flags & HASH_SET_TAKE_VALUE && value) sdsfree(value);
+    // ...
     return update;
 }
 
 ```
+
+### zset
+创建一个zset(有序集合)的命令“zadd key 100 xixixixi”
+```c
+// src/t_zset.c
+void zaddGenericCommand(client *c, int flags) {
+    static char *nanerr = "resulting score is not a number (NaN)";
+    robj *key = c->argv[1];
+    robj *zobj;
+    sds ele;
+    double score = 0, *scores = NULL;
+    int j, elements;
+    int scoreidx = 0;
+
+    zobj = lookupKeyWrite(c->db,key);
+    if (zobj == NULL) {
+        if (xx) goto reply_to_client; 
+        // 当zset结构不存在时,根据设定的值来决定创建一个zset结构或一个ziplist伪装的压缩版本的zset结构
+        if (server.zset_max_ziplist_entries == 0 ||
+            server.zset_max_ziplist_value < sdslen(c->argv[scoreidx+1]->ptr))
+        {
+            zobj = createZsetObject();
+        } else {
+            zobj = createZsetZiplistObject();
+        }
+        dbAdd(c->db,key,zobj);
+    } else {
+        // 出错处理
+    }
+
+    for (j = 0; j < elements; j++) {
+        double newscore;
+        score = scores[j];
+        int retflags = flags;
+
+        ele = c->argv[scoreidx+1+j*2]->ptr;
+        // 将命令的值加入到zset中
+        int retval = zsetAdd(zobj, score, ele, &retflags, &newscore);
+        if (retval == 0) {
+            addReplyError(c,nanerr);
+            goto cleanup;
+        }
+        if (retflags & ZADD_ADDED) added++;
+        if (retflags & ZADD_UPDATED) updated++;
+        if (!(retflags & ZADD_NOP)) processed++;
+        score = newscore;
+    }
+    server.dirty += (added+updated);
+
+reply_to_client:
+    // ...
+
+cleanup:
+    // ...
+
+```
+
+#### createZsetObject
+#### createZsetZiplistObject
+#### zsetAdd
