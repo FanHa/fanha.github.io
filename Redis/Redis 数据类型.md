@@ -743,6 +743,7 @@ void zaddGenericCommand(client *c, int flags) {
             addReplyError(c,nanerr);
             goto cleanup;
         }
+        // 统计信息
         if (retflags & ZADD_ADDED) added++;
         if (retflags & ZADD_UPDATED) updated++;
         if (!(retflags & ZADD_NOP)) processed++;
@@ -759,5 +760,200 @@ cleanup:
 ```
 
 #### createZsetObject
+```c
+// src/object.c
+robj *createZsetObject(void) {
+    zset *zs = zmalloc(sizeof(*zs));
+    robj *o;
+    // 初始化存放数据的普通dict(HashTable)结构
+    zs->dict = dictCreate(&zsetDictType,NULL);
+    // 这个结构应该是用来保存顺序的
+    zs->zsl = zslCreate();
+    o = createObject(OBJ_ZSET,zs);
+    o->encoding = OBJ_ENCODING_SKIPLIST;
+    return o;
+}
+```
+
+```c
+// src/server.h
+// zset结构包裹了一个普通dict结构(用来存放元素的score,保证score不重复)
+// 一个zskiplist结构, 用来存放实际元素
+typedef struct zset {
+    dict *dict;
+    zskiplist *zsl;
+} zset;
+
+typedef struct zskiplist {
+    struct zskiplistNode *header, *tail;
+    unsigned long length;
+    int level; //TODO level的作用?
+} zskiplist;
+
+typedef struct zskiplistNode {
+    sds ele;    // 节点元素,即zset里的元素
+    double score;   // 节点的排序分
+    struct zskiplistNode *backward;
+    struct zskiplistLevel {
+        struct zskiplistNode *forward;
+        unsigned long span;
+    } level[];
+} zskiplistNode;
+```
+
+```c
+// src/t_zset.c
+zskiplist *zslCreate(void) {
+    int j;
+    zskiplist *zsl;
+
+    zsl = zmalloc(sizeof(*zsl));
+    zsl->level = 1;
+    zsl->length = 0;
+    // 初始化一个header节点
+    zsl->header = zslCreateNode(ZSKIPLIST_MAXLEVEL,0,NULL);
+    // TODO 这个level的作用?
+    for (j = 0; j < ZSKIPLIST_MAXLEVEL; j++) {
+        zsl->header->level[j].forward = NULL;
+        zsl->header->level[j].span = 0;
+    }
+    zsl->header->backward = NULL;
+    zsl->tail = NULL;
+    return zsl;
+}
+
+zskiplistNode *zslCreateNode(int level, double score, sds ele) {
+    zskiplistNode *zn =
+        zmalloc(sizeof(*zn)+level*sizeof(struct zskiplistLevel));
+    zn->score = score;
+    zn->ele = ele;
+    return zn;
+}
+```
+
+
 #### createZsetZiplistObject
+```c
+// src/object.c
+// 一般刚开始zset里面元素少,直接用个ziplist(压缩链表)保存
+robj *createZsetZiplistObject(void) {
+    unsigned char *zl = ziplistNew();
+    robj *o = createObject(OBJ_ZSET,zl);
+    o->encoding = OBJ_ENCODING_ZIPLIST;
+    return o;
+}
+```
 #### zsetAdd
+```c
+// src/t_zset.c
+int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
+    /* Turn options into simple to check vars. */
+    int incr = (*flags & ZADD_INCR) != 0;
+    int nx = (*flags & ZADD_NX) != 0;
+    int xx = (*flags & ZADD_XX) != 0;
+    *flags = 0; /* We'll return our response flags. */
+    double curscore;
+
+    /* NaN as input is an error regardless of all the other parameters. */
+    if (isnan(score)) {
+        *flags = ZADD_NAN;
+        return 0;
+    }
+
+    /* Update the sorted set according to its encoding. */
+    if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
+        // 当zset的实际保存结构还是ziplist(一般此时zset里面的元素比较少)
+        unsigned char *eptr;
+
+        if ((eptr = zzlFind(zobj->ptr,ele,&curscore)) != NULL) {
+            // 要插入的元素已经存在时的情况
+            if (nx) {
+                // nx不允许重复插入
+                *flags |= ZADD_NOP;
+                return 1;
+            }
+
+            // 准备好需要插入原色的顺序分score
+            if (incr) {
+                score += curscore;
+                if (isnan(score)) {
+                    *flags |= ZADD_NAN;
+                    return 0;
+                }
+                if (newscore) *newscore = score;
+            }
+
+            // 调用ziplist的操作函数删除旧值,插入新值
+            if (score != curscore) {
+                zobj->ptr = zzlDelete(zobj->ptr,eptr);
+                zobj->ptr = zzlInsert(zobj->ptr,ele,score);
+                *flags |= ZADD_UPDATED;
+            }
+            return 1;
+        } else if (!xx) {
+            // 没有找到相同的元素的情况下,插入新值
+            zobj->ptr = zzlInsert(zobj->ptr,ele,score);
+            // 判断插入新值后的ziplist是否“超载”了,超载就需要转变成skiplist
+            if (zzlLength(zobj->ptr) > server.zset_max_ziplist_entries ||
+                sdslen(ele) > server.zset_max_ziplist_value)
+                zsetConvert(zobj,OBJ_ENCODING_SKIPLIST);
+            if (newscore) *newscore = score;
+            *flags |= ZADD_ADDED;
+            return 1;
+        } else {
+            *flags |= ZADD_NOP;
+            return 1;
+        }
+    } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
+        zset *zs = zobj->ptr;
+        zskiplistNode *znode;
+        dictEntry *de;
+        // 从dict结构里找寻是否已经包含要插入的元素
+        de = dictFind(zs->dict,ele);
+        if (de != NULL) {
+            // nx参数 不允许重复插入
+            if (nx) {
+                *flags |= ZADD_NOP;
+                return 1;
+            }
+            curscore = *(double*)dictGetVal(de);
+
+            /* Prepare the score for the increment if needed. */
+            if (incr) {
+                score += curscore;
+                if (isnan(score)) {
+                    *flags |= ZADD_NAN;
+                    return 0;
+                }
+                if (newscore) *newscore = score;
+            }
+
+            /* Remove and re-insert when score changes. */
+            if (score != curscore) {
+                znode = zslUpdateScore(zs->zsl,curscore,ele,score);
+                /* Note that we did not removed the original element from
+                 * the hash table representing the sorted set, so we just
+                 * update the score. */
+                dictGetVal(de) = &znode->score; /* Update score ptr. */
+                *flags |= ZADD_UPDATED;
+            }
+            return 1;
+        } else if (!xx) {
+            // zset不存在要插入的值,调用zskiplist的插入方法zslInsert插入值,值插入skiplist结构,score插入dict(HashTable)结构保证score不重复
+            ele = sdsdup(ele);
+            znode = zslInsert(zs->zsl,score,ele);
+            serverAssert(dictAdd(zs->dict,ele,&znode->score) == DICT_OK);
+            *flags |= ZADD_ADDED;
+            if (newscore) *newscore = score;
+            return 1;
+        } else {
+            *flags |= ZADD_NOP;
+            return 1;
+        }
+    } else {
+        serverPanic("Unknown sorted set encoding");
+    }
+    return 0; /* Never reached. */
+}
+
+```
