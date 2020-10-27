@@ -54,29 +54,27 @@ unsigned char *__ziplistInsert(unsigned char *zl, unsigned char *p, unsigned cha
     // 前面ziplist字符串结构 的 zdata部分是由一个个的enrty来表示具体的元素,
     // [byte][TailOffset][zlen][entry]...[entry][end]
     // 每个enrty的结构[prevlen][len][data]
-    if (p[0] != ZIP_END) { // 要插入元素的位置不在list尾部时算出prevlen的方式 TODO 这里的prevlen和很多其他位置的占位长度其实是可变的
+    if (p[0] != ZIP_END) { // 要插入entry的位置不在list尾部时算出prevlen的方式 TODO 这里的prevlen和很多其他位置的占位长度其实是可变的
         ZIP_DECODE_PREVLEN(p, prevlensize, prevlen);
     } else {
-        // 要插入的元素在list尾部时算出prevlen的方式
+        // 要插入的entry在list尾部时算出prevlen的方式
         unsigned char *ptail = ZIPLIST_ENTRY_TAIL(zl);
         if (ptail[0] != ZIP_END) {
             prevlen = zipRawEntryLength(ptail);
         }
     }
 
-    // 尝试对要保存的元素是否压缩,比如一个字符串“1234567”可压缩保存成一个int型,节约空间
+    // 尝试对要保存的entry值压缩,比如一个字符串“1234567”可压缩保存成一个int型,节约空间
     if (zipTryEncoding(s,slen,&value,&encoding)) {
         reqlen = zipIntSize(encoding);
     } else {
         reqlen = slen;
     }
-    // 数据大小+prevlen+数据长度 = 新增元素需要的空间
+    // 数据大小+prevlen+数据长度 = 新增entry需要的空间
     reqlen += zipStorePrevEntryLength(NULL,prevlen);
     reqlen += zipStoreEntryEncoding(NULL,encoding,slen);
 
-    /* When the insert position is not equal to the tail, we need to
-     * make sure that the next entry can hold this entry's length in
-     * its prevlen field. */
+    // 当要插入的entry不是list尾部时,需要检查插入的entry的下一个“entry”的prevlen属性是否长度已经足够,由此也可以知道“entry”的prevlen属性的长度是可变的
     int forcelarge = 0;
     nextdiff = (p[0] != ZIP_END) ? zipPrevLenByteDiff(p,reqlen) : 0;
     if (nextdiff == -4 && reqlen < 4) {
@@ -84,23 +82,25 @@ unsigned char *__ziplistInsert(unsigned char *zl, unsigned char *p, unsigned cha
         forcelarge = 1;
     }
 
-    /* Store offset because a realloc may change the address of zl. */
+    // 保存要插入的entry位置与字符串起点之间的“距离”
     offset = p-zl;
+    // 根据新ziplist所需大小重新分配空间
     zl = ziplistResize(zl,curlen+reqlen+nextdiff);
+    // 将p指向新空间的要插入entry的位置
     p = zl+offset;
 
-    /* Apply memory move when necessary and update tail offset. */
+    
     if (p[0] != ZIP_END) {
-        /* Subtract one because of the ZIP_END bytes */
+        // 将原本字符串将要插入的entry后面的内容按位move到新的位置
         memmove(p+reqlen,p-nextdiff,curlen-offset-1+nextdiff);
 
-        /* Encode this entry's raw length in the next entry. */
+        // 将当前Entry的长度写入下一个entry的prevlen位置
         if (forcelarge)
             zipStorePrevEntryLengthLarge(p+reqlen,reqlen);
         else
             zipStorePrevEntryLength(p+reqlen,reqlen);
 
-        /* Update offset for tail */
+        // 跟新整个ziplist的offset属性
         ZIPLIST_TAIL_OFFSET(zl) =
             intrev32ifbe(intrev32ifbe(ZIPLIST_TAIL_OFFSET(zl))+reqlen);
 
@@ -113,19 +113,18 @@ unsigned char *__ziplistInsert(unsigned char *zl, unsigned char *p, unsigned cha
                 intrev32ifbe(intrev32ifbe(ZIPLIST_TAIL_OFFSET(zl))+nextdiff);
         }
     } else {
-        /* This element will be the new tail. */
+        // 直接把entry写入tail位置就好
         ZIPLIST_TAIL_OFFSET(zl) = intrev32ifbe(p-zl);
     }
 
-    /* When nextdiff != 0, the raw length of the next entry has changed, so
-     * we need to cascade the update throughout the ziplist */
+    // 当改变了插入entry的下一个entry的prevlen值时,下一个entry本身的长度会变,因此存在“下下一个entry”的prevlen空间不足的情况,需要遍历entry直到entry的prevlen空间大小不再改变位置
     if (nextdiff != 0) {
         offset = p-zl;
         zl = __ziplistCascadeUpdate(zl,p+reqlen);
         p = zl+offset;
     }
 
-    /* Write the entry */
+    // 写入要插入元素的entry到ziplist字符串
     p += zipStorePrevEntryLength(p,prevlen);
     p += zipStoreEntryEncoding(p,encoding,slen);
     if (ZIP_IS_STR(encoding)) {
@@ -133,6 +132,7 @@ unsigned char *__ziplistInsert(unsigned char *zl, unsigned char *p, unsigned cha
     } else {
         zipSaveInteger(p,value,encoding);
     }
+    // 调整ziplist的长度属性
     ZIPLIST_INCR_LENGTH(zl,1);
     return zl;
 }
