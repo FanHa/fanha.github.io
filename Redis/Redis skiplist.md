@@ -37,7 +37,6 @@ typedef struct zskiplistNode {
 ### 初始化
 ```c
 // src/t_zset.c
-/* Create a new skiplist. */
 zskiplist *zslCreate(void) {
     int j;
     zskiplist *zsl;
@@ -67,44 +66,43 @@ zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
 
     serverAssert(!isnan(score));
     x = zsl->header;
-    for (i = zsl->level-1; i >= 0; i--) { // 从当前最高层开始
-        /* store rank that is crossed to reach the insert position */
+    for (i = zsl->level-1; i >= 0; i--) { // 从当前最高层开始, 找到每一层的“上一个节点”
         rank[i] = i == (zsl->level-1) ? 0 : rank[i+1];
         while (x->level[i].forward &&
                 (x->level[i].forward->score < score ||
                     (x->level[i].forward->score == score &&
-                    sdscmp(x->level[i].forward->ele,ele) < 0)))
+                    sdscmp(x->level[i].forward->ele,ele) < 0))) // 顺着链表(每一层)找到要插入节点的位置
         {
-            rank[i] += x->level[i].span;
-            x = x->level[i].forward;
+            rank[i] += x->level[i].span; // 累加i层的span
+            x = x->level[i].forward; // 还没有找到要插入的位置,x指向链表当前节点的forward节点
         }
-        update[i] = x;
+        update[i] = x; // 找到了待插入节点i层的位置,将要插入节点i层的“上一个节点”位置保存
     }
     
     level = zslRandomLevel(); // 生成一个随机的层数
     if (level > zsl->level) { // 当随机层数大于当前skiplist的最高层数时
-        for (i = zsl->level; i < level; i++) {
+        for (i = zsl->level; i < level; i++) { // 处理ziplist的header中大于level的层数
             rank[i] = 0;
             update[i] = zsl->header;
-            update[i]->level[i].span = zsl->length;
+            update[i]->level[i].span = zsl->length; // 将header中大于当前level的层数的span置换为zsl的长度
         }
-        zsl->level = level;
+        zsl->level = level; // 更新当前zsl的最高level层数
     }
-    x = zslCreateNode(level,score,ele);
+    x = zslCreateNode(level,score,ele); // 创建节点
     for (i = 0; i < level; i++) {
-        x->level[i].forward = update[i]->level[i].forward;
-        update[i]->level[i].forward = x;
+        x->level[i].forward = update[i]->level[i].forward; // 依次将新节点的每一层的forward指向前面已经保存好的update结构中每一层的forward
+        update[i]->level[i].forward = x; // update结构中每一层的forward指向新节点
 
-        /* update span covered by update[i] as x is inserted here */
-        x->level[i].span = update[i]->level[i].span - (rank[0] - rank[i]);
-        update[i]->level[i].span = (rank[0] - rank[i]) + 1;
+        x->level[i].span = update[i]->level[i].span - (rank[0] - rank[i]); // 更新新节点每一层的span
+        update[i]->level[i].span = (rank[0] - rank[i]) + 1; // 更新新节点的“上一个节点”每一层的span
     }
 
-    /* increment span for untouched levels */
+    // 更新新节点的中那些还没有用到的层数的上一个节点的span,因为新增了一个节点,所以直接+1就行
     for (i = level; i < zsl->level; i++) {
         update[i]->level[i].span++;
     }
 
+    // 更新新节点的backward节点
     x->backward = (update[0] == zsl->header) ? NULL : update[0];
     if (x->level[0].forward)
         x->level[0].forward->backward = x;
