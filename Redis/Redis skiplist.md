@@ -24,7 +24,7 @@ typedef struct zskiplist {
 
 typedef struct zskiplistNode {
     sds ele;    // 元素值
-    double score;   // 元素Score
+    double score;   // 元素Score,用于排序
     struct zskiplistNode *backward; // 链表的下一个节点
     struct zskiplistLevel { // 层级信息,包含当前层级节点的上一个节点指针 和 间隔宽度(span)
         struct zskiplistNode *forward;
@@ -71,7 +71,7 @@ zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
         while (x->level[i].forward &&
                 (x->level[i].forward->score < score ||
                     (x->level[i].forward->score == score &&
-                    sdscmp(x->level[i].forward->ele,ele) < 0))) // 顺着链表(每一层)找到要插入节点的位置
+                    sdscmp(x->level[i].forward->ele,ele) < 0))) // 每一层都顺着链表找到要插入节点的位置
         {
             rank[i] += x->level[i].span; // 累加i层的span
             x = x->level[i].forward; // 还没有找到要插入的位置,x指向链表当前节点的forward节点
