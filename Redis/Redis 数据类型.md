@@ -613,7 +613,7 @@ void zaddGenericCommand(client *c, int flags) {
         int retflags = flags;
 
         ele = c->argv[scoreidx+1+j*2]->ptr;
-        // 将命令的值加入到zset中
+        // 将命令的值和score加入到zset中
         int retval = zsetAdd(zobj, score, ele, &retflags, &newscore);
         if (retval == 0) {
             addReplyError(c,nanerr);
@@ -653,8 +653,8 @@ robj *createZsetObject(void) {
 
 ```c
 // src/server.h
-// zset结构包裹了一个普通dict结构(用来存放元素的score,保证score不重复)
-// 一个zskiplist结构, 用来存放实际元素
+// zset结构包裹了一个普通dict结构(用来存放元素的值,快速查找并保证值不重复)
+// 一个zskiplist结构(跳跃表), 用来存放元素的值和score
 typedef struct zset {
     dict *dict;
     zskiplist *zsl;
@@ -663,48 +663,18 @@ typedef struct zset {
 typedef struct zskiplist {
     struct zskiplistNode *header, *tail;
     unsigned long length;
-    int level; //TODO level的作用?
+    int level; // 跳跃表的层数
 } zskiplist;
 
 typedef struct zskiplistNode {
     sds ele;    // 节点元素,即zset里的元素
     double score;   // 节点的排序分
-    struct zskiplistNode *backward;
+    struct zskiplistNode *backward; // 链的上一个节点位置
     struct zskiplistLevel {
-        struct zskiplistNode *forward;
-        unsigned long span;
+        struct zskiplistNode *forward; // 当前层的下一个节点位置
+        unsigned long span; // 当前层到下一个节点的间隔
     } level[];
 } zskiplistNode;
-```
-
-```c
-// src/t_zset.c
-zskiplist *zslCreate(void) {
-    int j;
-    zskiplist *zsl;
-
-    zsl = zmalloc(sizeof(*zsl));
-    zsl->level = 1;
-    zsl->length = 0;
-    // 初始化一个header节点
-    zsl->header = zslCreateNode(ZSKIPLIST_MAXLEVEL,0,NULL);
-    // TODO 这个level的作用?
-    for (j = 0; j < ZSKIPLIST_MAXLEVEL; j++) {
-        zsl->header->level[j].forward = NULL;
-        zsl->header->level[j].span = 0;
-    }
-    zsl->header->backward = NULL;
-    zsl->tail = NULL;
-    return zsl;
-}
-
-zskiplistNode *zslCreateNode(int level, double score, sds ele) {
-    zskiplistNode *zn =
-        zmalloc(sizeof(*zn)+level*sizeof(struct zskiplistLevel));
-    zn->score = score;
-    zn->ele = ele;
-    return zn;
-}
 ```
 
 
@@ -723,20 +693,18 @@ robj *createZsetZiplistObject(void) {
 ```c
 // src/t_zset.c
 int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
-    /* Turn options into simple to check vars. */
     int incr = (*flags & ZADD_INCR) != 0;
     int nx = (*flags & ZADD_NX) != 0;
     int xx = (*flags & ZADD_XX) != 0;
     *flags = 0; /* We'll return our response flags. */
     double curscore;
 
-    /* NaN as input is an error regardless of all the other parameters. */
+    // zset 内的元素必须传入score值
     if (isnan(score)) {
         *flags = ZADD_NAN;
         return 0;
     }
 
-    /* Update the sorted set according to its encoding. */
     if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
         // 当zset的实际保存结构还是ziplist(一般此时zset里面的元素比较少)
         unsigned char *eptr;
@@ -744,12 +712,12 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
         if ((eptr = zzlFind(zobj->ptr,ele,&curscore)) != NULL) {
             // 要插入的元素已经存在时的情况
             if (nx) {
-                // nx不允许重复插入
+                // nx不允许更新元素的score
                 *flags |= ZADD_NOP;
                 return 1;
             }
 
-            // 准备好需要插入原色的顺序分score
+            // 准备好需要插入元素的顺序分score
             if (incr) {
                 score += curscore;
                 if (isnan(score)) {
@@ -787,7 +755,7 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
         // 从dict结构里找寻是否已经包含要插入的元素
         de = dictFind(zs->dict,ele);
         if (de != NULL) {
-            // nx参数 不允许重复插入
+            // nx参数 不允许更新元素的score
             if (nx) {
                 *flags |= ZADD_NOP;
                 return 1;
@@ -815,7 +783,10 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
             }
             return 1;
         } else if (!xx) {
-            // zset不存在要插入的值,调用zskiplist的插入方法zslInsert插入值,值插入skiplist结构,score插入dict(HashTable)结构保证score不重复
+            // zset不存在要插入的值,
+            // 调用zskiplist的插入方法zslInsert插入值和score,
+            // 调用dictAdd方法插入值和score结构保证值不重复
+            // 
             ele = sdsdup(ele);
             znode = zslInsert(zs->zsl,score,ele);
             serverAssert(dictAdd(zs->dict,ele,&znode->score) == DICT_OK);
@@ -827,7 +798,7 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
             return 1;
         }
     } else {
-        serverPanic("Unknown sorted set encoding");
+        // ...
     }
     return 0; /* Never reached. */
 }
