@@ -188,6 +188,162 @@ InvokeParams InvokeParams::SetUpForRunMicrotasks(
 }
 ```
 
+#### Invoke
+```cpp
+// src/execution/execution.cc
+V8_WARN_UNUSED_RESULT MaybeHandle<Object> Invoke(Isolate* isolate,
+                                                 const InvokeParams& params) {
+  // ...
+
+  // api callbacks can be called directly, unless we want to take the detour
+  // through JS to set up a frame for break-at-entry.
+  if (params.target->IsJSFunction()) {
+    Handle<JSFunction> function = Handle<JSFunction>::cast(params.target);
+    if ((!params.is_construct || function->IsConstructor()) &&
+        function->shared().IsApiFunction() &&
+        !function->shared().BreakAtEntry()) {
+      SaveAndSwitchContext save(isolate, function->context());
+      DCHECK(function->context().global_object().IsJSGlobalObject());
+
+      Handle<Object> receiver = params.is_construct
+                                    ? isolate->factory()->the_hole_value()
+                                    : params.receiver;
+      auto value = Builtins::InvokeApiFunction(
+          isolate, params.is_construct, function, receiver, params.argc,
+          params.argv, Handle<HeapObject>::cast(params.new_target));
+      bool has_exception = value.is_null();
+      DCHECK(has_exception == isolate->has_pending_exception());
+      if (has_exception) {
+        if (params.message_handling == Execution::MessageHandling::kReport) {
+          isolate->ReportPendingMessages();
+        }
+        return MaybeHandle<Object>();
+      } else {
+        isolate->clear_pending_message();
+      }
+      return value;
+    }
+
+    // Set up a ScriptContext when running scripts that need it.
+    if (function->shared().needs_script_context()) {
+      Handle<Context> context;
+      if (!NewScriptContext(isolate, function).ToHandle(&context)) {
+        if (params.message_handling == Execution::MessageHandling::kReport) {
+          isolate->ReportPendingMessages();
+        }
+        return MaybeHandle<Object>();
+      }
+
+      // We mutate the context if we allocate a script context. This is
+      // guaranteed to only happen once in a native context since scripts will
+      // always produce name clashes with themselves.
+      function->set_context(*context);
+    }
+  }
+
+  // Entering JavaScript.
+  VMState<JS> state(isolate);
+  CHECK(AllowJavascriptExecution::IsAllowed(isolate));
+  if (!ThrowOnJavascriptExecution::IsAllowed(isolate)) {
+    isolate->ThrowIllegalOperation();
+    if (params.message_handling == Execution::MessageHandling::kReport) {
+      isolate->ReportPendingMessages();
+    }
+    return MaybeHandle<Object>();
+  }
+  if (!DumpOnJavascriptExecution::IsAllowed(isolate)) {
+    V8::GetCurrentPlatform()->DumpWithoutCrashing();
+    return isolate->factory()->undefined_value();
+  }
+
+  if (params.execution_target == Execution::Target::kCallable) {
+    Handle<Context> context = isolate->native_context();
+    if (!context->script_execution_callback().IsUndefined(isolate)) {
+      v8::Context::AbortScriptExecutionCallback callback =
+          v8::ToCData<v8::Context::AbortScriptExecutionCallback>(
+              context->script_execution_callback());
+      v8::Isolate* api_isolate = reinterpret_cast<v8::Isolate*>(isolate);
+      v8::Local<v8::Context> api_context = v8::Utils::ToLocal(context);
+      callback(api_isolate, api_context);
+      DCHECK(!isolate->has_scheduled_exception());
+      // Always throw an exception to abort execution, if callback exists.
+      isolate->ThrowIllegalOperation();
+      return MaybeHandle<Object>();
+    }
+  }
+
+  // Placeholder for return value.
+  Object value;
+
+  Handle<Code> code =
+      JSEntry(isolate, params.execution_target, params.is_construct);
+  {
+    // Save and restore context around invocation and block the
+    // allocation of handles without explicit handle scopes.
+    SaveContext save(isolate);
+    SealHandleScope shs(isolate);
+
+    if (FLAG_clear_exceptions_on_js_entry) isolate->clear_pending_exception();
+
+    if (params.execution_target == Execution::Target::kCallable) {
+      // clang-format off
+      // {new_target}, {target}, {receiver}, return value: tagged pointers
+      // {argv}: pointer to array of tagged pointers
+      using JSEntryFunction = GeneratedCode<Address(
+          Address root_register_value, Address new_target, Address target,
+          Address receiver, intptr_t argc, Address** argv)>;
+      // clang-format on
+      JSEntryFunction stub_entry =
+          JSEntryFunction::FromAddress(isolate, code->InstructionStart());
+
+      Address orig_func = params.new_target->ptr();
+      Address func = params.target->ptr();
+      Address recv = params.receiver->ptr();
+      Address** argv = reinterpret_cast<Address**>(params.argv);
+      RuntimeCallTimerScope timer(isolate, RuntimeCallCounterId::kJS_Execution);
+      value = Object(stub_entry.Call(isolate->isolate_data()->isolate_root(),
+                                     orig_func, func, recv, params.argc, argv));
+    } else {
+      DCHECK_EQ(Execution::Target::kRunMicrotasks, params.execution_target);
+
+      // clang-format off
+      // return value: tagged pointers
+      // {microtask_queue}: pointer to a C++ object
+      using JSEntryFunction = GeneratedCode<Address(
+          Address root_register_value, MicrotaskQueue* microtask_queue)>;
+      // clang-format on
+      JSEntryFunction stub_entry =
+          JSEntryFunction::FromAddress(isolate, code->InstructionStart());
+
+      RuntimeCallTimerScope timer(isolate, RuntimeCallCounterId::kJS_Execution);
+      value = Object(stub_entry.Call(isolate->isolate_data()->isolate_root(),
+                                     params.microtask_queue));
+    }
+  }
+
+#ifdef VERIFY_HEAP
+  if (FLAG_verify_heap) {
+    value.ObjectVerify(isolate);
+  }
+#endif
+
+  // Update the pending exception flag and return the value.
+  bool has_exception = value.IsException(isolate);
+  DCHECK(has_exception == isolate->has_pending_exception());
+  if (has_exception) {
+    if (params.message_handling == Execution::MessageHandling::kReport) {
+      isolate->ReportPendingMessages();
+    }
+    return MaybeHandle<Object>();
+  } else {
+    isolate->clear_pending_message();
+  }
+
+  return Handle<Object>(value, isolate);
+}
+
+```
+
 #### TryRunMicrotasks
 ```cpp
 // src/execution/execution.cc
