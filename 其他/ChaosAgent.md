@@ -56,7 +56,7 @@ type Transport struct {
 	Config   *Config // 配置
 }
 ```
----
+
 ### 初始化
 ```go
 // transport/transport.go
@@ -78,7 +78,7 @@ func New(config *Config) (*Transport, error) {
 }
 
 ```
----
+
 ### 注册要监听的http路由Handler
 比如心跳服务就需要注册监听一个`/ping`路由来回应platform的心跳检测
 ```go
@@ -106,7 +106,7 @@ func AddHttpHandler(handlerName string, handler Handler) error {
 	return nil
 }
 ```
----
+
 ### 启停服务
 ```go
 // transport/transport.go
@@ -230,7 +230,7 @@ func (beat *heartbeat) record(success bool) {
 	})
 }
 ```
-
+---
 ## ChaosBlade Service
 转化platform的http请求到chaosblade的具体执行
 ```go
@@ -243,7 +243,7 @@ type ChaosBlade struct {
 	running map[string]string
 }
 ```
----
+
 ### 初始化
 ```go
 // chaosblade/blade.go
@@ -333,7 +333,7 @@ func (blade *ChaosBlade) handleCacheAndSafePoint(cmdline, command, arg string, r
 	}
 }
 ```
---- 
+
 ### 启停
 chaosblade服务的是由另一个服务Controller来启停的(和前面的heartbeat等服务不同),需要实现的接口是DoStart 和 DoStop(供Controller服务调用)
 ```go
@@ -372,4 +372,91 @@ func (blade *ChaosBlade) DoStop() error {
 ## Controller服务
 Controller服务包裹了Chaosblade服务,同时也向其他潜在的别的混沌工具提供了注册接口
 ```go
+// controller/controller.go
+type Controller struct {
+	services   map[string]service.LifeCycle // 以注册的服务,目前只有chaosblade
+	serviceKey []string // 服务key
+	transport  *transport.Transport // 注入的httpTransport服务,用来处理http请求
+	handler    *transport.InterceptorRequestHandler
+	mutex      sync.Mutex
+	*service.Controller // ??
+	shutdownFuncList []func() error
+}
 ```
+
+### 初始化Controller
+```go
+//NewController
+func NewController(transport0 *transport.Transport) *Controller {
+	control := &Controller{
+		services:         make(map[string]service.LifeCycle, 0),
+		serviceKey:       make([]string, 0),
+		transport:        transport0,
+		shutdownFuncList: make([]func() error, 0),
+	}
+	control.Controller = service.NewController(control)
+	control.handler = &GetControllerHandler(control).InterceptorRequestHandler
+	return control
+}
+```
+
+### 注册服务到controller
+```go
+// controller/controller.go
+func (controller *Controller) Register(serviceName string, service service.LifeCycle) {
+	controller.mutex.Lock()
+	defer controller.mutex.Unlock()
+	if controller.services[serviceName] == nil { // 重复注册判断
+		controller.serviceKey = append(controller.serviceKey, serviceName) // 将服务加入到服务列表
+		controller.services[serviceName] = service
+		logrus.Infof("[Controller] register %s service to controller", serviceName)
+	}
+}
+```
+
+### 启停Controller
+```go
+// controller/controller.go
+func (controller *Controller) DoStart() error {
+	go func() {
+		controller.mutex.Lock()
+		defer controller.mutex.Unlock()
+        // 遍历所有已经注册的服务,调用他们的Start方法
+		for _, key := range controller.serviceKey {
+			lifeCycle := controller.services[key]
+			if lifeCycle != nil {
+				err := lifeCycle.Start()
+				if err != nil {
+					logrus.Warningf("[Controller] start %s service failed, err: %s", key, err.Error())
+					continue
+				}
+				logrus.Infof("[Controller] start %s service successfully.", key)
+			}
+		}
+	}()
+	return nil
+}
+func (controller *Controller) DoStop() error {
+	go func() {
+		defer tools.PrintPanicStack()
+		controller.mutex.Lock()
+		defer controller.mutex.Unlock()
+		length := len(controller.serviceKey)
+        // 遍历所有已经注册的服务,调用他们的Stop方法
+		for i := length - 1; i >= 0; i-- {
+			key := controller.serviceKey[i]
+			lifeCycle := controller.services[key]
+			if lifeCycle != nil {
+				err := lifeCycle.Stop()
+				if err != nil {
+					logrus.Warningf("[Controller] stop %s service failed, err: %s", key, err.Error())
+					continue
+				}
+				logrus.Infof("[Controller] stop %s service successfully.", key)
+			}
+		}
+	}()
+	return nil
+}
+```
+
