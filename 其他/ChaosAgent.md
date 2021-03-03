@@ -1,5 +1,6 @@
 ## 主要结构
 ChaosAgent用来和ChaosPlatform通信并调用chaosblade
+![avatar](/_resource/chaosagent.png)
 ```go
 // main.go
 func main() {
