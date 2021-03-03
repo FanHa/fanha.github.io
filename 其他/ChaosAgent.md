@@ -375,7 +375,7 @@ Controller服务包裹了Chaosblade服务,同时也向其他潜在的别的混�
 ```go
 // controller/controller.go
 type Controller struct {
-    services   map[string]service.LifeCycle // 以注册的服务,目前只有chaosblade
+    services   map[string]service.LifeCycle // 已注册的服务,目前只有chaosblade
     serviceKey []string // 服务key
     transport  *transport.Transport // 注入的httpTransport服务,用来处理http请求
     handler    *transport.InterceptorRequestHandler
@@ -387,7 +387,7 @@ type Controller struct {
 
 ### 初始化Controller
 ```go
-//NewController
+// controller/controller.go
 func NewController(transport0 *transport.Transport) *Controller {
     control := &Controller{
         services:         make(map[string]service.LifeCycle, 0),
