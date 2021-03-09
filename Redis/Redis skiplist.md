@@ -111,4 +111,18 @@ zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
     zsl->length++;
     return x;
 }
+
+// 生成随机层数
+int zslRandomLevel(void) {
+    int level = 1;
+    while ((random()&0xFFFF) < (ZSKIPLIST_P * 0xFFFF)) // 通过ZSKIPLIST_P 来决定有多大概率 层数+1 ,这里目前版本是写死的0.25,表明层数n+1 是 层数n 节点的1/4;
+        level += 1;
+    return (level<ZSKIPLIST_MAXLEVEL) ? level : ZSKIPLIST_MAXLEVEL;
+}
+
+// src/server.h
+#define ZSKIPLIST_MAXLEVEL 32 /* Should be enough for 2^64 elements */
+#define ZSKIPLIST_P 0.25      /* Skiplist P = 1/4 */
 ```
+
+
