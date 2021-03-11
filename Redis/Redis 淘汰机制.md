@@ -69,33 +69,6 @@ unsigned int LRU_CLOCK(void) {
 }
 ```
 
-### 初始化淘汰池
-redis 在initServer时初始化一个实现key的LRU机制的pool
-```c
-// src/server.c
-void initServer(void) {
-    // ...
-    evictionPoolAlloc(); /* Initialize the LRU keys pool. */
-    // ...
-
-}
-```
-```c
-// src/evict.c
-void evictionPoolAlloc(void) {
-    struct evictionPoolEntry *ep;
-    int j;
-
-    ep = zmalloc(sizeof(*ep)*EVPOOL_SIZE);
-    for (j = 0; j < EVPOOL_SIZE; j++) {
-        ep[j].idle = 0;
-        ep[j].key = NULL;
-        ep[j].cached = sdsnewlen(NULL,EVPOOL_CACHED_SDS_SIZE);
-        ep[j].dbid = 0;
-    }
-    EvictionPoolLRU = ep;
-}
-```
 ### 触发淘汰机制
 ```c
 // src/server.c
@@ -157,8 +130,7 @@ int freeMemoryIfNeeded(void) {
                     dict = (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) ?
                             db->dict : db->expires;
                     if ((keys = dictSize(dict)) != 0) {
-                        // 往淘汰池子里加入候选人 
-                        // TODO
+                        // 往淘汰池子里加入候选robj
                         evictionPoolPopulate(i, dict, db->dict, pool);
                         total_keys += keys;
                     }
@@ -226,10 +198,10 @@ int freeMemoryIfNeeded(void) {
             // ...
             // 根据配置决定 同步执行淘汰机制还是异步执行淘汰机制
             if (server.lazyfree_lazy_eviction)
-                // TODO
+                // 异步删除
                 dbAsyncDelete(db,keyobj);
             else
-                // TODO
+                // 同步删除
                 dbSyncDelete(db,keyobj);
             
             // 手动触发修改key时的hook方法们
@@ -276,6 +248,161 @@ cant_free:
     return result;
 }
 ```
-### evictionPoolPopulate
-### dbAsyncDelete
-### dbSyncDelete
+### 淘汰池
+#### 初始化淘汰池
+redis 在initServer时初始化一个实现key的LRU机制的pool
+```c
+// src/server.c
+void initServer(void) {
+    // ...
+    evictionPoolAlloc(); /* Initialize the LRU keys pool. */
+    // ...
+
+}
+```
+```c
+// src/evict.c
+void evictionPoolAlloc(void) {
+    struct evictionPoolEntry *ep;
+    int j;
+
+    ep = zmalloc(sizeof(*ep)*EVPOOL_SIZE);
+    for (j = 0; j < EVPOOL_SIZE; j++) {
+        ep[j].idle = 0;
+        ep[j].key = NULL;
+        ep[j].cached = sdsnewlen(NULL,EVPOOL_CACHED_SDS_SIZE);
+        ep[j].dbid = 0;
+    }
+    EvictionPoolLRU = ep;
+}
+```
+#### 淘汰池新加入值
+```c
+// src/evict.c
+void evictionPoolPopulate(int dbid, dict *sampledict, dict *keydict, struct evictionPoolEntry *pool) {
+    int j, k, count;
+    dictEntry *samples[server.maxmemory_samples];
+
+    // TODO 随机获取一些样例空间(直接获取的就是dictEntry所在位置)
+    count = dictGetSomeKeys(sampledict,samples,server.maxmemory_samples);
+    // 遍历这些样例数据
+    for (j = 0; j < count; j++) {
+        unsigned long long idle;
+        sds key;
+        robj *o;
+        dictEntry *de;
+
+        de = samples[j];
+        key = dictGetKey(de);
+
+        if (server.maxmemory_policy != MAXMEMORY_VOLATILE_TTL) {
+            // 找到数据存放的实际位置
+            if (sampledict != keydict) de = dictFind(keydict, key);
+            o = dictGetVal(de);
+        }
+
+        // 区分不同的淘汰策略,根绝策略的不同计算当前 robj的idle(分数),分数越高表明越有淘汰潜力
+        if (server.maxmemory_policy & MAXMEMORY_FLAG_LRU) {
+            idle = estimateObjectIdleTime(o);
+        } else if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
+            idle = 255-LFUDecrAndReturn(o);
+        } else if (server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL) {
+            idle = ULLONG_MAX - (long)dictGetVal(de);
+        } else {
+            serverPanic("Unknown eviction policy in evictionPoolPopulate()");
+        }
+
+        // 在淘汰池中安idle分数高低找到合适自己的位置,按idle分数排,或者找到了第一个空位
+        k = 0;
+        while (k < EVPOOL_SIZE &&
+               pool[k].key &&
+               pool[k].idle < idle) k++;
+        if (k == 0 && pool[EVPOOL_SIZE-1].key != NULL) {
+            // 当前idle分数比池子中第一个robj小,且池子最后一个元素也已经有值(这应该近似代表当前的idle分数太低,不配淘汰),则直接跳过本次循环
+            continue;
+        } else if (k < EVPOOL_SIZE && pool[k].key == NULL) {
+            // 找到空位了,后续直接插入就行
+        } else {
+            // 为当前idle分数寻找合适位置时,停在了一个本身有值的位置上
+            if (pool[EVPOOL_SIZE-1].key == NULL) {
+                // 如果池子末尾还有空间,直接将当前位置及其后面的值往池子后面移一个身位,空出当前位置
+                sds cached = pool[EVPOOL_SIZE-1].cached;
+                memmove(pool+k+1,pool+k,
+                    sizeof(pool[0])*(EVPOOL_SIZE-k-1));
+                pool[k].cached = cached;
+            } else {
+                // 池子末尾没有空间了,移除池子最左边的robj,然后把当前位置左边的数据全部往左移一个身位,空出当前位置
+                k--;
+                
+                sds cached = pool[0].cached; /* Save SDS before overwriting. */
+                if (pool[0].key != pool[0].cached) sdsfree(pool[0].key);
+                memmove(pool,pool+1,sizeof(pool[0])*k);
+                pool[k].cached = cached;
+            }
+        }
+
+        // 将当前robj的数据写入池子的当前位置
+        int klen = sdslen(key);
+        if (klen > EVPOOL_CACHED_SDS_SIZE) {
+            pool[k].key = sdsdup(key);
+        } else {
+            memcpy(pool[k].cached,key,klen+1);
+            sdssetlen(pool[k].cached,klen);
+            pool[k].key = pool[k].cached;
+        }
+        pool[k].idle = idle;
+        pool[k].dbid = dbid;
+    }
+}
+```
+
+### 释放淘汰池里的空间
+#### 异步 dbAsyncDelete
+```c
+// src/lazyfree.c
+#define LAZYFREE_THRESHOLD 64
+int dbAsyncDelete(redisDb *db, robj *key) {
+    // 先删除expiredb中的引用
+    if (dictSize(db->expires) > 0) dictDelete(db->expires,key->ptr);
+
+    // TODO 这一步的意义
+    dictEntry *de = dictUnlink(db->dict,key->ptr);
+    if (de) {
+        robj *val = dictGetVal(de);
+        // 算出要释放的空间的工作量
+        size_t free_effort = lazyfreeGetFreeEffort(val);
+
+        // 当工作量大于 LAZYFREE_THRESHOLD 阈值时,触发lazyFree,不然就直接同步释放就行
+        if (free_effort > LAZYFREE_THRESHOLD && val->refcount == 1) {
+            atomicIncr(lazyfree_objects,1);
+            // 将工作量加入到异步处理队列中,由其他线程处理
+            bioCreateBackgroundJob(BIO_LAZY_FREE,val,NULL,NULL);
+            // 将当前entry的值置为NULL,后面就不会再调起同步free了
+            dictSetVal(db->dict,de,NULL);
+        }
+    }
+
+    // 如果没有达到异步free的阈值,这里就会调用同步free,删除键,值,释放空间
+    if (de) {
+        dictFreeUnlinkedEntry(db->dict,de);
+        if (server.cluster_enabled) slotToKeyDel(key->ptr);
+        return 1;
+    } else {
+        return 0;
+    }
+}
+```
+#### 同步 dbSyncDelete
+```c
+// src/db.c
+int dbSyncDelete(redisDb *db, robj *key) {
+    // 同步DELETE直接删除键和值,释放空间
+    if (dictSize(db->expires) > 0) dictDelete(db->expires,key->ptr);
+    if (dictDelete(db->dict,key->ptr) == DICT_OK) {
+        if (server.cluster_enabled) slotToKeyDel(key->ptr);
+        return 1;
+    } else {
+        return 0;
+    }
+}
+```
