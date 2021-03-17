@@ -363,10 +363,11 @@ void evictionPoolPopulate(int dbid, dict *sampledict, dict *keydict, struct evic
 // src/lazyfree.c
 #define LAZYFREE_THRESHOLD 64
 int dbAsyncDelete(redisDb *db, robj *key) {
-    // 先删除expiredb中的引用
+    // 先删除expires db中的信息
     if (dictSize(db->expires) > 0) dictDelete(db->expires,key->ptr);
 
-    // TODO 这一步的意义
+    // 释放dict里dictEntry中的信息,但具体存放存放数据的robj 和 dictEntry本身并没有释放,后面还需要用到
+    // 注:这个dictUnlink 和 后面的 dictFreeUnlinkedEntry需要配合着用
     dictEntry *de = dictUnlink(db->dict,key->ptr);
     if (de) {
         robj *val = dictGetVal(de);
