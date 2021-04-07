@@ -125,3 +125,58 @@ void bioInit(void) {
     }
 }
 ```
+### bioProcessBackgroundJobs
+```c
+// src/bio.c
+void *bioProcessBackgroundJobs(void *arg) {
+    struct bio_job *job;
+    unsigned long type = (unsigned long) arg;
+    sigset_t sigset;
+
+    // ...
+    pthread_mutex_lock(&bio_mutex[type]); // 锁住队列(应该防止在取出任务前的临界阶段就被其他线程如住线程写入数据)
+    while(1) {
+        listNode *ln;
+
+        // 当亲啊类型BIO任务队列里没有任务,等信号
+        if (listLength(bio_jobs[type]) == 0) {
+            pthread_cond_wait(&bio_newjob_cond[type],&bio_mutex[type]); // 等信号时当前任务类型的互斥锁bio_mutex[type]会解封
+            continue;
+        }
+        // 取出队列最前面的任务
+        ln = listFirst(bio_jobs[type]);
+        job = ln->value;
+        // 取出任务后可以解线程锁了
+        pthread_mutex_unlock(&bio_mutex[type]);
+
+        // 根据不同任务类型执行操作
+        if (type == BIO_CLOSE_FILE) {
+            close((long)job->arg1);  //关闭文件
+        } else if (type == BIO_AOF_FSYNC) {
+            // redis数据刷盘
+            redis_fsync((long)job->arg1);
+        } else if (type == BIO_LAZY_FREE) {
+            // 释放空间
+            // 释放空间也有不同的类型,如object, dict, list, 在释放了空间后还需要同步更新外层包裹结构的信息
+            if (job->arg1)
+                lazyfreeFreeObjectFromBioThread(job->arg1);
+            else if (job->arg2 && job->arg3)
+                lazyfreeFreeDatabaseFromBioThread(job->arg2,job->arg3);
+            else if (job->arg3)
+                lazyfreeFreeSlotsMapFromBioThread(job->arg3);
+        } else {
+            serverPanic("Wrong job type in bioProcessBackgroundJobs().");
+        }
+        zfree(job);
+
+        // 删除队列里的节点需要设置当前类型任务的互斥锁, 这个锁会在下个循环解除
+        pthread_mutex_lock(&bio_mutex[type]);
+        listDelNode(bio_jobs[type],ln);
+        bio_pending[type]--;
+
+        // 通知等待锁的用户
+        pthread_cond_broadcast(&bio_step_cond[type]);
+    }
+}
+
+```
