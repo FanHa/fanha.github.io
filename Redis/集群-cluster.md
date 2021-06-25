@@ -7,7 +7,7 @@
 - 首先是有n台独立已经运行的redis服务,并通过配置将自己初始化成为了一个只有一台实例的cluster;
 - 然后是有一个组织者(这个组织者可以是人,也可以是某个其他服务或脚本),知道有这n台独立运行的redis的信息;
 - 组织者决定哪些redis实例负责哪些slot,哪些redis实例是master,哪些redis实例是slave等等,并把这些信息通过命令发给到实例;
-    - 官网创建集群脚本 "./redis-trib.rb create --replicas 1 127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 127.0.0.1:7004 127.0.0.1:7005"
+    - 官网创建集群脚本 "./redis-cli.rb create --replicas 1 127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 127.0.0.1:7004 127.0.0.1:7005"
 - 实例接受命令开始自发的更新集群信息,组成一个更大的cluster
 
 ## clusterInit
@@ -154,3 +154,119 @@ typedef struct clusterNode {
     list *fail_reports;         // 其他认为这个节点已经fail的节点列表
 } clusterNode;
 ```
+
+## redis-cli 发送 Cluster meet到对应redis实例
+脚本(redis-cli)经过自分配好每个节点的角色后,需要通知每个redis实例组成集群(通过向redis服务端口发送命令cluster meet,让所有redis实例主动加入第一个实例的集群)
+```c
+// src/redis-cli.c
+static int clusterManagerCommandCreate(int argc, char **argv) {
+        // ...
+        clusterManagerNode *first = NULL;
+        listRewind(cluster_manager.nodes, &li);
+        while ((ln = listNext(&li)) != NULL) {
+            clusterManagerNode *node = ln->value;
+            if (first == NULL) {
+                first = node;
+                continue;
+            }
+            redisReply *reply = NULL;
+            // 向每个redis实例发送cluster meet 命令带上第一个redis 实例的信息
+            reply = CLUSTER_MANAGER_COMMAND(node, "cluster meet %s %d",
+                                            first->ip, first->port);
+            // ...
+        }
+        // ...
+}
+```
+### cluster meet 命令
+```c
+// src/cluster.c
+void clusterCommand(client *c) {
+    // ...
+    if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"help")) {
+        // ...
+    } else if (!strcasecmp(c->argv[1]->ptr,"meet") && (c->argc == 4 || c->argc == 5)) {
+        /* CLUSTER MEET <ip> <port> [cport] */
+        long long port, cport;
+
+        if (getLongLongFromObject(c->argv[3], &port) != C_OK) {
+            // ...
+            return;
+        }
+
+        if (c->argc == 5) {
+            if (getLongLongFromObject(c->argv[4], &cport) != C_OK) {
+                // ...
+            }
+        } else {
+            cport = port + CLUSTER_PORT_INCR;
+        }
+        // 收到cluster meet 尝试连接目标redis 实例
+        if (clusterStartHandshake(c->argv[2]->ptr,port,cport) == 0 &&
+            errno == EINVAL)
+        {
+            // ... 
+        } else {
+            addReply(c,shared.ok);
+        }
+    }
+    // ...
+}
+
+int clusterStartHandshake(char *ip, int port, int cport) {
+    clusterNode *n;
+    char norm_ip[NET_IP_STR_LEN];
+    struct sockaddr_storage sa;
+
+    /* IP sanity check */
+    if (inet_pton(AF_INET,ip,
+            &(((struct sockaddr_in *)&sa)->sin_addr)))
+    {
+        sa.ss_family = AF_INET;
+    } else if (inet_pton(AF_INET6,ip,
+            &(((struct sockaddr_in6 *)&sa)->sin6_addr)))
+    {
+        sa.ss_family = AF_INET6;
+    } else {
+        errno = EINVAL;
+        return 0;
+    }
+
+    /* Port sanity check */
+    if (port <= 0 || port > 65535 || cport <= 0 || cport > 65535) {
+        errno = EINVAL;
+        return 0;
+    }
+
+    /* Set norm_ip as the normalized string representation of the node
+     * IP address. */
+    memset(norm_ip,0,NET_IP_STR_LEN);
+    if (sa.ss_family == AF_INET)
+        inet_ntop(AF_INET,
+            (void*)&(((struct sockaddr_in *)&sa)->sin_addr),
+            norm_ip,NET_IP_STR_LEN);
+    else
+        inet_ntop(AF_INET6,
+            (void*)&(((struct sockaddr_in6 *)&sa)->sin6_addr),
+            norm_ip,NET_IP_STR_LEN);
+
+    if (clusterHandshakeInProgress(norm_ip,port,cport)) {
+        errno = EAGAIN;
+        return 0;
+    }
+
+    /* Add the node with a random address (NULL as first argument to
+     * createClusterNode()). Everything will be fixed during the
+     * handshake. */
+    n = createClusterNode(NULL,CLUSTER_NODE_HANDSHAKE|CLUSTER_NODE_MEET);
+    memcpy(n->ip,norm_ip,sizeof(n->ip));
+    n->port = port;
+    n->cport = cport;
+    clusterAddNode(n);
+    return 1;
+}
+
+
+```
+
+## clusterAcceptHandler TODO
