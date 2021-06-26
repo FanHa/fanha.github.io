@@ -178,7 +178,7 @@ static int clusterManagerCommandCreate(int argc, char **argv) {
         // ...
 }
 ```
-### cluster meet 命令
+### cluster meet命令处理
 ```c
 // src/cluster.c
 void clusterCommand(client *c) {
@@ -217,47 +217,15 @@ int clusterStartHandshake(char *ip, int port, int cport) {
     clusterNode *n;
     char norm_ip[NET_IP_STR_LEN];
     struct sockaddr_storage sa;
-
-    /* IP sanity check */
-    if (inet_pton(AF_INET,ip,
-            &(((struct sockaddr_in *)&sa)->sin_addr)))
-    {
-        sa.ss_family = AF_INET;
-    } else if (inet_pton(AF_INET6,ip,
-            &(((struct sockaddr_in6 *)&sa)->sin6_addr)))
-    {
-        sa.ss_family = AF_INET6;
-    } else {
-        errno = EINVAL;
-        return 0;
-    }
-
-    /* Port sanity check */
-    if (port <= 0 || port > 65535 || cport <= 0 || cport > 65535) {
-        errno = EINVAL;
-        return 0;
-    }
-
-    /* Set norm_ip as the normalized string representation of the node
-     * IP address. */
-    memset(norm_ip,0,NET_IP_STR_LEN);
-    if (sa.ss_family == AF_INET)
-        inet_ntop(AF_INET,
-            (void*)&(((struct sockaddr_in *)&sa)->sin_addr),
-            norm_ip,NET_IP_STR_LEN);
-    else
-        inet_ntop(AF_INET6,
-            (void*)&(((struct sockaddr_in6 *)&sa)->sin6_addr),
-            norm_ip,NET_IP_STR_LEN);
-
+    // ...
+    // 如果已经在握手中了则不再握手
     if (clusterHandshakeInProgress(norm_ip,port,cport)) {
         errno = EAGAIN;
         return 0;
     }
 
-    /* Add the node with a random address (NULL as first argument to
-     * createClusterNode()). Everything will be fixed during the
-     * handshake. */
+    // 初始化clusternode结构信息,并保存,
+    // 此时这个node 的link值为null,然后在clusterCron中,发现link为null,尝试连接
     n = createClusterNode(NULL,CLUSTER_NODE_HANDSHAKE|CLUSTER_NODE_MEET);
     memcpy(n->ip,norm_ip,sizeof(n->ip));
     n->port = port;
@@ -268,5 +236,73 @@ int clusterStartHandshake(char *ip, int port, int cport) {
 
 
 ```
+### clusterCron 连接目标机器
+```c
+void clusterCron(void) {
+    // ...
+    di = dictGetSafeIterator(server.cluster->nodes);
+    server.cluster->stats_pfail_nodes = 0;
+    while((de = dictNext(di)) != NULL) {
+        clusterNode *node = dictGetVal(de);
+        // ...
+        // 与目标机器的连接不存在(初始化时)
+        if (node->link == NULL) {
 
+            clusterLink *link = createClusterLink(node); //初始化连接信息
+            link->conn = server.tls_cluster ? connCreateTLS() : connCreateSocket();
+            connSetPrivateData(link->conn, link);
+            // 与目标机器的低层连接(tcp)交给内核,这里只关注连接完成后的回调clusterLinkConnectHandler
+            if (connConnect(link->conn, node->ip, node->cport, NET_FIRST_BIND_ADDR,
+                        clusterLinkConnectHandler) == -1) {
+                // ...
+            }
+            node->link = link;
+        }
+    }
+    // ...
+}
+
+void clusterLinkConnectHandler(connection *conn) {
+    clusterLink *link = connGetPrivateData(conn);
+    clusterNode *node = link->node;
+
+    /* Check if connection succeeded */
+    if (connGetState(conn) != CONN_STATE_CONNECTED) {
+        serverLog(LL_VERBOSE, "Connection with Node %.40s at %s:%d failed: %s",
+                node->name, node->ip, node->cport,
+                connGetLastError(conn));
+        freeClusterLink(link);
+        return;
+    }
+
+    /* Register a read handler from now on */
+    connSetReadHandler(conn, clusterReadHandler);
+
+    /* Queue a PING in the new connection ASAP: this is crucial
+     * to avoid false positives in failure detection.
+     *
+     * If the node is flagged as MEET, we send a MEET message instead
+     * of a PING one, to force the receiver to add us in its node
+     * table. */
+    mstime_t old_ping_sent = node->ping_sent;
+    clusterSendPing(link, node->flags & CLUSTER_NODE_MEET ?
+            CLUSTERMSG_TYPE_MEET : CLUSTERMSG_TYPE_PING);
+    if (old_ping_sent) {
+        /* If there was an active ping before the link was
+         * disconnected, we want to restore the ping time, otherwise
+         * replaced by the clusterSendPing() call. */
+        node->ping_sent = old_ping_sent;
+    }
+    /* We can clear the flag after the first packet is sent.
+     * If we'll never receive a PONG, we'll never send new packets
+     * to this node. Instead after the PONG is received and we
+     * are no longer in meet/handshake status, we want to send
+     * normal PING packets. */
+    node->flags &= ~CLUSTER_NODE_MEET;
+
+    serverLog(LL_DEBUG,"Connecting with Node %.40s at %s:%d",
+            node->name, node->ip, node->cport);
+}
+
+```
 ## clusterAcceptHandler TODO
