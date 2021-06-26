@@ -266,43 +266,460 @@ void clusterLinkConnectHandler(connection *conn) {
     clusterLink *link = connGetPrivateData(conn);
     clusterNode *node = link->node;
 
-    /* Check if connection succeeded */
-    if (connGetState(conn) != CONN_STATE_CONNECTED) {
-        serverLog(LL_VERBOSE, "Connection with Node %.40s at %s:%d failed: %s",
-                node->name, node->ip, node->cport,
-                connGetLastError(conn));
-        freeClusterLink(link);
-        return;
-    }
-
-    /* Register a read handler from now on */
+    //设置连接成功后的可读事件回调
     connSetReadHandler(conn, clusterReadHandler);
 
-    /* Queue a PING in the new connection ASAP: this is crucial
-     * to avoid false positives in failure detection.
-     *
-     * If the node is flagged as MEET, we send a MEET message instead
-     * of a PING one, to force the receiver to add us in its node
-     * table. */
     mstime_t old_ping_sent = node->ping_sent;
+    // 发送ping消息(第一次是发送meet消息)
     clusterSendPing(link, node->flags & CLUSTER_NODE_MEET ?
             CLUSTERMSG_TYPE_MEET : CLUSTERMSG_TYPE_PING);
-    if (old_ping_sent) {
-        /* If there was an active ping before the link was
-         * disconnected, we want to restore the ping time, otherwise
-         * replaced by the clusterSendPing() call. */
-        node->ping_sent = old_ping_sent;
-    }
-    /* We can clear the flag after the first packet is sent.
-     * If we'll never receive a PONG, we'll never send new packets
-     * to this node. Instead after the PONG is received and we
-     * are no longer in meet/handshake status, we want to send
-     * normal PING packets. */
+    // ...
+    // 设置flag,后面就只需发送普通的ping消息了
     node->flags &= ~CLUSTER_NODE_MEET;
+    // ...
+}
 
-    serverLog(LL_DEBUG,"Connecting with Node %.40s at %s:%d",
-            node->name, node->ip, node->cport);
+// 这里是第一次发送消息,所以type为CLUSTER_NODE_MEET
+void clusterSendPing(clusterLink *link, int type) {
+    unsigned char *buf;
+    clusterMsg *hdr;
+    // ...
+    buf = zcalloc(totlen);
+    hdr = (clusterMsg*) buf;
+    // ...
+    // 构造meet头(type为CLUSTER_NODE_MEET)
+    clusterBuildMessageHdr(hdr,type);
+
+    // 这里目前只有自身实例的信息,直接continue略过
+    while(freshnodes > 0 && gossipcount < wanted && maxiterations--) {
+        dictEntry *de = dictGetRandomKey(server.cluster->nodes);
+        clusterNode *this = dictGetVal(de);
+        // ...
+        if (this == myself) continue;
+        // ...
+    }
+
+    totlen = sizeof(clusterMsg)-sizeof(union clusterMsgData);
+    totlen += (sizeof(clusterMsgDataGossip)*gossipcount);
+    hdr->count = htons(gossipcount);
+    hdr->totlen = htonl(totlen);
+    // 发送Meet消息到目标实例
+    clusterSendMessage(link,buf,totlen);
+    zfree(buf);
+}
+
+// TODO connSetReadHandler
+```
+### 目标机器接受meet消息
+```c
+// src/cluster.c
+void clusterInit(void) {
+    //...
+            // 目标机器初始化时设置了集群信息端口的可读回调(tcp握手等低层信息交换)
+            if (aeCreateFileEvent(server.el, server.cfd[j], AE_READABLE,
+                clusterAcceptHandler, NULL) == AE_ERR)
+                    // ...
+            }
+    // ...
+}
+
+void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+    // ...
+    while(max--) {
+        // ...
+        // 握手成功后设置,需要设置下次收到集群信息的回调(这里是指其他实例发过来的meet信息)
+        if (connAccept(conn, clusterConnAcceptHandler) == C_ERR) {
+            if (connGetState(conn) == CONN_STATE_ERROR)
+                // ...
+            connClose(conn);
+            return;
+        }
+    }
+}
+static void clusterConnAcceptHandler(connection *conn) {
+    clusterLink *link;
+    // 初始化连接信息
+    link = createClusterLink(NULL);
+    link->conn = conn;
+    connSetPrivateData(conn, link);
+
+    // 创建收到集群信息的可读事件回调 clusterReadHandler
+    connSetReadHandler(conn, clusterReadHandler);
+}
+
+void clusterReadHandler(connection *conn) {
+    clusterMsg buf[1];
+    ssize_t nread;
+    clusterMsg *hdr;
+    clusterLink *link = connGetPrivateData(conn);
+    unsigned int readlen, rcvbuflen;
+
+    while(1) { /* Read as long as there is data to read. */
+        rcvbuflen = sdslen(link->rcvbuf);
+        //...
+        // 收到一个完整的Meet信息后调用clusterProcessPacket解析meet信息
+        if (rcvbuflen >= 8 && rcvbuflen == ntohl(hdr->totlen)) {
+            if (clusterProcessPacket(link)) {
+                // ...
+            } else {
+                // ...
+            }
+        }
+    }
+}
+int clusterProcessPacket(clusterLink *link) {
+    clusterMsg *hdr = (clusterMsg*) link->rcvbuf;
+    uint32_t totlen = ntohl(hdr->totlen);
+    uint16_t type = ntohs(hdr->type);
+    mstime_t now = mstime();
+
+
+    uint16_t flags = ntohs(hdr->flags);
+    uint64_t senderCurrentEpoch = 0, senderConfigEpoch = 0;
+    clusterNode *sender;
+
+    // 寻找发送者对应的本地集群信息,但因为是第一次收到对方节点的信息(meet),所以这里找不到对应本地集群节点信息
+    sender = clusterLookupNode(hdr->sender);
+
+    /* Initial processing of PING and MEET requests replying with a PONG. */
+    if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_MEET) {
+
+        if (!sender && type == CLUSTERMSG_TYPE_MEET) {
+            clusterNode *node;
+            // 根据发送方的的ip,port 信息初始化一个集群node信息,并加入本地集群信息表
+            node = createClusterNode(NULL,CLUSTER_NODE_HANDSHAKE);
+            nodeIp2String(node->ip,link,hdr->myip);
+            node->port = ntohs(hdr->port);
+            node->cport = ntohs(hdr->cport);
+            clusterAddNode(node);
+            clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
+        }
+
+        // 新节点信息加入到gossip区域,及时传播出去 //TODO
+        if (!sender && type == CLUSTERMSG_TYPE_MEET)
+            clusterProcessGossipSection(hdr,link);
+
+        // 回应 TODO
+        clusterSendPing(link,CLUSTERMSG_TYPE_PONG);
+    }
+
+    /* PING, PONG, MEET: process config information. */
+    if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_PONG ||
+        type == CLUSTERMSG_TYPE_MEET)
+    {
+        serverLog(LL_DEBUG,"%s packet received: %p",
+            type == CLUSTERMSG_TYPE_PING ? "ping" : "pong",
+            (void*)link->node);
+        if (link->node) {
+            if (nodeInHandshake(link->node)) {
+                /* If we already have this node, try to change the
+                 * IP/port of the node with the new one. */
+                if (sender) {
+                    serverLog(LL_VERBOSE,
+                        "Handshake: we already know node %.40s, "
+                        "updating the address if needed.", sender->name);
+                    if (nodeUpdateAddressIfNeeded(sender,link,hdr))
+                    {
+                        clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
+                                             CLUSTER_TODO_UPDATE_STATE);
+                    }
+                    /* Free this node as we already have it. This will
+                     * cause the link to be freed as well. */
+                    clusterDelNode(link->node);
+                    return 0;
+                }
+
+                /* First thing to do is replacing the random name with the
+                 * right node name if this was a handshake stage. */
+                clusterRenameNode(link->node, hdr->sender);
+                serverLog(LL_DEBUG,"Handshake with node %.40s completed.",
+                    link->node->name);
+                link->node->flags &= ~CLUSTER_NODE_HANDSHAKE;
+                link->node->flags |= flags&(CLUSTER_NODE_MASTER|CLUSTER_NODE_SLAVE);
+                clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
+            } else if (memcmp(link->node->name,hdr->sender,
+                        CLUSTER_NAMELEN) != 0)
+            {
+                /* If the reply has a non matching node ID we
+                 * disconnect this node and set it as not having an associated
+                 * address. */
+                serverLog(LL_DEBUG,"PONG contains mismatching sender ID. About node %.40s added %d ms ago, having flags %d",
+                    link->node->name,
+                    (int)(now-(link->node->ctime)),
+                    link->node->flags);
+                link->node->flags |= CLUSTER_NODE_NOADDR;
+                link->node->ip[0] = '\0';
+                link->node->port = 0;
+                link->node->cport = 0;
+                freeClusterLink(link);
+                clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
+                return 0;
+            }
+        }
+
+        /* Copy the CLUSTER_NODE_NOFAILOVER flag from what the sender
+         * announced. This is a dynamic flag that we receive from the
+         * sender, and the latest status must be trusted. We need it to
+         * be propagated because the slave ranking used to understand the
+         * delay of each slave in the voting process, needs to know
+         * what are the instances really competing. */
+        if (sender) {
+            int nofailover = flags & CLUSTER_NODE_NOFAILOVER;
+            sender->flags &= ~CLUSTER_NODE_NOFAILOVER;
+            sender->flags |= nofailover;
+        }
+
+        /* Update the node address if it changed. */
+        if (sender && type == CLUSTERMSG_TYPE_PING &&
+            !nodeInHandshake(sender) &&
+            nodeUpdateAddressIfNeeded(sender,link,hdr))
+        {
+            clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
+                                 CLUSTER_TODO_UPDATE_STATE);
+        }
+
+        /* Update our info about the node */
+        if (link->node && type == CLUSTERMSG_TYPE_PONG) {
+            link->node->pong_received = now;
+            link->node->ping_sent = 0;
+
+            /* The PFAIL condition can be reversed without external
+             * help if it is momentary (that is, if it does not
+             * turn into a FAIL state).
+             *
+             * The FAIL condition is also reversible under specific
+             * conditions detected by clearNodeFailureIfNeeded(). */
+            if (nodeTimedOut(link->node)) {
+                link->node->flags &= ~CLUSTER_NODE_PFAIL;
+                clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
+                                     CLUSTER_TODO_UPDATE_STATE);
+            } else if (nodeFailed(link->node)) {
+                clearNodeFailureIfNeeded(link->node);
+            }
+        }
+
+        /* Check for role switch: slave -> master or master -> slave. */
+        if (sender) {
+            if (!memcmp(hdr->slaveof,CLUSTER_NODE_NULL_NAME,
+                sizeof(hdr->slaveof)))
+            {
+                /* Node is a master. */
+                clusterSetNodeAsMaster(sender);
+            } else {
+                /* Node is a slave. */
+                clusterNode *master = clusterLookupNode(hdr->slaveof);
+
+                if (nodeIsMaster(sender)) {
+                    /* Master turned into a slave! Reconfigure the node. */
+                    clusterDelNodeSlots(sender);
+                    sender->flags &= ~(CLUSTER_NODE_MASTER|
+                                       CLUSTER_NODE_MIGRATE_TO);
+                    sender->flags |= CLUSTER_NODE_SLAVE;
+
+                    /* Update config and state. */
+                    clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
+                                         CLUSTER_TODO_UPDATE_STATE);
+                }
+
+                /* Master node changed for this slave? */
+                if (master && sender->slaveof != master) {
+                    if (sender->slaveof)
+                        clusterNodeRemoveSlave(sender->slaveof,sender);
+                    clusterNodeAddSlave(master,sender);
+                    sender->slaveof = master;
+
+                    /* Update config. */
+                    clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
+                }
+            }
+        }
+
+        /* Update our info about served slots.
+         *
+         * Note: this MUST happen after we update the master/slave state
+         * so that CLUSTER_NODE_MASTER flag will be set. */
+
+        /* Many checks are only needed if the set of served slots this
+         * instance claims is different compared to the set of slots we have
+         * for it. Check this ASAP to avoid other computational expansive
+         * checks later. */
+        clusterNode *sender_master = NULL; /* Sender or its master if slave. */
+        int dirty_slots = 0; /* Sender claimed slots don't match my view? */
+
+        if (sender) {
+            sender_master = nodeIsMaster(sender) ? sender : sender->slaveof;
+            if (sender_master) {
+                dirty_slots = memcmp(sender_master->slots,
+                        hdr->myslots,sizeof(hdr->myslots)) != 0;
+            }
+        }
+
+        /* 1) If the sender of the message is a master, and we detected that
+         *    the set of slots it claims changed, scan the slots to see if we
+         *    need to update our configuration. */
+        if (sender && nodeIsMaster(sender) && dirty_slots)
+            clusterUpdateSlotsConfigWith(sender,senderConfigEpoch,hdr->myslots);
+
+        /* 2) We also check for the reverse condition, that is, the sender
+         *    claims to serve slots we know are served by a master with a
+         *    greater configEpoch. If this happens we inform the sender.
+         *
+         * This is useful because sometimes after a partition heals, a
+         * reappearing master may be the last one to claim a given set of
+         * hash slots, but with a configuration that other instances know to
+         * be deprecated. Example:
+         *
+         * A and B are master and slave for slots 1,2,3.
+         * A is partitioned away, B gets promoted.
+         * B is partitioned away, and A returns available.
+         *
+         * Usually B would PING A publishing its set of served slots and its
+         * configEpoch, but because of the partition B can't inform A of the
+         * new configuration, so other nodes that have an updated table must
+         * do it. In this way A will stop to act as a master (or can try to
+         * failover if there are the conditions to win the election). */
+        if (sender && dirty_slots) {
+            int j;
+
+            for (j = 0; j < CLUSTER_SLOTS; j++) {
+                if (bitmapTestBit(hdr->myslots,j)) {
+                    if (server.cluster->slots[j] == sender ||
+                        server.cluster->slots[j] == NULL) continue;
+                    if (server.cluster->slots[j]->configEpoch >
+                        senderConfigEpoch)
+                    {
+                        serverLog(LL_VERBOSE,
+                            "Node %.40s has old slots configuration, sending "
+                            "an UPDATE message about %.40s",
+                                sender->name, server.cluster->slots[j]->name);
+                        clusterSendUpdate(sender->link,
+                            server.cluster->slots[j]);
+
+                        /* TODO: instead of exiting the loop send every other
+                         * UPDATE packet for other nodes that are the new owner
+                         * of sender's slots. */
+                        break;
+                    }
+                }
+            }
+        }
+
+        /* If our config epoch collides with the sender's try to fix
+         * the problem. */
+        if (sender &&
+            nodeIsMaster(myself) && nodeIsMaster(sender) &&
+            senderConfigEpoch == myself->configEpoch)
+        {
+            clusterHandleConfigEpochCollision(sender);
+        }
+
+        /* Get info from the gossip section */
+        if (sender) clusterProcessGossipSection(hdr,link);
+    } else if (type == CLUSTERMSG_TYPE_FAIL) {
+        clusterNode *failing;
+
+        if (sender) {
+            failing = clusterLookupNode(hdr->data.fail.about.nodename);
+            if (failing &&
+                !(failing->flags & (CLUSTER_NODE_FAIL|CLUSTER_NODE_MYSELF)))
+            {
+                serverLog(LL_NOTICE,
+                    "FAIL message received from %.40s about %.40s",
+                    hdr->sender, hdr->data.fail.about.nodename);
+                failing->flags |= CLUSTER_NODE_FAIL;
+                failing->fail_time = now;
+                failing->flags &= ~CLUSTER_NODE_PFAIL;
+                clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
+                                     CLUSTER_TODO_UPDATE_STATE);
+            }
+        } else {
+            serverLog(LL_NOTICE,
+                "Ignoring FAIL message from unknown node %.40s about %.40s",
+                hdr->sender, hdr->data.fail.about.nodename);
+        }
+    } else if (type == CLUSTERMSG_TYPE_PUBLISH) {
+        robj *channel, *message;
+        uint32_t channel_len, message_len;
+
+        /* Don't bother creating useless objects if there are no
+         * Pub/Sub subscribers. */
+        if (dictSize(server.pubsub_channels) ||
+           listLength(server.pubsub_patterns))
+        {
+            channel_len = ntohl(hdr->data.publish.msg.channel_len);
+            message_len = ntohl(hdr->data.publish.msg.message_len);
+            channel = createStringObject(
+                        (char*)hdr->data.publish.msg.bulk_data,channel_len);
+            message = createStringObject(
+                        (char*)hdr->data.publish.msg.bulk_data+channel_len,
+                        message_len);
+            pubsubPublishMessage(channel,message);
+            decrRefCount(channel);
+            decrRefCount(message);
+        }
+    } else if (type == CLUSTERMSG_TYPE_FAILOVER_AUTH_REQUEST) {
+        if (!sender) return 1;  /* We don't know that node. */
+        clusterSendFailoverAuthIfNeeded(sender,hdr);
+    } else if (type == CLUSTERMSG_TYPE_FAILOVER_AUTH_ACK) {
+        if (!sender) return 1;  /* We don't know that node. */
+        /* We consider this vote only if the sender is a master serving
+         * a non zero number of slots, and its currentEpoch is greater or
+         * equal to epoch where this node started the election. */
+        if (nodeIsMaster(sender) && sender->numslots > 0 &&
+            senderCurrentEpoch >= server.cluster->failover_auth_epoch)
+        {
+            server.cluster->failover_auth_count++;
+            /* Maybe we reached a quorum here, set a flag to make sure
+             * we check ASAP. */
+            clusterDoBeforeSleep(CLUSTER_TODO_HANDLE_FAILOVER);
+        }
+    } else if (type == CLUSTERMSG_TYPE_MFSTART) {
+        /* This message is acceptable only if I'm a master and the sender
+         * is one of my slaves. */
+        if (!sender || sender->slaveof != myself) return 1;
+        /* Manual failover requested from slaves. Initialize the state
+         * accordingly. */
+        resetManualFailover();
+        server.cluster->mf_end = now + CLUSTER_MF_TIMEOUT;
+        server.cluster->mf_slave = sender;
+        pauseClients(now+(CLUSTER_MF_TIMEOUT*CLUSTER_MF_PAUSE_MULT));
+        serverLog(LL_WARNING,"Manual failover requested by replica %.40s.",
+            sender->name);
+    } else if (type == CLUSTERMSG_TYPE_UPDATE) {
+        clusterNode *n; /* The node the update is about. */
+        uint64_t reportedConfigEpoch =
+                    ntohu64(hdr->data.update.nodecfg.configEpoch);
+
+        if (!sender) return 1;  /* We don't know the sender. */
+        n = clusterLookupNode(hdr->data.update.nodecfg.nodename);
+        if (!n) return 1;   /* We don't know the reported node. */
+        if (n->configEpoch >= reportedConfigEpoch) return 1; /* Nothing new. */
+
+        /* If in our current config the node is a slave, set it as a master. */
+        if (nodeIsSlave(n)) clusterSetNodeAsMaster(n);
+
+        /* Update the node's configEpoch. */
+        n->configEpoch = reportedConfigEpoch;
+        clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
+                             CLUSTER_TODO_FSYNC_CONFIG);
+
+        /* Check the bitmap of served slots and update our
+         * config accordingly. */
+        clusterUpdateSlotsConfigWith(n,reportedConfigEpoch,
+            hdr->data.update.nodecfg.slots);
+    } else if (type == CLUSTERMSG_TYPE_MODULE) {
+        if (!sender) return 1;  /* Protect the module from unknown nodes. */
+        /* We need to route this message back to the right module subscribed
+         * for the right message type. */
+        uint64_t module_id = hdr->data.module.msg.module_id; /* Endian-safe ID */
+        uint32_t len = ntohl(hdr->data.module.msg.len);
+        uint8_t type = hdr->data.module.msg.type;
+        unsigned char *payload = hdr->data.module.msg.bulk_data;
+        moduleCallClusterReceivers(sender->name,module_id,type,payload,len);
+    } else {
+        serverLog(LL_WARNING,"Received unknown packet type: %d", type);
+    }
+    return 1;
 }
 
 ```
-## clusterAcceptHandler TODO
