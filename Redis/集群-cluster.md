@@ -456,7 +456,6 @@ int clusterProcessPacket(clusterLink *link) {
     return 1;
 }
 
-// TODO clusterProcessGossipSection
 ```
 ### 节点clusterCron 周期发送ping消息,传播集群信息
 ```c
@@ -573,4 +572,78 @@ void clusterSetGossipEntry(clusterMsg *hdr, int i, clusterNode *n) {
     gossip->notused1 = 0;
 }
 ```
-### 节点设置了集群消息的回调,收到ping或pong消息,更新本地集群信息,并视机回pong信息,帮助对方更新集群信息 //TODO
+### 集群中的节点都设置了集群消息的回调,收到ping或pong消息,更新本地集群信息,并视情况回pong信息,帮助对方更新集群信息 
+```c
+// src/cluster.c
+int clusterProcessPacket(clusterLink *link) {
+    clusterMsg *hdr = (clusterMsg*) link->rcvbuf;
+    uint32_t totlen = ntohl(hdr->totlen);
+    uint16_t type = ntohs(hdr->type);
+    mstime_t now = mstime();
+
+    uint16_t flags = ntohs(hdr->flags);
+    uint64_t senderCurrentEpoch = 0, senderConfigEpoch = 0;
+    clusterNode *sender;
+    sender = clusterLookupNode(hdr->sender);
+
+    /* Initial processing of PING and MEET requests replying with a PONG. */
+    if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_MEET) {
+        serverLog(LL_DEBUG,"Ping packet received: %p", (void*)link->node);
+        // 收到ping消息需同样需要调用 clusterSendPing 发送一个pong消息,也会带上自己生成的gossip信息
+        clusterSendPing(link,CLUSTERMSG_TYPE_PONG);
+    }
+
+    if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_PONG ||
+        type == CLUSTERMSG_TYPE_MEET)
+    {
+        // 如果是一个pong信息,我们先更新这个信息发送方的连接信息
+        if (link->node && type == CLUSTERMSG_TYPE_PONG) {
+            link->node->pong_received = now;
+            link->node->ping_sent = 0;
+            // ...
+        }
+
+        // 无论最后收到的是ping 还是 pong,最后都会走到这里,调用clusterProcessGossipSection,根据收到的信息更新本地的gossip信息
+        if (sender) clusterProcessGossipSection(hdr,link);
+    } 
+    // ...
+    return 1;
+}
+```
+#### clusterProcessGossipSection 处理gossip信息
+对收到的ping和pong消息里待的gossip信息做处理
+```c
+void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
+    uint16_t count = ntohs(hdr->count);
+    clusterMsgDataGossip *g = (clusterMsgDataGossip*) hdr->data.ping.gossip;
+    clusterNode *sender = link->node ? link->node : clusterLookupNode(hdr->sender);
+
+    // 遍历gossip信息中的每个node
+    while(count--) {
+        uint16_t flags = ntohs(g->flags);
+        clusterNode *node;
+        sds ci;
+        node = clusterLookupNode(g->nodename);
+        if (node) { //如果我们本地已经知道这个node 
+            // 更新本地信息
+
+        } else {
+            // 本地没有这个node的信息,则新建关于这个node 的 ClusterNode结构,加入到本地cluster信息中
+            if (sender &&
+                !(flags & CLUSTER_NODE_NOADDR) &&
+                !clusterBlacklistExists(g->nodename))
+            {
+                clusterNode *node;
+                node = createClusterNode(g->nodename, flags);
+                memcpy(node->ip,g->ip,NET_IP_STR_LEN);
+                node->port = ntohs(g->port);
+                node->cport = ntohs(g->cport);
+                clusterAddNode(node);
+            }
+        }
+
+        g++;
+    }
+}
+
+```
