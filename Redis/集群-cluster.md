@@ -155,8 +155,19 @@ typedef struct clusterNode {
 } clusterNode;
 ```
 
-## redis-cli 发送 Cluster meet到对应redis实例
-脚本(redis-cli)经过自分配好每个节点的角色后,需要通知每个redis实例组成集群(通过向redis服务端口发送命令cluster meet,让所有redis实例主动加入第一个实例的集群)
+## redis-cli 组织和通知各实例来建立集群
+- 集群初始化流程
+    - redis-cli分配好节点角色后,通知集群中的每个实例,让他们主动加入一个共同的节点(cluster meet命令)
+    - 收到cluster meet命令处理,设置好要加入的集群的目标机器信息
+    - clusterCron 根据前面设置好的目标机器信息连接目标机器
+    - 目标机器接收meet消息,将机器加入本地集群信息,并pong回自己视角的集群信息(当机器多时,gossip机制,返回部分)
+    - 接收目标机器的pong,更新本地集群信息
+    - 集群根据已知信息相互ping,pong,发送gossip消息,使得集群中的机器最终都对整个集群信息有了解
+    - 设置集群中各个节点的slot和master-slave关系(cluster setslot命令 和 cluster replicate命令)
+    - 节点收到cluster setslot 和 cluster replicate 命令后开始更新自己的职责信息 TODO
+    - 传播slot设置和replicate设置 TODO
+
+### 发送 Cluster meet到对应redis实例
 ```c
 // src/redis-cli.c
 static int clusterManagerCommandCreate(int argc, char **argv) {
@@ -177,15 +188,8 @@ static int clusterManagerCommandCreate(int argc, char **argv) {
         }
         // ...
 }
-- 集群初始化流程
-    - 收到cluster meet命令处理,设置好要加入的集群的目标机器信息
-    - clusterCron 根据前面设置好的目标机器信息连接目标机器
-    - 目标机器接收meet消息,将机器加入本地集群信息,并pong回自己视角的集群信息(当机器多时,gossip机制,返回部分)
-    - 接收目标机器的pong,更新本地集群信息
-    - 集群根据已知信息相互ping,pong,发送gossip消息,使得集群中的机器最终都对整个集群信息有了解 TODO
-        - ping TODO
-        - pong TODO
 ```
+
 ### 收到cluster meet命令处理,设置好要加入的集群的目标机器信息
 ```c
 // src/cluster.c
@@ -647,3 +651,50 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
 }
 
 ```
+### redis-cli设置集群中各个节点的slot和master-slave关系(cluster setslot命令 和 cluster replicate命令)
+```c
+src/redis-cli.c
+        // cluster meet 相关
+        // cluster 命令后需要等集群里的节点互相认识了后再发设置slot 和 master-slave 更有效率
+        sleep(1);
+        clusterManagerWaitForClusterJoin();
+
+        // 遍历所有节点,根据既定的配置,向每个节点发送他的职责
+        listRewind(cluster_manager.nodes, &li);
+        while ((ln = listNext(&li)) != NULL) {
+            clusterManagerNode *node = ln->value;
+            if (!node->dirty) continue;
+            char *err = NULL;
+            int flushed = clusterManagerFlushNodeConfig(node, &err);
+            if (!flushed && !node->replicate) {
+                // ...
+            }
+        }
+        // ...
+```
+```c
+// src/redis-cli.c
+static int clusterManagerFlushNodeConfig(clusterManagerNode *node, char **err) {
+    if (!node->dirty) return 0;
+    redisReply *reply = NULL;
+    int is_err = 0, success = 1;
+    if (err != NULL) *err = NULL;
+    if (node->replicate != NULL) {
+        // 当前节点是slave时,发送cluter replicate
+        reply = CLUSTER_MANAGER_COMMAND(node, "CLUSTER REPLICATE %s",
+                                        node->replicate);
+        // ...
+    } else {
+        // 当前节点时master时发送cluster setslot
+        int added = clusterManagerAddSlots(node, err);
+        if (!added || *err != NULL) success = 0;
+    }
+    node->dirty = 0;
+cleanup:
+    if (reply != NULL) freeReplyObject(reply);
+    return success;
+}
+```
+
+### 节点收到cluster replicate 命令 和 cluster setslot命令的处理 TODO
+### 传播slot设置和replicate设置 TODO
