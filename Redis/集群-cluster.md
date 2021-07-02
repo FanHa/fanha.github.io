@@ -164,8 +164,8 @@ typedef struct clusterNode {
     - 接收目标机器的pong,更新本地集群信息
     - 集群根据已知信息相互ping,pong,发送gossip消息,使得集群中的机器最终都对整个集群信息有了解
     - 设置集群中各个节点的slot和master-slave关系(cluster setslot命令 和 cluster replicate命令)
-    - 节点收到cluster setslot 和 cluster replicate 命令后开始更新自己的职责信息 TODO
-    - 传播slot设置和replicate设置 TODO
+    - 节点收到cluster setslot 和 cluster replicate 命令后开始更新自己的职责信息
+    - 传播slot设置和replicate设置
 
 ### 发送 Cluster meet到对应redis实例
 ```c
@@ -685,7 +685,7 @@ static int clusterManagerFlushNodeConfig(clusterManagerNode *node, char **err) {
                                         node->replicate);
         // ...
     } else {
-        // 当前节点时master时发送cluster setslot
+        // 当前节点时master时发送cluster addslots
         int added = clusterManagerAddSlots(node, err);
         if (!added || *err != NULL) success = 0;
     }
@@ -696,5 +696,121 @@ cleanup:
 }
 ```
 
-### 节点收到cluster replicate 命令 和 cluster setslot命令的处理 TODO
-### 传播slot设置和replicate设置 TODO
+### 节点收到cluster replicate 命令 和 cluster addslots命令的处理
+#### cluster replicate 命令
+```c
+// src/cluster.c
+void clusterCommand(client *c) {
+    //...
+    if (!strcasecmp(c->argv[1]->ptr,"replicate") && c->argc == 3) {
+        /* CLUSTER REPLICATE <NODE ID> */
+        clusterNode *n = clusterLookupNode(c->argv[2]->ptr);
+
+        // 不允许已经是master 且已经分配的slot的node直接通过命令方式成为别的node的slave
+        if (nodeIsMaster(myself) &&
+            (myself->numslots != 0 || dictSize(server.db[0].dict) != 0)) {
+            addReplyError(c,
+                "To set a master the node must be empty and "
+                "without assigned slots.");
+            return;
+        }
+
+        // 设置信息,后续在gossip中会把这个信息传播出去,让别的节点知道
+        clusterSetMaster(n);
+        addReply(c,shared.ok);
+    } 
+    // ...
+}
+```
+#### cluster setslot 命令
+```c
+void clusterCommand(client *c) {
+    // ...
+    if ((!strcasecmp(c->argv[1]->ptr,"addslots") ||
+               !strcasecmp(c->argv[1]->ptr,"delslots")) && c->argc >= 3)
+    {
+        
+        int del = !strcasecmp(c->argv[1]->ptr,"delslots");
+
+        for (j = 2; j < c->argc; j++) {
+            if (del && server.cluster->slots[slot] == NULL) {
+                // ...
+            } else if (!del && server.cluster->slots[slot]) {
+                // 如果已知要add的slot 已经有主了,则不能设置
+                // 但因为现在还在初始化阶段,节点的slots值都是空
+                return;
+            }
+            if (slots[slot]++ == 1) {
+                // 去重
+                return;
+            }
+        }
+        for (j = 0; j < CLUSTER_SLOTS; j++) {
+            if (slots[j]) {
+                int retval;
+                // 在cluster中加入这个slot信息的归属
+
+                retval = del ? clusterDelSlot(j) :
+                               clusterAddSlot(myself,j);
+                serverAssertWithInfo(c,NULL,retval == C_OK);
+            }
+        }
+        zfree(slots);
+        clusterDoBeforeSleep(CLUSTER_TODO_UPDATE_STATE|CLUSTER_TODO_SAVE_CONFIG);
+        addReply(c,shared.ok);
+    } 
+}
+```
+### 传播slot设置和replicate设置
+上一步设置的slot 和 replicate 信息每个节点都只知道自己的,需要传播到整个集群,还是通过前面clusterCron里的ping 和 pong来交换和设置
+```c
+int clusterProcessPacket(clusterLink *link) {  
+    // ...
+    if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_PONG ||
+        type == CLUSTERMSG_TYPE_MEET)
+    {
+        if (sender) {
+            // 更新replicate信息
+            if (!memcmp(hdr->slaveof,CLUSTER_NODE_NULL_NAME,
+                sizeof(hdr->slaveof)))
+            {
+                /* Node is a master. */
+                clusterSetNodeAsMaster(sender);
+            } else {
+                /* Node is a slave. */
+                // 收到的sender信息表示自己是slave
+                // 找到sender的master
+                clusterNode *master = clusterLookupNode(hdr->slaveof);
+
+                if (nodeIsMaster(sender)) { // 如果sender本来是master需要清空他的slot信息
+                    // 更新sender的标记
+                    clusterDelNodeSlots(sender);
+                    sender->flags &= ~(CLUSTER_NODE_MASTER|
+                                       CLUSTER_NODE_MIGRATE_TO);
+                    sender->flags |= CLUSTER_NODE_SLAVE;
+                }
+
+                if (master && sender->slaveof != master) {
+                    // sender本身是别的master的slave时,需要更新sender的master信息
+                    if (sender->slaveof)
+                        clusterNodeRemoveSlave(sender->slaveof,sender);
+                    // 更新sender指定的master的信息
+                    clusterNodeAddSlave(master,sender);
+                    sender->slaveof = master;
+                }
+            }
+        }
+        // 更新slot信息 TODO
+        clusterNode *sender_master = NULL; /* Sender or its master if slave. */
+        int dirty_slots = 0; /* Sender claimed slots don't match my view? */
+
+        if (sender) {
+            sender_master = nodeIsMaster(sender) ? sender : sender->slaveof;
+            if (sender_master) {
+                dirty_slots = memcmp(sender_master->slots,
+                        hdr->myslots,sizeof(hdr->myslots)) != 0;
+            }
+        }
+    }
+}
+```
