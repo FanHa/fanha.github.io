@@ -165,7 +165,7 @@ typedef struct clusterNode {
     - 集群根据已知信息相互ping,pong,发送gossip消息,使得集群中的机器最终都对整个集群信息有了解
     - 设置集群中各个节点的slot和master-slave关系(cluster setslot命令 和 cluster replicate命令)
     - 节点收到cluster setslot 和 cluster replicate 命令后开始更新自己的职责信息
-    - 传播slot设置和replicate设置
+    - 通过集群信息传播slot设置和replicate设置
 
 ### 发送 Cluster meet到对应redis实例
 ```c
@@ -805,12 +805,93 @@ int clusterProcessPacket(clusterLink *link) {
         int dirty_slots = 0; /* Sender claimed slots don't match my view? */
 
         if (sender) {
+            // sender报告的slot和我们已知的信息不同时,设置dirty_slots,后续用来更新信息
             sender_master = nodeIsMaster(sender) ? sender : sender->slaveof;
             if (sender_master) {
                 dirty_slots = memcmp(sender_master->slots,
                         hdr->myslots,sizeof(hdr->myslots)) != 0;
             }
         }
+
+        // 根据sender发来的信息版本(configEpoch),更新本地有关sender的信息
+        if (sender && nodeIsMaster(sender) && dirty_slots)
+            clusterUpdateSlotsConfigWith(sender,senderConfigEpoch,hdr->myslots);
+
+        if (sender && dirty_slots) {
+            int j;
+            for (j = 0; j < CLUSTER_SLOTS; j++) {
+                if (bitmapTestBit(hdr->myslots,j)) { 
+                    if (server.cluster->slots[j] == sender ||
+                        server.cluster->slots[j] == NULL) continue; //要设置的slot本来就属于sender 或没有归属,continue
+                    if (server.cluster->slots[j]->configEpoch >
+                        senderConfigEpoch) // 要设置的slot本来属于其他node,且configEpoch信息大于sender
+                    {
+
+                        // 发送一条‘CLUSTERMSG_TYPE_UPDATE’集群信息给sender,告诉现在的最新情况(并强制让sender更新slot信息 TODO)
+                        clusterSendUpdate(sender->link,
+                            server.cluster->slots[j]);
+
+
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 当sender的configEpoch 和 我们本地的configEpoch相同时代表冲突;
+        // (每次更新信息后configEpoch都递增,正常不应该出现一个带了更新信息的configEpoch和我们本地的configEpoch相同)
+        if (sender &&
+            nodeIsMaster(myself) && nodeIsMaster(sender) &&
+            senderConfigEpoch == myself->configEpoch)
+        {
+            // 解决configEpoch冲突的问题
+            clusterHandleConfigEpochCollision(sender);
+        }
     }
+}
+
+void clusterHandleConfigEpochCollision(clusterNode *sender) {
+    // ...
+    // configEpoch相同就比nodeId大小
+    // sender的小就直接略过
+    if (memcmp(sender->name,myself->name,CLUSTER_NAMELEN) <= 0) return;
+    
+    // 否则就增加本地集群currentEpoch ,防止后面继续冲突
+    server.cluster->currentEpoch++;
+    myself->configEpoch = server.cluster->currentEpoch;
+    
+}
+```
+
+## 集群建立后任意节点都能接收来自客户端的请求,然后通过“重定向”让客户再连接到真正读取数据的节点进行操作
+### 重定向
+```c
+// src/server.c
+int processCommand(client *c) {
+
+    // ...
+    // 如果开启了cluster_enabled,再处理命令时需要现判定不不需要重定向
+    if (server.cluster_enabled &&
+        !(c->flags & CLIENT_MASTER) &&
+        !(c->flags & CLIENT_LUA &&
+          server.lua_caller->flags & CLIENT_MASTER) &&
+        !(c->cmd->getkeys_proc == NULL && c->cmd->firstkey == 0 &&
+          c->cmd->proc != execCommand))
+    {
+        int hashslot;
+        int error_code;
+        clusterNode *n = getNodeByQuery(c,c->cmd,c->argv,c->argc,
+                                        &hashslot,&error_code);
+        if (n == NULL || n != server.cluster->myself) {
+            if (c->cmd->proc == execCommand) {
+                discardTransaction(c);
+            } else {
+                flagTransaction(c);
+            }
+            clusterRedirectClient(c,n,hashslot,error_code);
+            return C_OK;
+        }
+    }
+    // ...
 }
 ```
