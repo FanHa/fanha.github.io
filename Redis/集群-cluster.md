@@ -863,14 +863,15 @@ void clusterHandleConfigEpochCollision(clusterNode *sender) {
 }
 ```
 
-## 集群建立后任意节点都能接收来自客户端的请求,然后通过“重定向”让客户再连接到真正读取数据的节点进行操作
+## 集群建立后的命令处理
+集群建立后任意节点都能接收来自客户端的请求,先判断自己能不能处理,如果不能,则通过“重定向”让客户端再连接到真正读取数据的节点进行操作
 ### 重定向
 ```c
 // src/server.c
 int processCommand(client *c) {
 
     // ...
-    // 如果开启了cluster_enabled,再处理命令时需要现判定不不需要重定向
+    // 如果开启了cluster_enabled,再处理命令前需要现判定不不需要重定向
     if (server.cluster_enabled &&
         !(c->flags & CLIENT_MASTER) &&
         !(c->flags & CLIENT_LUA &&
@@ -880,14 +881,10 @@ int processCommand(client *c) {
     {
         int hashslot;
         int error_code;
+        // 根据命令的键算出来的slot寻找能处理这个命令的节点
         clusterNode *n = getNodeByQuery(c,c->cmd,c->argv,c->argc,
                                         &hashslot,&error_code);
-        if (n == NULL || n != server.cluster->myself) {
-            if (c->cmd->proc == execCommand) {
-                discardTransaction(c);
-            } else {
-                flagTransaction(c);
-            }
+        if (n == NULL || n != server.cluster->myself) { //当能处理的节点不是自己时需要返回重定向信息,客户端根据重定向的信息向对应节点再发起请求处理
             clusterRedirectClient(c,n,hashslot,error_code);
             return C_OK;
         }
@@ -895,3 +892,6 @@ int processCommand(client *c) {
     // ...
 }
 ```
+
+## 集群建立后管理员主动更改集群设置
+一般主动更改设置就是给集群加更多的冗余机器,或是将slot分得更散
