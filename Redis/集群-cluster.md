@@ -163,8 +163,8 @@ typedef struct clusterNode {
     - 目标机器接收meet消息,将机器加入本地集群信息,并pong回自己视角的集群信息(当机器多时,gossip机制,返回部分)
     - 接收目标机器的pong,更新本地集群信息
     - 集群根据已知信息相互ping,pong,发送gossip消息,使得集群中的机器最终都对整个集群信息有了解
-    - 设置集群中各个节点的slot和master-slave关系(cluster setslot命令 和 cluster replicate命令)
-    - 节点收到cluster setslot 和 cluster replicate 命令后开始更新自己的职责信息
+    - 设置集群中各个节点的slot和master-slave关系(cluster addslots 和 cluster replicate命令)
+    - 节点收到cluster addslots 和 cluster replicate 命令后开始更新自己的职责信息
     - 通过集群信息传播slot设置和replicate设置
 
 ### 发送 Cluster meet到对应redis实例
@@ -651,7 +651,7 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
 }
 
 ```
-### redis-cli设置集群中各个节点的slot和master-slave关系(cluster setslot命令 和 cluster replicate命令)
+### redis-cli设置集群中各个节点的slot和master-slave关系(cluster addslots命令 和 cluster replicate命令)
 ```c
 src/redis-cli.c
         // cluster meet 相关
@@ -697,7 +697,7 @@ cleanup:
 ```
 
 ### 节点收到cluster replicate 命令 和 cluster addslots命令的处理
-#### cluster replicate 命令
+#### 处理cluster replicate 命令
 ```c
 // src/cluster.c
 void clusterCommand(client *c) {
@@ -722,7 +722,7 @@ void clusterCommand(client *c) {
     // ...
 }
 ```
-#### cluster setslot 命令
+#### 处理cluster addslots 命令
 ```c
 void clusterCommand(client *c) {
     // ...
@@ -894,4 +894,12 @@ int processCommand(client *c) {
 ```
 
 ## 集群建立后管理员主动更改集群设置
-一般主动更改设置就是给集群加更多的冗余机器,或是将slot分得更散
+- 一般主动更改设置的原因:
+    - 增加冗余节点,直接向要新节点发送cluster meet, 目标随便选个在集群中的节点,然后等待集群信息传播就好(但目前实际这个节点没有分配任何slot,也不是任何其他节点的slave)
+    - 更改slots分配
+
+### 更改slot设置
+
+## failover选举
+## 自由slave
+## configEpoch 与 冲突解决
