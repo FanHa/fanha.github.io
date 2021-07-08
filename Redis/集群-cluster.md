@@ -1024,9 +1024,9 @@ void restoreCommand(client *c) {
     int j, type, replace = 0, absttl = 0;
     robj *obj;
 
-    // 参数解析
+    // ... 参数解析
 
-    // 将rid结构的读写区域指向传过来的键值对
+    // 将rio结构的读写区域指向传过来的键值对
     rioInitWithBuffer(&payload,c->argv[3]->ptr);
 
     // 写入本地db
@@ -1037,8 +1037,68 @@ void restoreCommand(client *c) {
     server.dirty++;
 }
 ```
+#### cluster setslots [slots] node 命令收尾
+```c
+void clusterCommand(client *c) {
 
-### key的转移时的客户端命令处理
+    if (!strcasecmp(c->argv[1]->ptr,"setslot") && c->argc >= 4) {
+        
+        int slot;
+        clusterNode *n;
+        // ...
+        if (!strcasecmp(c->argv[3]->ptr,"node") && c->argc == 5) {
+            clusterNode *n = clusterLookupNode(c->argv[4]->ptr);
+
+            // 清掉migrating_slot 状态
+            if (countKeysInSlot(slot) == 0 &&
+                server.cluster->migrating_slots_to[slot])
+                server.cluster->migrating_slots_to[slot] = NULL;
+
+            // 清掉importing 状态
+            if (n == myself &&
+                server.cluster->importing_slots_from[slot])
+            {
+                // 如果slot本来状态是import,需要更新下configEpoch,这样以后传播slot设置时,当前版本更高,可以在集群中替换掉旧版本关于当前slot的信息
+                if (clusterBumpConfigEpochWithoutConsensus() == C_OK) {
+                    // ...
+                }
+                server.cluster->importing_slots_from[slot] = NULL;
+            }
+            // 设置本地slot状态
+            clusterDelSlot(slot);
+            clusterAddSlot(n,slot);
+        }
+        // ...
+        addReply(c,shared.ok);
+    }
+}
+```
+
+### key正在转移时的客户端命令处理
+key正在转移时,源方和目标方的对这个key所在的slot都有标记(migrating,importing标记),处理key前会先查这个标记决定是否要重定向
+```c
+int processCommand(client *c) {
+    if (server.cluster_enabled &&
+        !(c->flags & CLIENT_MASTER) &&
+        !(c->flags & CLIENT_LUA &&
+          server.lua_caller->flags & CLIENT_MASTER) &&
+        !(c->cmd->getkeys_proc == NULL && c->cmd->firstkey == 0 &&
+          c->cmd->proc != execCommand))
+    {
+        int hashslot;
+        int error_code;
+        // 找到处理当前命令的节点,error_code 会返回重定向类型(move,ask等)
+        clusterNode *n = getNodeByQuery(c,c->cmd,c->argv,c->argc,
+                                        &hashslot,&error_code);
+        if (n == NULL || n != server.cluster->myself) {
+            // ... 当不是本季时,返回重定向消息,客户端根据消息再见机行事(error_code就是重定向的类型,比如move,ask等)
+            clusterRedirectClient(c,n,hashslot,error_code);
+            return C_OK;
+        }
+    }
+}
+```
+ 
 ## failover选举
 ## 自由slave
 ## configEpoch 与 冲突解决
