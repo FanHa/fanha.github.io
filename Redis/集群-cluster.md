@@ -128,7 +128,7 @@ typedef struct clusterState {
 ### clusterNode 结构
 ```c
 // src/cluster.h
-// 用于保存一个具体的cluster即诶单信息
+// 用于保存一个具体的cluster节点信息
 typedef struct clusterNode {
     mstime_t ctime; // 节点创建时间
     char name[CLUSTER_NAMELEN]; //节点名
@@ -1099,6 +1099,242 @@ int processCommand(client *c) {
 }
 ```
  
-## failover选举
+## failover 和 选举
+### 节点什么时候认为另一个节点已经fail了?
+#### 一手信息,自己与另一个节点ping-pong中发现ping不通了
+节点间`ping`来验证对应节点的状态
+```c
+// src/cluster.c
+// cron里周期性的选个节点发送ping消息
+void clusterCron(void) {
+    if (!(iteration % 10)) {
+        int j;
+
+        // 随机选一些(5个)节点做比较
+        for (j = 0; j < 5; j++) {
+            de = dictGetRandomKey(server.cluster->nodes);
+            clusterNode *this = dictGetVal(de);
+
+            // 选出最久没有收到过pong信息的节点
+            if (min_pong_node == NULL || min_pong > this->pong_received) {
+                min_pong_node = this;
+                min_pong = this->pong_received;
+            }
+        }
+        if (min_pong_node) {
+            // 向选中的节点发送一个寻常ping
+            clusterSendPing(min_pong_node->link, CLUSTERMSG_TYPE_PING);
+        }
+    }
+    // ...
+    orphaned_masters = 0;
+    max_slaves = 0;
+    this_slaves = 0;
+    di = dictGetSafeIterator(server.cluster->nodes);
+    // 检验每一个节点的状态
+    while((de = dictNext(di)) != NULL) { //
+        clusterNode *node = dictGetVal(de);
+        now = mstime(); /* Use an updated time at every iteration. */
+
+        // 距离上次ping对方已经很久了,且一直没有收到回应,释放连接(下一次cron看到没有连接了又会尝试重新连接)
+        mstime_t ping_delay = now - node->ping_sent;
+        mstime_t data_delay = now - node->data_received;
+        if (node->link && /* is connected */
+            now - node->link->ctime >
+            server.cluster_node_timeout && /* was not already reconnected */
+            node->ping_sent && /* we already sent a ping */
+            node->pong_received < node->ping_sent && /* still waiting pong */
+            /* and we are waiting for the pong more than timeout/2 */
+            ping_delay > server.cluster_node_timeout/2 &&
+            /* and in such interval we are not seeing any traffic at all. */
+            data_delay > server.cluster_node_timeout/2)
+        {
+            /* Disconnect the link, it will be reconnected automatically. */
+            freeClusterLink(node->link);
+        }
+
+        // 判断最后一次与目标节点有联系的时间
+        mstime_t node_delay = (ping_delay < data_delay) ? ping_delay :
+                                                          data_delay;
+        // 最后一次联系时间大于timeout时,我们需要在本地将目标机器的状态设置为`CLUSTER_NODE_PFAIL`(可能fail了)
+        if (node_delay > server.cluster_node_timeout) {
+            if (!(node->flags & (CLUSTER_NODE_PFAIL|CLUSTER_NODE_FAIL))) {
+                // ...
+                node->flags |= CLUSTER_NODE_PFAIL;
+                update_state = 1;
+            }
+        }
+    }
+    dictReleaseIterator(di);
+    // ...
+}
+```
+#### 节点收到`ping`时更新本地该节点的信息,并`pong`回一些知道的gossip信息
+```c
+// src/cluster.c
+int clusterProcessPacket(clusterLink *link) {
+    
+    uint16_t type = ntohs(hdr->type);
+    mstime_t now = mstime();
+    sender = clusterLookupNode(hdr->sender);
+    // 更新sender节点data_received的时间
+    if (sender) sender->data_received = now;
+
+    if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_MEET) {
+        //...
+        // 返回一个pong信息(这个pong消息会带上一些已知的gossip消息,包括“我”认为哪个节点可能fail了)
+        clusterSendPing(link,CLUSTERMSG_TYPE_PONG);
+    }
+    if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_PONG ||
+        type == CLUSTERMSG_TYPE_MEET)
+    {
+        // 更新sender节点的flags,后面gossip传播的也时这个状态
+        if (sender) {
+            int nofailover = flags & CLUSTER_NODE_NOFAILOVER;
+            sender->flags &= ~CLUSTER_NODE_NOFAILOVER;
+            sender->flags |= nofailover;
+        }
+    }
+}
+```
+#### 节点收到`pong`消息
+```c
+// src/cluster.c
+int clusterProcessPacket(clusterLink *link) {
+    
+    uint16_t type = ntohs(hdr->type);
+    mstime_t now = mstime();
+    sender = clusterLookupNode(hdr->sender);
+    // 更新sender节点data_received的时间
+    if (sender) sender->data_received = now;
+
+    if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_PONG ||
+        type == CLUSTERMSG_TYPE_MEET)
+    {
+        // 更新sender节点的flags,后面gossip传播的也时这个状态
+        if (sender) {
+            int nofailover = flags & CLUSTER_NODE_NOFAILOVER;
+            sender->flags &= ~CLUSTER_NODE_NOFAILOVER;
+            sender->flags |= nofailover;
+        }
+
+        // 更新pong_received的时间
+        if (link->node && type == CLUSTERMSG_TYPE_PONG) {
+            link->node->pong_received = now;
+            link->node->ping_sent = 0;
+
+            // ... 收到了目标节点的pong消息,可以大小对该节点的`CLUSTER_NODE_PFAIL`状态的疑虑了
+            if (nodeTimedOut(link->node)) {
+                link->node->flags &= ~CLUSTER_NODE_PFAIL;
+                clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
+                                     CLUSTER_TODO_UPDATE_STATE);
+            } else if (nodeFailed(link->node)) {
+                clearNodeFailureIfNeeded(link->node);
+            }
+        }
+        // ...
+        // 处理sender发过来的gossip消息
+        if (sender) clusterProcessGossipSection(hdr,link);
+    }
+}
+
+void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
+    uint16_t count = ntohs(hdr->count);
+    clusterMsgDataGossip *g = (clusterMsgDataGossip*) hdr->data.ping.gossip;
+    clusterNode *sender = link->node ? link->node : clusterLookupNode(hdr->sender);
+
+    while(count--) {
+        uint16_t flags = ntohs(g->flags);
+        clusterNode *node;
+        sds ci;
+
+        node = clusterLookupNode(g->nodename);
+        if (node) {
+            if (sender && nodeIsMaster(sender) && node != myself) {
+                // 听到关于某个节点可能失败,或已经失败
+                if (flags & (CLUSTER_NODE_FAIL|CLUSTER_NODE_PFAIL)) {
+                    // 更新收到的关于该节点的”投诉“(即有哪些节点都报告了同一个节点的fail信息),
+                    if (clusterNodeAddFailureReport(node,sender)) {
+
+                    }
+                    // 当对该节点的”投诉“超过某个值时,需要正式标记他“fail” TODO
+                    markNodeAsFailingIfNeeded(node);
+                } else { // 听说某个节点很正常,需要消除掉同一个sender以前报告这个节点的“fail”信息
+                    if (clusterNodeDelFailureReport(node,sender)) {
+                        
+                    }
+                }
+            }
+
+            /* If from our POV the node is up (no failure flags are set),
+             * we have no pending ping for the node, nor we have failure
+             * reports for this node, update the last pong time with the
+             * one we see from the other nodes. */
+            if (!(flags & (CLUSTER_NODE_FAIL|CLUSTER_NODE_PFAIL)) &&
+                node->ping_sent == 0 &&
+                clusterNodeFailureReportsCount(node) == 0)
+            {
+                mstime_t pongtime = ntohl(g->pong_received);
+                pongtime *= 1000; /* Convert back to milliseconds. */
+
+                /* Replace the pong time with the received one only if
+                 * it's greater than our view but is not in the future
+                 * (with 500 milliseconds tolerance) from the POV of our
+                 * clock. */
+                if (pongtime <= (server.mstime+500) &&
+                    pongtime > node->pong_received)
+                {
+                    node->pong_received = pongtime;
+                }
+            }
+
+            /* If we already know this node, but it is not reachable, and
+             * we see a different address in the gossip section of a node that
+             * can talk with this other node, update the address, disconnect
+             * the old link if any, so that we'll attempt to connect with the
+             * new address. */
+            if (node->flags & (CLUSTER_NODE_FAIL|CLUSTER_NODE_PFAIL) &&
+                !(flags & CLUSTER_NODE_NOADDR) &&
+                !(flags & (CLUSTER_NODE_FAIL|CLUSTER_NODE_PFAIL)) &&
+                (strcasecmp(node->ip,g->ip) ||
+                 node->port != ntohs(g->port) ||
+                 node->cport != ntohs(g->cport)))
+            {
+                if (node->link) freeClusterLink(node->link);
+                memcpy(node->ip,g->ip,NET_IP_STR_LEN);
+                node->port = ntohs(g->port);
+                node->cport = ntohs(g->cport);
+                node->flags &= ~CLUSTER_NODE_NOADDR;
+            }
+        } else {
+            /* If it's not in NOADDR state and we don't have it, we
+             * add it to our trusted dict with exact nodeid and flag.
+             * Note that we cannot simply start a handshake against
+             * this IP/PORT pairs, since IP/PORT can be reused already,
+             * otherwise we risk joining another cluster.
+             *
+             * Note that we require that the sender of this gossip message
+             * is a well known node in our cluster, otherwise we risk
+             * joining another cluster. */
+            if (sender &&
+                !(flags & CLUSTER_NODE_NOADDR) &&
+                !clusterBlacklistExists(g->nodename))
+            {
+                clusterNode *node;
+                node = createClusterNode(g->nodename, flags);
+                memcpy(node->ip,g->ip,NET_IP_STR_LEN);
+                node->port = ntohs(g->port);
+                node->cport = ntohs(g->cport);
+                clusterAddNode(node);
+            }
+        }
+
+        /* Next node */
+        g++;
+    }
+}
+
+```
+
 ## 自由slave
 ## configEpoch 与 冲突解决
