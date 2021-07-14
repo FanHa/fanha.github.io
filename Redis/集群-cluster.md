@@ -1101,6 +1101,13 @@ int processCommand(client *c) {
  
 ## failover 和 选举
 ### 节点什么时候认为另一个节点已经fail了?
+- 收集
+ - 一手信息,相互ping-pong有阻碍
+ - 二手信息,gossip中关于某个node不行了的消息
+- 确认Fail后通知各方
+ - 向所有节点发送CLUSTERMSG_TYPE_FAIL消息
+ - 节点收到CLUSTERMSG_TYPE_FAIL消息处理
+ - slave节点在Cron时发现自己的master节点Fail
 #### 一手信息,自己与另一个节点ping-pong中发现ping不通了
 节点间`ping`来验证对应节点的状态
 ```c
@@ -1223,7 +1230,7 @@ int clusterProcessPacket(clusterLink *link) {
             link->node->pong_received = now;
             link->node->ping_sent = 0;
 
-            // ... 收到了目标节点的pong消息,可以大小对该节点的`CLUSTER_NODE_PFAIL`状态的疑虑了
+            // ... 收到了目标节点的pong消息,可以打消对该节点的`CLUSTER_NODE_PFAIL`状态的疑虑了
             if (nodeTimedOut(link->node)) {
                 link->node->flags &= ~CLUSTER_NODE_PFAIL;
                 clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
@@ -1257,7 +1264,7 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
                     if (clusterNodeAddFailureReport(node,sender)) {
 
                     }
-                    // 当对该节点的”投诉“超过某个值时,需要正式标记他“fail” TODO
+                    // 当对该节点的”投诉“超过某个值时,需要正式标记他“fail”, 见下
                     markNodeAsFailingIfNeeded(node);
                 } else { // 听说某个节点很正常,需要消除掉同一个sender以前报告这个节点的“fail”信息
                     if (clusterNodeDelFailureReport(node,sender)) {
@@ -1266,10 +1273,7 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
                 }
             }
 
-            /* If from our POV the node is up (no failure flags are set),
-             * we have no pending ping for the node, nor we have failure
-             * reports for this node, update the last pong time with the
-             * one we see from the other nodes. */
+            // 如果从“我”的视角,这个节点一切正常,且没有等待回复的ping,则记下pong_received时间
             if (!(flags & (CLUSTER_NODE_FAIL|CLUSTER_NODE_PFAIL)) &&
                 node->ping_sent == 0 &&
                 clusterNodeFailureReportsCount(node) == 0)
@@ -1277,64 +1281,182 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
                 mstime_t pongtime = ntohl(g->pong_received);
                 pongtime *= 1000; /* Convert back to milliseconds. */
 
-                /* Replace the pong time with the received one only if
-                 * it's greater than our view but is not in the future
-                 * (with 500 milliseconds tolerance) from the POV of our
-                 * clock. */
                 if (pongtime <= (server.mstime+500) &&
                     pongtime > node->pong_received)
-                {
+                {   
+                    // 记下pong_received
                     node->pong_received = pongtime;
                 }
             }
 
-            /* If we already know this node, but it is not reachable, and
-             * we see a different address in the gossip section of a node that
-             * can talk with this other node, update the address, disconnect
-             * the old link if any, so that we'll attempt to connect with the
-             * new address. */
-            if (node->flags & (CLUSTER_NODE_FAIL|CLUSTER_NODE_PFAIL) &&
-                !(flags & CLUSTER_NODE_NOADDR) &&
-                !(flags & (CLUSTER_NODE_FAIL|CLUSTER_NODE_PFAIL)) &&
-                (strcasecmp(node->ip,g->ip) ||
-                 node->port != ntohs(g->port) ||
-                 node->cport != ntohs(g->cport)))
+        } 
+        g++;
+    }
+}
+
+void markNodeAsFailingIfNeeded(clusterNode *node) {
+    int failures;
+    int needed_quorum = (server.cluster->size / 2) + 1;
+
+    // ...
+    failures = clusterNodeFailureReportsCount(node);
+    // 认为“他”Pfail的节点还不够多,return
+    if (failures < needed_quorum) return; /* No weak agreement from masters. */
+
+    // ...
+    // 当从“我”的视角发现有足够多的节点认为“他”PFail了,则将该节点比阿吉哦为Fail
+
+    node->flags &= ~CLUSTER_NODE_PFAIL;
+    node->flags |= CLUSTER_NODE_FAIL;
+    node->fail_time = mstime();
+
+    // 广播节点Fail的消息, #ref clusterSendFail
+    clusterSendFail(node->name);
+    // 下一次主事件循环更新集群的状态
+    clusterDoBeforeSleep(CLUSTER_TODO_UPDATE_STATE|CLUSTER_TODO_SAVE_CONFIG);
+}
+
+void clusterSendFail(char *nodename) {
+    clusterMsg buf[1];
+    clusterMsg *hdr = (clusterMsg*) buf;
+
+    // 构造一个 CLUSTERMSG_TYPE_FAIL 的消息
+    clusterBuildMessageHdr(hdr,CLUSTERMSG_TYPE_FAIL);
+    memcpy(hdr->data.fail.about.nodename,nodename,CLUSTER_NAMELEN);
+    // BroadCast!
+    // Fail这种事情尽快通知所有人 #ref clusterBroadcastMessage
+    clusterBroadcastMessage(buf,ntohl(hdr->totlen));
+}
+
+void clusterBroadcastMessage(void *buf, size_t len) {
+    dictIterator *di;
+    dictEntry *de;
+
+    di = dictGetSafeIterator(server.cluster->nodes);
+    // 遍历所有已知节点,发送 CLUSTERMSG_TYPE_FAIL 消息
+    while((de = dictNext(di)) != NULL) {
+        clusterNode *node = dictGetVal(de);
+        clusterSendMessage(node->link,buf,len);
+    }
+    dictReleaseIterator(di);
+}
+```
+#### 节点收到CLUSTERMSG_TYPE_FAIL消息
+```c
+// src/cluster.c
+int clusterProcessPacket(clusterLink *link) {
+    // ...
+    if (type == CLUSTERMSG_TYPE_FAIL) {
+        clusterNode *failing;
+
+        if (sender) {
+            failing = clusterLookupNode(hdr->data.fail.about.nodename);
+            if (failing &&
+                !(failing->flags & (CLUSTER_NODE_FAIL|CLUSTER_NODE_MYSELF)))
             {
-                if (node->link) freeClusterLink(node->link);
-                memcpy(node->ip,g->ip,NET_IP_STR_LEN);
-                node->port = ntohs(g->port);
-                node->cport = ntohs(g->cport);
-                node->flags &= ~CLUSTER_NODE_NOADDR;
+                // 节点收到 CLUSTER_NODE_FAIL 消息直接选择相信,然后设置对应节点flag
+                failing->flags |= CLUSTER_NODE_FAIL;
+                failing->fail_time = now;
+                failing->flags &= ~CLUSTER_NODE_PFAIL;
+                // 下一次事件循环前更新集群状态
+                clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
+                                     CLUSTER_TODO_UPDATE_STATE);
             }
         } else {
-            /* If it's not in NOADDR state and we don't have it, we
-             * add it to our trusted dict with exact nodeid and flag.
-             * Note that we cannot simply start a handshake against
-             * this IP/PORT pairs, since IP/PORT can be reused already,
-             * otherwise we risk joining another cluster.
-             *
-             * Note that we require that the sender of this gossip message
-             * is a well known node in our cluster, otherwise we risk
-             * joining another cluster. */
-            if (sender &&
-                !(flags & CLUSTER_NODE_NOADDR) &&
-                !clusterBlacklistExists(g->nodename))
-            {
-                clusterNode *node;
-                node = createClusterNode(g->nodename, flags);
-                memcpy(node->ip,g->ip,NET_IP_STR_LEN);
-                node->port = ntohs(g->port);
-                node->cport = ntohs(g->cport);
-                clusterAddNode(node);
+            
+        }
+    } 
+    // ...
+}
+```
+
+#### 更新集群状态
+每个节点每一次主事件循环前都会检查从自己视角的整个集群的的状态,当发现某个master节点为 CLUSTER_NODE_FAIL 时,需要设置集群状态 CLUSTER_FAIL
+```c
+// src/cluster.c
+void clusterUpdateState(void) {
+    int j, new_state;
+    int reachable_masters = 0;
+    static mstime_t among_minority_time;
+    static mstime_t first_call_time = 0;
+    new_state = CLUSTER_OK;
+
+
+    if (server.cluster_require_full_coverage) { // 设置必须所有master节点可用时,只要有一个Fail,就要把整体集群state设置为Fail
+        for (j = 0; j < CLUSTER_SLOTS; j++) {
+            if (server.cluster->slots[j] == NULL ||
+                server.cluster->slots[j]->flags & (CLUSTER_NODE_FAIL))
+            {   
+                new_state = CLUSTER_FAIL;
+                break;
             }
         }
+    }
 
-        /* Next node */
-        g++;
+
+    if (new_state != server.cluster->state) {
+        // ...
+        server.cluster->state = new_state;
+    }
+}
+
+```
+#### slave节点在Cron时发现自己的master节点Fail
+```c
+// src/cluster.c
+void clusterCron(void) {
+
+    if (nodeIsSlave(myself)) { // 当自己是slave时
+        clusterHandleManualFailover();
+        if (!(server.cluster_module_flags & CLUSTER_MODULE_FLAG_NO_FAILOVER))
+            // 检测是否需要开启Failover流程 #ref clusterHandleSlaveFailover
+            clusterHandleSlaveFailover();
+    }
+}
+
+void clusterHandleSlaveFailover(void) {
+    mstime_t data_age;
+    mstime_t auth_age = mstime() - server.cluster->failover_auth_time;
+    int needed_quorum = (server.cluster->size / 2) + 1;
+    int manual_failover = server.cluster->mf_end != 0 &&
+                          server.cluster->mf_can_start;
+    mstime_t auth_timeout, auth_retry_time;
+
+    server.cluster->todo_before_sleep &= ~CLUSTER_TODO_HANDLE_FAILOVER;
+
+    if (server.cluster->failover_auth_sent == 0) { // 如果“我”还没有发起过failover,则需要发起failover请求
+        server.cluster->currentEpoch++;
+        server.cluster->failover_auth_epoch = server.cluster->currentEpoch;
+        //发起failover请求 #ref clusterRequestFailoverAuth TODO
+        clusterRequestFailoverAuth();
+        server.cluster->failover_auth_sent = 1; //设置“已发起请求”状态,下次代码走到这会跳过,直接走接下来的的“得票”缓解
+        return; /* Wait for replies. */
+    }
+
+    // 异步的收集failover的投票结果
+    if (server.cluster->failover_auth_count >= needed_quorum) {
+        /* We have the quorum, we can finally failover the master. */
+
+        serverLog(LL_WARNING,
+            "Failover election won: I'm the new master.");
+
+        /* Update my configEpoch to the epoch of the election. */
+        if (myself->configEpoch < server.cluster->failover_auth_epoch) {
+            myself->configEpoch = server.cluster->failover_auth_epoch;
+            serverLog(LL_WARNING,
+                "configEpoch set to %llu after successful failover",
+                (unsigned long long) myself->configEpoch);
+        }
+
+        /* Take responsibility for the cluster slots. */
+        clusterFailoverReplaceYourMaster();
+    } else {
+        clusterLogCantFailover(CLUSTER_CANT_FAILOVER_WAITING_VOTES);
     }
 }
 
 ```
 
+## 集群分裂相关
 ## 自由slave
 ## configEpoch 与 冲突解决
