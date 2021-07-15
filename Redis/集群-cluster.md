@@ -1108,6 +1108,11 @@ int processCommand(client *c) {
  - 向所有节点发送CLUSTERMSG_TYPE_FAIL消息
  - 节点收到CLUSTERMSG_TYPE_FAIL消息处理
  - slave节点在Cron时发现自己的master节点Fail
+- Failover
+ - slave 发起clusterRequestFailoverAuth 开始投票
+ - 其他master收到RequestFailoverAuth投出自己的票
+ - slave收集投票结果
+ - slave判断自己的得到足够多的票后,取代master
 #### 一手信息,自己与另一个节点ping-pong中发现ping不通了
 节点间`ping`来验证对应节点的状态
 ```c
@@ -1427,34 +1432,166 @@ void clusterHandleSlaveFailover(void) {
     if (server.cluster->failover_auth_sent == 0) { // 如果“我”还没有发起过failover,则需要发起failover请求
         server.cluster->currentEpoch++;
         server.cluster->failover_auth_epoch = server.cluster->currentEpoch;
-        //发起failover请求 #ref clusterRequestFailoverAuth TODO
+        //发起failover请求 #ref clusterRequestFailoverAuth 
         clusterRequestFailoverAuth();
-        server.cluster->failover_auth_sent = 1; //设置“已发起请求”状态,下次代码走到这会跳过,直接走接下来的的“得票”缓解
+        server.cluster->failover_auth_sent = 1; //设置“已发起请求”状态,下次代码走到这会跳过,直接走接下来的的“得票”环节
         return; /* Wait for replies. */
     }
 
-    // 异步的收集failover的投票结果
+    // 异步的收集failover的投票结果,这里只统计投票结果,当结果满足条件时,开始执行‘Replace’流程
     if (server.cluster->failover_auth_count >= needed_quorum) {
-        /* We have the quorum, we can finally failover the master. */
 
-        serverLog(LL_WARNING,
-            "Failover election won: I'm the new master.");
-
-        /* Update my configEpoch to the epoch of the election. */
-        if (myself->configEpoch < server.cluster->failover_auth_epoch) {
-            myself->configEpoch = server.cluster->failover_auth_epoch;
-            serverLog(LL_WARNING,
-                "configEpoch set to %llu after successful failover",
-                (unsigned long long) myself->configEpoch);
-        }
-
-        /* Take responsibility for the cluster slots. */
-        clusterFailoverReplaceYourMaster();
+        clusterFailoverReplaceYourMaster(); 
     } else {
         clusterLogCantFailover(CLUSTER_CANT_FAILOVER_WAITING_VOTES);
     }
 }
 
+```
+#### clusterRequestFailoverAuth slave发起failover投票
+```c
+// src/cluster.c
+void clusterRequestFailoverAuth(void) {
+    clusterMsg buf[1];
+    clusterMsg *hdr = (clusterMsg*) buf;
+    uint32_t totlen;
+
+    // 构建CLUSTERMSG_TYPE_FAILOVER_AUTH_REQUEST消息
+    clusterBuildMessageHdr(hdr,CLUSTERMSG_TYPE_FAILOVER_AUTH_REQUEST);
+
+    totlen = sizeof(clusterMsg)-sizeof(union clusterMsgData);
+    hdr->totlen = htonl(totlen);
+    // Broadcast 群发消息(但只有master们会去处理和投票)
+    clusterBroadcastMessage(buf,totlen);
+}
+```
+#### 其他master收到 CLUSTERMSG_TYPE_FAILOVER_AUTH_REQUEST消息 并投票
+```c
+// src/cluster.c
+int clusterProcessPacket(clusterLink *link) {
+    clusterNode *sender;
+    sender = clusterLookupNode(hdr->sender);
+    // ...
+
+    if (type == CLUSTERMSG_TYPE_FAILOVER_AUTH_REQUEST) {
+        if (!sender) return 1;  /* We don't know that node. */
+        // 权衡利弊然后投票 #ref clusterSendFailoverAuthIfNeeded
+        clusterSendFailoverAuthIfNeeded(sender,hdr);
+    }
+    // ...
+}
+
+void clusterSendFailoverAuthIfNeeded(clusterNode *node, clusterMsg *request) {
+    clusterNode *master = node->slaveof;
+    uint64_t requestCurrentEpoch = ntohu64(request->currentEpoch);
+    uint64_t requestConfigEpoch = ntohu64(request->configEpoch);
+    unsigned char *claimed_slots = request->myslots;
+    int force_ack = request->mflags[0] & CLUSTERMSG_FLAG0_FORCEACK;
+    int j;
+
+    // 自己不是master或不管任何slot,没必要起哄
+    if (nodeIsSlave(myself) || myself->numslots == 0) return;
+
+    // 一次选举只投一次票,其他的投票请求就忽略了
+    if (server.cluster->lastVoteEpoch == server.cluster->currentEpoch) {
+        
+        return;
+    }
+
+    // node本来就是master,或者“我”没有该node的master信息,或者“我”这里并不认为该node的master已经挂了,也不投票
+    if (nodeIsMaster(node) || master == NULL ||
+        (!nodeFailed(master) && !force_ack))
+    {
+        // ...
+        return;
+    }
+
+    // 把票投给第一个符合条件的slave
+    server.cluster->lastVoteEpoch = server.cluster->currentEpoch;
+    node->slaveof->voted_time = mstime();
+    clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|CLUSTER_TODO_FSYNC_CONFIG);
+    // 发送投票回执 #ref 
+    clusterSendFailoverAuth(node);
+}
+
+void clusterSendFailoverAuth(clusterNode *node) {
+    clusterMsg buf[1];
+    clusterMsg *hdr = (clusterMsg*) buf;
+    uint32_t totlen;
+
+    if (!node->link) return;
+    // 创建type为 CLUSTERMSG_TYPE_FAILOVER_AUTH_ACK 的消息
+    clusterBuildMessageHdr(hdr,CLUSTERMSG_TYPE_FAILOVER_AUTH_ACK);
+    totlen = sizeof(clusterMsg)-sizeof(union clusterMsgData);
+    hdr->totlen = htonl(totlen);
+    clusterSendMessage(node->link,(unsigned char*)buf,totlen);
+}
+
+
+```
+
+#### slave 收到投票结果
+```c
+// src/cluster.c
+int clusterProcessPacket(clusterLink *link) {
+    if (type == CLUSTERMSG_TYPE_FAILOVER_AUTH_ACK) {
+
+        if (nodeIsMaster(sender) && sender->numslots > 0 &&
+            senderCurrentEpoch >= server.cluster->failover_auth_epoch)
+        {
+            // “我”就是把投给我的票数+1,后面的主事件循环会根据统计来决定要不要Replace原来的master
+            server.cluster->failover_auth_count++;
+            clusterDoBeforeSleep(CLUSTER_TODO_HANDLE_FAILOVER);
+        }
+    } 
+}
+```
+#### 得到足够的票数后 clusterFailoverReplaceYourMaster
+```c
+// src/cluster.c
+void clusterCron(void) {
+
+    if (nodeIsSlave(myself)) { // 当自己是slave时
+        clusterHandleManualFailover();
+        if (!(server.cluster_module_flags & CLUSTER_MODULE_FLAG_NO_FAILOVER))
+            // 检测是否需要开启Failover流程 #ref clusterHandleSlaveFailover
+            clusterHandleSlaveFailover();
+    }
+}
+
+void clusterHandleSlaveFailover(void) {
+
+    // 异步的收集failover的投票结果,这里只统计投票结果,当结果满足条件时,开始执行‘Replace’流程
+    if (server.cluster->failover_auth_count >= needed_quorum) {
+        //正式取代旧master #ref
+        clusterFailoverReplaceYourMaster(); 
+    } else {
+        clusterLogCantFailover(CLUSTER_CANT_FAILOVER_WAITING_VOTES);
+    }
+}
+void clusterFailoverReplaceYourMaster(void) {
+    int j;
+    clusterNode *oldmaster = myself->slaveof;
+
+    // 设置自己为master
+    clusterSetNodeAsMaster(myself);
+    replicationUnsetMaster();
+
+    // 将原master的slot设置到自己
+    for (j = 0; j < CLUSTER_SLOTS; j++) {
+        if (clusterNodeGetSlotBit(oldmaster,j)) {
+            clusterDelSlot(j);
+            clusterAddSlot(myself,j);
+        }
+    }
+
+    // 更新状态
+    clusterUpdateState();
+    clusterSaveConfigOrDie(1);
+
+    // 群发通知,恭喜
+    clusterBroadcastPong(CLUSTER_BROADCAST_ALL);
+}
 ```
 
 ## 集群分裂相关
