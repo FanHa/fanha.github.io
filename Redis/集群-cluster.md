@@ -63,7 +63,6 @@ void clusterInit(void) {
         }
     }
 
-    // TODO ??
     server.cluster->slots_to_keys = raxNew();
     memset(server.cluster->slots_keys_count,0,
            sizeof(server.cluster->slots_keys_count));
@@ -93,36 +92,20 @@ typedef struct clusterState {
     clusterNode *migrating_slots_to[CLUSTER_SLOTS]; // 正在迁移的slot信息, 哪个slot 迁移到哪个 节点
     clusterNode *importing_slots_from[CLUSTER_SLOTS]; // 正在导入的slot信息, 哪个slot正在从哪个节点导过来
     clusterNode *slots[CLUSTER_SLOTS]; // slot与节点的对应关系
-    uint64_t slots_keys_count[CLUSTER_SLOTS]; // TODO ??
-    rax *slots_to_keys; // TODO ??
+    uint64_t slots_keys_count[CLUSTER_SLOTS]; 
+    rax *slots_to_keys; // 便于快速查找一个slot下有些什么key 树结构
 
-    // master 挂掉时,slave进行选举时用到的字段 TODO
-    mstime_t failover_auth_time; /* Time of previous or next election. */
-    int failover_auth_count;    /* Number of votes received so far. */
-    int failover_auth_sent;     /* True if we already asked for votes. */
-    int failover_auth_rank;     /* This slave rank for current auth request. */
-    uint64_t failover_auth_epoch; /* Epoch of the current election. */
-    int cant_failover_reason;   /* Why a slave is currently not able to
-                                   failover. See the CANT_FAILOVER_* macros. */
-    /* Manual failover state in common. */
-    mstime_t mf_end;            /* Manual failover time limit (ms unixtime).
-                                   It is zero if there is no MF in progress. */
-    /* Manual failover state of master. */
-    clusterNode *mf_slave;      /* Slave performing the manual failover. */
-    /* Manual failover state of slave. */
-    long long mf_master_offset; /* Master offset the slave needs to start MF
-                                   or zero if stil not received. */
-    int mf_can_start;           /* If non-zero signal that the manual failover
-                                   can start requesting masters vote. */
-    /* The followign fields are used by masters to take state on elections. */
-    uint64_t lastVoteEpoch;     /* Epoch of the last vote granted. */
-    int todo_before_sleep; /* Things to do in clusterBeforeSleep(). */
+    // slave认为master 挂掉时,进行选举时用到的字段 
+    mstime_t failover_auth_time; // 上一次发送选举请求的时间(或准备下一次发动选举请求的时间)
+    int failover_auth_count;    // 已经收到了多少票
+    int failover_auth_sent;     // 已经发送了多少投票请求
+    int failover_auth_rank;     // 同一个master下的slave小圈子间的排名(谁数据更新更完整)
+    uint64_t failover_auth_epoch; // 这次选举的版本号,越新越有说服力(直接丢掉旧的)
+    int cant_failover_reason;   // 这一次不能发起failover投票请求的原因
 
-    /* Messages received and sent by type. */
-    long long stats_bus_messages_sent[CLUSTERMSG_TYPE_COUNT];
-    long long stats_bus_messages_received[CLUSTERMSG_TYPE_COUNT];
-    long long stats_pfail_nodes;    /* Number of nodes in PFAIL status,
-                                       excluding nodes without address. */
+    // 选举成为master后使用的字段
+    uint64_t lastVoteEpoch;     // 本master就是通过这一次选举成为master的(如果遇到更大更新的epoch也生成自己时master,则需要让位)
+
 } clusterState;
 ```
 ### clusterNode 结构
@@ -134,16 +117,16 @@ typedef struct clusterNode {
     char name[CLUSTER_NAMELEN]; //节点名
     int flags;      // 节点标记
     uint64_t configEpoch; // “我”所知道的这个节点的信息 的版本
-    unsigned char slots[CLUSTER_SLOTS/8]; // 节点处理的slot TODO 为啥/8??
+    unsigned char slots[CLUSTER_SLOTS/8]; // 节点处理的slot 
     int numslots;   // 节点处理的slot数
     int numslaves;  // 节点的slave数
     struct clusterNode **slaves; // 指向节点的slave节点的信息结构的指针
     struct clusterNode *slaveof; // 指向节点的master节点的信息结构的指针
     mstime_t ping_sent;      // ”我“上次ping他的时间
     mstime_t pong_received;  // 上次收到”他“的pong的时间
-    mstime_t data_received;  // 上次收到”他“的data的时间 ?? TODO data不是通过ping 和pong 传递么
+    mstime_t data_received;  // 上次收到”他“的data的时间 ,ping,pong都行
     mstime_t fail_time;      // 设置”他“为fail状态的时间
-    mstime_t voted_time;     /* Last time we voted for a slave of this master */
+    mstime_t voted_time;     // 上一次为这个master投票的时间
     mstime_t repl_offset_time;  /* Unix time we received offset for this node */
     mstime_t orphaned_time;     /* Starting time of orphaned master condition */
     long long repl_offset;      /* Last known repl offset for this node. */
@@ -402,7 +385,6 @@ int clusterProcessPacket(clusterLink *link) {
             node->port = ntohs(hdr->port);
             node->cport = ntohs(hdr->cport);
             clusterAddNode(node);
-            clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG); // TODO
         }
 
         // 至此,当前节点已经有了发送方的节点信息,需要把当前节点所知道的集群信息发返回去
@@ -447,8 +429,6 @@ int clusterProcessPacket(clusterLink *link) {
 
             if (nodeTimedOut(link->node)) {
                 link->node->flags &= ~CLUSTER_NODE_PFAIL;
-                clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
-                                     CLUSTER_TODO_UPDATE_STATE);
             } else if (nodeFailed(link->node)) {
                 clearNodeFailureIfNeeded(link->node);
             }
@@ -756,7 +736,6 @@ void clusterCommand(client *c) {
             }
         }
         zfree(slots);
-        clusterDoBeforeSleep(CLUSTER_TODO_UPDATE_STATE|CLUSTER_TODO_SAVE_CONFIG);
         addReply(c,shared.ok);
     } 
 }
@@ -800,7 +779,7 @@ int clusterProcessPacket(clusterLink *link) {
                 }
             }
         }
-        // 更新slot信息 TODO
+        // 更新slot信息
         clusterNode *sender_master = NULL; /* Sender or its master if slave. */
         int dirty_slots = 0; /* Sender claimed slots don't match my view? */
 
@@ -827,7 +806,7 @@ int clusterProcessPacket(clusterLink *link) {
                         senderConfigEpoch) // 要设置的slot本来属于其他node,且configEpoch信息大于sender
                     {
 
-                        // 发送一条‘CLUSTERMSG_TYPE_UPDATE’集群信息给sender,告诉现在的最新情况(并强制让sender更新slot信息 TODO)
+                        // 发送一条‘CLUSTERMSG_TYPE_UPDATE’集群信息给sender,告诉现在的最新情况(并强制让sender更新slot信息)
                         clusterSendUpdate(sender->link,
                             server.cluster->slots[j]);
 
@@ -1238,8 +1217,7 @@ int clusterProcessPacket(clusterLink *link) {
             // ... 收到了目标节点的pong消息,可以打消对该节点的`CLUSTER_NODE_PFAIL`状态的疑虑了
             if (nodeTimedOut(link->node)) {
                 link->node->flags &= ~CLUSTER_NODE_PFAIL;
-                clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
-                                     CLUSTER_TODO_UPDATE_STATE);
+
             } else if (nodeFailed(link->node)) {
                 clearNodeFailureIfNeeded(link->node);
             }
@@ -1318,7 +1296,6 @@ void markNodeAsFailingIfNeeded(clusterNode *node) {
     // 广播节点Fail的消息, #ref clusterSendFail
     clusterSendFail(node->name);
     // 下一次主事件循环更新集群的状态
-    clusterDoBeforeSleep(CLUSTER_TODO_UPDATE_STATE|CLUSTER_TODO_SAVE_CONFIG);
 }
 
 void clusterSendFail(char *nodename) {
@@ -1364,8 +1341,7 @@ int clusterProcessPacket(clusterLink *link) {
                 failing->fail_time = now;
                 failing->flags &= ~CLUSTER_NODE_PFAIL;
                 // 下一次事件循环前更新集群状态
-                clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
-                                     CLUSTER_TODO_UPDATE_STATE);
+
             }
         } else {
             
@@ -1509,7 +1485,6 @@ void clusterSendFailoverAuthIfNeeded(clusterNode *node, clusterMsg *request) {
     // 把票投给第一个符合条件的slave
     server.cluster->lastVoteEpoch = server.cluster->currentEpoch;
     node->slaveof->voted_time = mstime();
-    clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|CLUSTER_TODO_FSYNC_CONFIG);
     // 发送投票回执 #ref 
     clusterSendFailoverAuth(node);
 }
@@ -1541,7 +1516,6 @@ int clusterProcessPacket(clusterLink *link) {
         {
             // “我”就是把投给我的票数+1,后面的主事件循环会根据统计来决定要不要Replace原来的master
             server.cluster->failover_auth_count++;
-            clusterDoBeforeSleep(CLUSTER_TODO_HANDLE_FAILOVER);
         }
     } 
 }
@@ -1589,11 +1563,75 @@ void clusterFailoverReplaceYourMaster(void) {
     clusterUpdateState();
     clusterSaveConfigOrDie(1);
 
-    // 群发通知,恭喜
+    // 群发通知,恭喜,其他节点会根据这个信息设置“我”为新master
     clusterBroadcastPong(CLUSTER_BROADCAST_ALL);
 }
 ```
+##### 很久都没有节点获得足够的票的情况,(选举失败处理)
+```c
+void clusterHandleSlaveFailover(void) {
+    // 距离上次发送failover已经过去这么久了
+    mstime_t auth_age = mstime() - server.cluster->failover_auth_time;
+    // 超时时间和重试时间设置
+    auth_timeout = server.cluster_node_timeout*2;
+    if (auth_timeout < 2000) auth_timeout = 2000;
+    auth_retry_time = auth_timeout*2;
 
-## 集群分裂相关
-## 自由slave
+    // 当距离上次发送failover投票请求已经过去很久了(大于规定的retry设置)
+    if (auth_age > auth_retry_time) {
+        server.cluster->failover_auth_time = mstime() +
+            500 + /* Fixed delay of 500 milliseconds, let FAIL msg propagate. */
+            random() % 500; /* Random delay between 0 and 500 milliseconds. */
+        // 清零上次发起投票请求的信息,接下来就会判断这个为0再次发起投票
+        server.cluster->failover_auth_count = 0;
+        server.cluster->failover_auth_sent = 0;
+        // failover_auth_rank 是同一个master下的slave间的小圈子判断slave数据的心新旧程度的标记,rank越低表明数据越新,
+        // 在发起投票时就享有优先权(更早发起投票的slave更容易被选中)
+        server.cluster->failover_auth_rank = clusterGetSlaveRank();
+        server.cluster->failover_auth_time +=
+            server.cluster->failover_auth_rank * 1000;
+        // 向所有同一个master下的slave小圈子发送pong消息,用于彼此知道rank
+        clusterBroadcastPong(CLUSTER_BROADCAST_LOCAL_SLAVES);
+        return;
+    }
+    if (mstime() < server.cluster->failover_auth_time) {
+        // 还没到达下次发起投票的时间
+        clusterLogCantFailover(CLUSTER_CANT_FAILOVER_WAITING_DELAY);
+        return;
+    }
+
+    if (auth_age > auth_timeout) {
+        // 上次发起的投票已经失效了
+        clusterLogCantFailover(CLUSTER_CANT_FAILOVER_EXPIRED);
+        return;
+    }
+
+    // 再一次发起投票
+    if (server.cluster->failover_auth_sent == 0) {
+        // ...
+    }
+}
+```
+## 集群分裂
+当网络状态不好时,集群会分裂,网络状态恢复后,“少数派”里的master节点发现了多数派里的更新信息的master,会自动丢掉自己曾经的数据,成为新master的slave(丢失数据)
+## 自由slave的再分配
+```c
+// src/cluster.c
+void clusterCron(void) {
+    // ...
+    if (nodeIsSlave(myself)) {
+        clusterHandleManualFailover();
+        if (!(server.cluster_module_flags & CLUSTER_MODULE_FLAG_NO_FAILOVER))
+            clusterHandleSlaveFailover();
+        /* If there are orphaned slaves, and we are a slave among the masters
+         * with the max number of non-failing slaves, consider migrating to
+         * the orphaned masters. Note that it does not make sense to try
+         * a migration if there is no master with at least *two* working
+         * slaves. */
+        if (orphaned_masters && max_slaves >= 2 && this_slaves == max_slaves)
+            clusterHandleSlaveMigration(max_slaves);
+    }
+}
+```
+
 ## configEpoch 与 冲突解决
