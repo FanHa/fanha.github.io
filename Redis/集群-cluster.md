@@ -1619,19 +1619,184 @@ void clusterHandleSlaveFailover(void) {
 // src/cluster.c
 void clusterCron(void) {
     // ...
+    orphaned_masters = 0;
+    max_slaves = 0;
+    this_slaves = 0;
+    di = dictGetSafeIterator(server.cluster->nodes);
+    while((de = dictNext(di)) != NULL) {
+        clusterNode *node = dictGetVal(de);
+        now = mstime(); /* Use an updated time at every iteration. */
+
+        if (nodeIsSlave(myself) && nodeIsMaster(node) && !nodeFailed(node)) {
+            // 得到master有多少正常的slave
+            int okslaves = clusterCountNonFailingSlaves(node);
+
+            // 当发现有master的正常slave为0时,就要注意了,可能是潜在的要
+            if (okslaves == 0 && node->numslots > 0 &&
+                node->flags & CLUSTER_NODE_MIGRATE_TO)
+            {
+                orphaned_masters++;
+            }
+
+            // 比出谁的正常slave最多
+            if (okslaves > max_slaves) max_slaves = okslaves;
+            // 当“我”是正在遍历的node的slave时,保存this_slaves,
+            if (nodeIsSlave(myself) && myself->slaveof == node)
+                this_slaves = okslaves;
+        }
+    }
+
     if (nodeIsSlave(myself)) {
-        clusterHandleManualFailover();
-        if (!(server.cluster_module_flags & CLUSTER_MODULE_FLAG_NO_FAILOVER))
-            clusterHandleSlaveFailover();
-        /* If there are orphaned slaves, and we are a slave among the masters
-         * with the max number of non-failing slaves, consider migrating to
-         * the orphaned masters. Note that it does not make sense to try
-         * a migration if there is no master with at least *two* working
-         * slaves. */
+        
+        // 当存在没有slave的master,且“我”所在的小团体中,slave数是最多的,且超过规定值,那么可以尝试迁移过继一个slave给哪个master
         if (orphaned_masters && max_slaves >= 2 && this_slaves == max_slaves)
+            //尝试迁移 #ref
             clusterHandleSlaveMigration(max_slaves);
     }
 }
+
+void clusterHandleSlaveMigration(int max_slaves) {
+    int j, okslaves = 0;
+    clusterNode *mymaster = myself->slaveof, *target = NULL, *candidate = NULL;
+    dictIterator *di;
+    dictEntry *de;
+
+    // 集群状态判断
+    if (server.cluster->state != CLUSTER_OK) return;
+
+    /* Step 2: Don't migrate if my master will not be left with at least
+     *         'migration-barrier' slaves after my migration. */
+    if (mymaster == NULL) return;
+    // 得到“我”的master有多少正常的slave
+    for (j = 0; j < mymaster->numslaves; j++)
+        if (!nodeFailed(mymaster->slaves[j]) &&
+            !nodeTimedOut(mymaster->slaves[j])) okslaves++;
+    if (okslaves <= server.cluster_migration_barrier) return;
+
+    
+    candidate = myself;
+    // 遍历所有nodes,找到要迁移的目标master
+    di = dictGetSafeIterator(server.cluster->nodes);
+    while((de = dictNext(di)) != NULL) {
+        clusterNode *node = dictGetVal(de);
+        int okslaves = 0, is_orphaned = 1;
+
+        // 剔除掉不是orphaned的情况
+        if (nodeIsSlave(node) || nodeFailed(node)) is_orphaned = 0;
+        if (!(node->flags & CLUSTER_NODE_MIGRATE_TO)) is_orphaned = 0;
+
+        if (nodeIsMaster(node)) okslaves = clusterCountNonFailingSlaves(node);
+        if (okslaves > 0) is_orphaned = 0;
+
+        if (is_orphaned) {
+            // 设置node为迁移目标
+            if (!target && node->numslots > 0) target = node;
+
+            /* Track the starting time of the orphaned condition for this
+             * master. */
+            if (!node->orphaned_time) node->orphaned_time = mstime();
+        } else {
+            node->orphaned_time = 0;
+        }
+
+        // 确认“我”是不是候选人(从slave最多的master里选出id最小的)
+        if (okslaves == max_slaves) {
+            for (j = 0; j < node->numslaves; j++) {
+                if (memcmp(node->slaves[j]->name,
+                           candidate->name,
+                           CLUSTER_NAMELEN) < 0)
+                {
+                    candidate = node->slaves[j];
+                }
+            }
+        }
+    }
+    dictReleaseIterator(di);
+
+    if (target && candidate == myself &&
+        (mstime()-target->orphaned_time) > CLUSTER_SLAVE_MIGRATION_DELAY &&
+       !(server.cluster_module_flags & CLUSTER_MODULE_FLAG_NO_FAILOVER))
+    {
+        // 当我是候选人时,将我的master设置为目标节点
+        clusterSetMaster(target);
+    }
+}
+
 ```
 
-## configEpoch 与 冲突解决
+## 冲突
+redis集群弱一致性,数据和设置的冲突是必然,出现冲突时以epoch为准,谁的epoch越大,就信谁
+```c
+// src/cluster.h
+// 节点自己的cluster状态中的几个epoch
+typedef struct clusterState {
+    uint64_t currentEpoch; // 自己信息的epoch
+ 
+    uint64_t failover_auth_epoch; // 发起failover 投票时的epoch
+ 
+    uint64_t lastVoteEpoch;     // 上次通过这个epoch当选的master
+
+} clusterState;
+// 保存的每个clusterNode信息中有个configEpoch用来标记这个节点的信息的版本
+typedef struct clusterNode {
+    uint64_t configEpoch; // “我”对这个节点的信息的epoch
+} clusterNode;
+```
+### cluster信息冲突
+#### 发送消息时带上clusterEpoch 和 configEpoch
+节点发送消息时会设置消息的currentEpoch 和 configEpoch
+```c
+// src/cluster.h
+typedef struct {
+    // ...
+    uint64_t currentEpoch;  // 发送方认为的cluster epoch
+    uint64_t configEpoch;   // 发送方的master 的epoch
+    // ...
+} clusterMsg;
+```
+```c
+void clusterBuildMessageHdr(clusterMsg *hdr, int type) {
+
+    hdr->currentEpoch = htonu64(server.cluster->currentEpoch);
+    hdr->configEpoch = htonu64(master->configEpoch);
+}
+```
+#### 收到消息方验证clusterEpoch 和 configEpoch
+```c
+int clusterProcessPacket(clusterLink *link) {
+
+    uint64_t senderCurrentEpoch = 0, senderConfigEpoch = 0;
+    // ...
+    if (sender && !nodeInHandshake(sender)) {
+        // 如果“我”已知发送方,则需要根据发送方发来的epoch来更新“我”认为的clusterEpoch(currentEpoch) 和 configEpoch
+        senderCurrentEpoch = ntohu64(hdr->currentEpoch);
+        senderConfigEpoch = ntohu64(hdr->configEpoch);
+        if (senderCurrentEpoch > server.cluster->currentEpoch)
+            server.cluster->currentEpoch = senderCurrentEpoch;
+        if (senderConfigEpoch > sender->configEpoch) {
+            sender->configEpoch = senderConfigEpoch;
+        }
+    }
+    // ...
+    if (type == CLUSTERMSG_TYPE_FAILOVER_AUTH_ACK) {
+        if (!sender) return 1;  /* We don't know that node. */
+        // clusterEpoch 用来在收到投票回应时比对这个投票是否有效(大于本地发起的failover auth epoch为有效)
+        if (nodeIsMaster(sender) && sender->numslots > 0 &&
+            senderCurrentEpoch >= server.cluster->failover_auth_epoch)
+        {
+            server.cluster->failover_auth_count++;
+        }
+    }
+    // ...
+    // slot信息的变更需要用到configEpoch
+    if (sender && nodeIsMaster(sender) && dirty_slots)
+        // #ref 
+        clusterUpdateSlotsConfigWith(sender,senderConfigEpoch,hdr->myslots);
+    
+}
+
+clusterUpdateSlotsConfigWith // todo
+```
+### 选举信息冲突
+
+## clusterDoBeforeSleep
