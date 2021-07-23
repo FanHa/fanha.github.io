@@ -1760,6 +1760,14 @@ void clusterBuildMessageHdr(clusterMsg *hdr, int type) {
     hdr->currentEpoch = htonu64(server.cluster->currentEpoch);
     hdr->configEpoch = htonu64(master->configEpoch);
 }
+
+```
+```c
+    if (server.cluster->failover_auth_sent == 0) {
+        server.cluster->currentEpoch++; //发起投票时会把集群epoch++,failover_auth_epoch赋值
+        server.cluster->failover_auth_epoch = server.cluster->currentEpoch;
+        //...
+    }
 ```
 #### 收到消息方验证clusterEpoch 和 configEpoch
 ```c
@@ -1788,15 +1796,72 @@ int clusterProcessPacket(clusterLink *link) {
         }
     }
     // ...
-    // slot信息的变更需要用到configEpoch
+    // 当收到的node声称的slot信息与本地不一致时,变更需要用到configEpoch
     if (sender && nodeIsMaster(sender) && dirty_slots)
         // #ref 
         clusterUpdateSlotsConfigWith(sender,senderConfigEpoch,hdr->myslots);
+
+    if (sender && dirty_slots) {
+        int j;
+        for (j = 0; j < CLUSTER_SLOTS; j++) {
+            if (bitmapTestBit(hdr->myslots,j)) {
+                if (server.cluster->slots[j] == sender ||
+                    server.cluster->slots[j] == NULL) continue;
+                if (server.cluster->slots[j]->configEpoch >
+                    senderConfigEpoch)
+                {
+                    // 当一个节点声称自己拥有一个slot,而“我”发现他的configEpoch比我本来存这个slot的节点的epoch小,我需要尽快告诉他这个事情
+                    clusterSendUpdate(sender->link,
+                        server.cluster->slots[j]);
+                    break;
+                }
+            }
+        }
+    }
+
+    // 当sender的configEpoch 和 我的epoch相等时,需要解决这个冲突
+    if (sender &&
+            nodeIsMaster(myself) && nodeIsMaster(sender) &&
+            senderConfigEpoch == myself->configEpoch)
+        {
+            // #ref
+            clusterHandleConfigEpochCollision(sender);
+        }
     
 }
 
-clusterUpdateSlotsConfigWith // todo
+// 需要更新slot信息时,比对configEpoch,只有比原来持有这个slot的节点的configEpoch大才会更新
+void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoch, unsigned char *slots) {
+    for (j = 0; j < CLUSTER_SLOTS; j++) {
+        if (bitmapTestBit(slots,j)) {
+            // 只有configEpoch 比原来声称有这个slot的节点的configEpoch大,才会改动
+            if (server.cluster->slots[j] == NULL ||
+                server.cluster->slots[j]->configEpoch < senderConfigEpoch)
+            {
+                // ...
+                if (server.cluster->slots[j] == curmaster)
+                    newmaster = sender;
+                clusterDelSlot(j);
+                clusterAddSlot(sender,j);
+                clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
+                                     CLUSTER_TODO_UPDATE_STATE|
+                                     CLUSTER_TODO_FSYNC_CONFIG);
+            }
+        }
+    }
+
+}
+
+// 解决configEpoch相同时的场景
+void clusterHandleConfigEpochCollision(clusterNode *sender) {
+
+    // 简单粗暴的再比较id,如果我的id比较大,则把集群Epoch++,同时把自己的configEpoch与集群epoch相同
+    // (如果“我”的id较小,不需要做什么,因为对方收到我的ping-pong信息也会走这一步,他会完成clusterEpoch和configEpoch的更新的)
+    if (memcmp(sender->name,myself->name,CLUSTER_NAMELEN) <= 0) return;
+    server.cluster->currentEpoch++;
+    myself->configEpoch = server.cluster->currentEpoch;
+}
+
 ```
-### 选举信息冲突
 
 ## clusterDoBeforeSleep
