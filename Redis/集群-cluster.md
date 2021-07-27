@@ -41,11 +41,6 @@ void clusterInit(void) {
     if (saveconf) clusterSaveConfigOrDie(1);
 
     // ...
-    int port = server.tls_cluster ? server.tls_port : server.port;
-    if (port > (65535-CLUSTER_PORT_INCR)) {
-        // ...
-        exit(1);
-    }
     // 设置一个专门用来集群间信息交流的端口
     if (listenToPort(port+CLUSTER_PORT_INCR,
         server.cfd,&server.cfd_count) == C_ERR)
@@ -63,7 +58,7 @@ void clusterInit(void) {
         }
     }
 
-    server.cluster->slots_to_keys = raxNew();
+    server.cluster->slots_to_keys = raxNew(); //这个slots_to_keys用来保存一个树,可以迅速反查slot下有哪些key
     memset(server.cluster->slots_keys_count,0,
            sizeof(server.cluster->slots_keys_count));
 
@@ -89,8 +84,8 @@ typedef struct clusterState {
     int size;             // 整个cluster中的master数量
     dict *nodes;          // 集群中所有节点的名字与信息表
     dict *nodes_black_list; // 节点黑名单
-    clusterNode *migrating_slots_to[CLUSTER_SLOTS]; // 正在迁移的slot信息, 哪个slot 迁移到哪个 节点
-    clusterNode *importing_slots_from[CLUSTER_SLOTS]; // 正在导入的slot信息, 哪个slot正在从哪个节点导过来
+    clusterNode *migrating_slots_to[CLUSTER_SLOTS]; // 正在迁移(出去)的slot信息, 哪个slot 迁移到哪个 节点
+    clusterNode *importing_slots_from[CLUSTER_SLOTS]; // 正在导入(进来)的slot信息, 哪个slot正在从哪个节点导过来
     clusterNode *slots[CLUSTER_SLOTS]; // slot与节点的对应关系
     uint64_t slots_keys_count[CLUSTER_SLOTS]; 
     rax *slots_to_keys; // 便于快速查找一个slot下有些什么key 树结构
@@ -111,7 +106,7 @@ typedef struct clusterState {
 ### clusterNode 结构
 ```c
 // src/cluster.h
-// 用于保存一个具体的cluster节点信息
+// 用于保存一个具体的(“我”所知道的)cluster节点信息
 typedef struct clusterNode {
     mstime_t ctime; // 节点创建时间
     char name[CLUSTER_NAMELEN]; //节点名
@@ -196,7 +191,7 @@ void clusterCommand(client *c) {
         } else {
             cport = port + CLUSTER_PORT_INCR;
         }
-        // 收到cluster meet 尝试连接目标redis 实例
+        // 收到cluster meet 尝试连接目标redis 实例 #ref(clusterStartHandshake)
         if (clusterStartHandshake(c->argv[2]->ptr,port,cport) == 0 &&
             errno == EINVAL)
         {
@@ -208,6 +203,7 @@ void clusterCommand(client *c) {
     // ...
 }
 
+// 与目标机器进行集群信息连接的握手
 int clusterStartHandshake(char *ip, int port, int cport) {
     clusterNode *n;
     char norm_ip[NET_IP_STR_LEN];
@@ -246,7 +242,7 @@ void clusterCron(void) {
             clusterLink *link = createClusterLink(node); //初始化连接信息
             link->conn = server.tls_cluster ? connCreateTLS() : connCreateSocket();
             connSetPrivateData(link->conn, link);
-            // 与目标机器的低层连接(tcp)交给内核,这里只关注连接完成后的回调clusterLinkConnectHandler
+            // 与目标机器的底层连接(tcp)交给内核,这里只关注连接完成后的回调clusterLinkConnectHandler
             if (connConnect(link->conn, node->ip, node->cport, NET_FIRST_BIND_ADDR,
                         clusterLinkConnectHandler) == -1) {
                 // ...
@@ -336,10 +332,11 @@ static void clusterConnAcceptHandler(connection *conn) {
     link->conn = conn;
     connSetPrivateData(conn, link);
 
-    // 创建收到集群信息的可读事件回调 clusterReadHandler
+    // 创建收到集群信息的可读事件回调 #ref(clusterReadHandler)
     connSetReadHandler(conn, clusterReadHandler);
 }
 
+// cluster信息可读事件回调
 void clusterReadHandler(connection *conn) {
     clusterMsg buf[1];
     ssize_t nread;
@@ -352,6 +349,7 @@ void clusterReadHandler(connection *conn) {
         //...
         // 收到一个完整的Meet信息后调用clusterProcessPacket解析meet信息
         if (rcvbuflen >= 8 && rcvbuflen == ntohl(hdr->totlen)) {
+            // #ref(clusterProcessPacket)
             if (clusterProcessPacket(link)) {
                 // ...
             } else {
@@ -360,12 +358,13 @@ void clusterReadHandler(connection *conn) {
         }
     }
 }
+
+// 解析并处理处理集群信息
 int clusterProcessPacket(clusterLink *link) {
     clusterMsg *hdr = (clusterMsg*) link->rcvbuf;
     uint32_t totlen = ntohl(hdr->totlen);
     uint16_t type = ntohs(hdr->type);
     mstime_t now = mstime();
-
 
     uint16_t flags = ntohs(hdr->flags);
     uint64_t senderCurrentEpoch = 0, senderConfigEpoch = 0;
@@ -434,7 +433,7 @@ int clusterProcessPacket(clusterLink *link) {
             }
         }
 
-        // 收到pong消息需要处理对方发来的关于集群的gossip消息,并更新自己本地的集群信息
+        // 收到pong消息需要处理对方发来的关于集群的gossip消息,并更新自己本地的集群信息 #ref(clusterProcessGossipSection)
         if (sender) clusterProcessGossipSection(hdr,link);
     }
     return 1;
@@ -509,16 +508,16 @@ void clusterSendPing(clusterLink *link, int type) {
             continue;
         }
 
-        // 因为是随机选的,难免选到相同节点,略郭
+        // 因为是随机选的,难免选到相同节点,略过
         if (clusterNodeIsInGossipSection(hdr,gossipcount,this)) continue;
 
-        // 将该节点信息加入gossip待发送区域
+        // 将该节点信息加入gossip待发送区域 #ref(clusterProcessGossipSection)
         clusterSetGossipEntry(hdr,gossipcount,this);
         freshnodes--;
         gossipcount++;
     }
 
-    // 当发现自己的cluster里有PFail(疑似fail)的节点时,遍历找到所有疑似Fail的节点,加入到gossip待发送区域中
+    // 当发现自己的cluster里有PFail(疑似fail)的节点时,需要尽快通知大家重点关照,破例加入到gossip待发送区域中
     if (pfail_wanted) {
         dictIterator *di;
         dictEntry *de;
@@ -570,9 +569,7 @@ int clusterProcessPacket(clusterLink *link) {
     clusterNode *sender;
     sender = clusterLookupNode(hdr->sender);
 
-    /* Initial processing of PING and MEET requests replying with a PONG. */
     if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_MEET) {
-        serverLog(LL_DEBUG,"Ping packet received: %p", (void*)link->node);
         // 收到ping消息需同样需要调用 clusterSendPing 发送一个pong消息,也会带上自己生成的gossip信息
         clusterSendPing(link,CLUSTERMSG_TYPE_PONG);
     }
@@ -595,7 +592,7 @@ int clusterProcessPacket(clusterLink *link) {
 }
 ```
 #### clusterProcessGossipSection 处理gossip信息
-对收到的ping和pong消息里待的gossip信息做处理
+对收到的ping和pong消息里带的gossip信息做处理
 ```c
 void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
     uint16_t count = ntohs(hdr->count);
@@ -609,8 +606,7 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
         sds ci;
         node = clusterLookupNode(g->nodename);
         if (node) { //如果我们本地已经知道这个node 
-            // 更新本地信息
-
+            // 更新本地信息 后年详细解析 clusterProcessGossipSection时会深入
         } else {
             // 本地没有这个node的信息,则新建关于这个node 的 ClusterNode结构,加入到本地cluster信息中
             if (sender &&
@@ -633,7 +629,8 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
 ```
 ### redis-cli设置集群中各个节点的slot和master-slave关系(cluster addslots命令 和 cluster replicate命令)
 ```c
-src/redis-cli.c
+// src/redis-cli.c
+        // ...
         // cluster meet 相关
         // cluster 命令后需要等集群里的节点互相认识了后再发设置slot 和 master-slave 更有效率
         sleep(1);
@@ -1692,8 +1689,6 @@ void clusterHandleSlaveMigration(int max_slaves) {
             // 设置node为迁移目标
             if (!target && node->numslots > 0) target = node;
 
-            /* Track the starting time of the orphaned condition for this
-             * master. */
             if (!node->orphaned_time) node->orphaned_time = mstime();
         } else {
             node->orphaned_time = 0;
@@ -1843,9 +1838,6 @@ void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoc
                     newmaster = sender;
                 clusterDelSlot(j);
                 clusterAddSlot(sender,j);
-                clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
-                                     CLUSTER_TODO_UPDATE_STATE|
-                                     CLUSTER_TODO_FSYNC_CONFIG);
             }
         }
     }
@@ -1863,5 +1855,3 @@ void clusterHandleConfigEpochCollision(clusterNode *sender) {
 }
 
 ```
-
-## clusterDoBeforeSleep
