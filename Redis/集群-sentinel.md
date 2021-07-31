@@ -18,7 +18,7 @@ struct sentinelState {
     int tilt;           // sentinel因为系统时间的不一致而进入的一种保护模式
     int running_scripts;    // ?? TODO
     mstime_t tilt_start_time;       // 开始tilt模式的时间
-    mstime_t previous_time;         // TODO
+    mstime_t previous_time;         // 上次执行周期性函数的时间(用来判断是否需要进入tilt模式)
     list *scripts_queue;            // todo
     char *announce_ip;  // 我与其他sentinel交互用的ip
     int announce_port;  // 我与其他sentinel交互用的port
@@ -28,9 +28,9 @@ struct sentinelState {
 
 // “我”所监管的redis实例结构(前面的 dict *masters)
 typedef struct sentinelRedisInstance {
-    int flags;      /* See SRI_... defines */
-    char *name;     /* Master name from the point of view of this sentinel. */
-    char *runid;    /* Run ID of this instance, or unique ID if is a Sentinel.*/
+    int flags;      // redis实例的类型和状态(master,sentinel,slave,oshotdown等等)
+    char *name;     // 实例名
+    char *runid;    // 实例ID
     uint64_t config_epoch;  /* Configuration epoch. */
     sentinelAddr *addr; /* Master host. */
     instanceLink *link; /* Link to the instance, may be shared for Sentinels. */
@@ -169,8 +169,12 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
 ```c
 // sentinel.c
 void sentinelTimer(void) {
+    // 判断是否因为时间的不同步而需要进`tilt`模式 #ref(sentinelCheckTiltCondition)
     sentinelCheckTiltCondition();
+    // 与所有已知的master间的交互
     sentinelHandleDictOfRedisInstances(sentinel.masters);
+
+
     sentinelRunPendingScripts();
     sentinelCollectTerminatedScripts();
     sentinelKillTimedoutScripts();
@@ -185,7 +189,20 @@ void sentinelTimer(void) {
 }
 
 ```
+#### sentinelCheckTiltCondition
+```c
+void sentinelCheckTiltCondition(void) {
+    mstime_t now = mstime();
+    mstime_t delta = now - sentinel.previous_time; //算出当前时间与上次执行sentinel周期函数的差值
 
+    // 当差值小于0或者大于某个阈值时,认为不太正常,需要进入tilt模式
+    if (delta < 0 || delta > SENTINEL_TILT_TRIGGER) {
+        sentinel.tilt = 1;
+        sentinel.tilt_start_time = mstime();
+    }
+    sentinel.previous_time = mstime();
+}
+```
 #### sentinelHandleDictOfRedisInstances(sentinel.masters)
 递归与所有已知的`redis-server(master)`服务及该服务已知的`redis-server(slave)`和其他`sentinel`; 
 具体与每个进程(服务)交互的是`sentinelHandleRedisInstance(ri)`
