@@ -15,9 +15,9 @@ struct sentinelState {
     char myid[CONFIG_RUN_ID_SIZE+1]; // sentinel实例ID
     uint64_t current_epoch;         // 信息版本(后续需要用这个版本比对来解决冲突)
     dict *masters;      // “我”所监管的master实例
-    int tilt;           // ?? TODO
+    int tilt;           // sentinel因为系统时间的不一致而进入的一种保护模式
     int running_scripts;    // ?? TODO
-    mstime_t tilt_start_time;       // ?? TODO
+    mstime_t tilt_start_time;       // 开始tilt模式的时间
     mstime_t previous_time;         // TODO
     list *scripts_queue;            // todo
     char *announce_ip;  // 我与其他sentinel交互用的ip
