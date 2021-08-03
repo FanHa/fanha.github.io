@@ -164,8 +164,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
 }
 ```
 
-### sentinelTimer
-// sentinel的周期性执行逻辑
+### sentinelTimer 需要周期执行的逻辑
 ```c
 // sentinel.c
 void sentinelTimer(void) {
@@ -175,9 +174,9 @@ void sentinelTimer(void) {
     sentinelHandleDictOfRedisInstances(sentinel.masters);
 
 
-    sentinelRunPendingScripts();
-    sentinelCollectTerminatedScripts();
-    sentinelKillTimedoutScripts();
+    sentinelRunPendingScripts(); //todo
+    sentinelCollectTerminatedScripts(); //todo
+    sentinelKillTimedoutScripts(); //todo
 
     /* We continuously change the frequency of the Redis "timer interrupt"
      * in order to desynchronize every Sentinel from every other.
@@ -189,8 +188,9 @@ void sentinelTimer(void) {
 }
 
 ```
-#### sentinelCheckTiltCondition
+#### sentinelCheckTiltCondition 判断是否因为时间同步问题而暂时进入`tilt`模式
 ```c
+// src/sentinel.c
 void sentinelCheckTiltCondition(void) {
     mstime_t now = mstime();
     mstime_t delta = now - sentinel.previous_time; //算出当前时间与上次执行sentinel周期函数的差值
@@ -203,51 +203,52 @@ void sentinelCheckTiltCondition(void) {
     sentinel.previous_time = mstime();
 }
 ```
-#### sentinelHandleDictOfRedisInstances(sentinel.masters)
+#### sentinelHandleDictOfRedisInstances(sentinel.masters) 处理已知服务实例的交互
 递归与所有已知的`redis-server(master)`服务及该服务已知的`redis-server(slave)`和其他`sentinel`; 
 具体与每个进程(服务)交互的是`sentinelHandleRedisInstance(ri)`
 ```c
+// src/sentinel.c
 void sentinelHandleDictOfRedisInstances(dict *instances) {
     dictIterator *di;
     dictEntry *de;
     sentinelRedisInstance *switch_to_promoted = NULL;
 
-    /* There are a number of things we need to perform against every master. */
+    // 遍历所有已知服务器实例
     di = dictGetIterator(instances);
     while((de = dictNext(di)) != NULL) {
         sentinelRedisInstance *ri = dictGetVal(de);
-
-        sentinelHandleRedisInstance(ri);
-        if (ri->flags & SRI_MASTER) {
+        // 每个实例的处理 #ref(sentinelHandleRedisInstance)
+        sentinelHandleRedisInstance(ri); 
+        if (ri->flags & SRI_MASTER) { // 只有实例为master时才做接下来的处理
+            // 处理实例的slave #ref(sentinelHandleDictOfRedisInstances)
             sentinelHandleDictOfRedisInstances(ri->slaves);
+            // 处理实例的sentinel #ref(sentinelHandleDictOfRedisInstances)
             sentinelHandleDictOfRedisInstances(ri->sentinels);
+            // todo
             if (ri->failover_state == SENTINEL_FAILOVER_STATE_UPDATE_CONFIG) {
                 switch_to_promoted = ri;
             }
         }
     }
-    if (switch_to_promoted)
+    if (switch_to_promoted) // todo
         sentinelFailoverSwitchToPromotedSlave(switch_to_promoted);
     dictReleaseIterator(di);
 }
-```
 
-#### sentinelHandleRedisInstance
-
-```c
 void sentinelHandleRedisInstance(sentinelRedisInstance *ri) {
-    // 取得与服务实体的连接
+    // 取得与服务实体的连接 #ref(sentinelReconnectInstance) todo
     sentinelReconnectInstance(ri);
 
-    // 发送周期性的问候信息来掌握服务(包括redis-server.master,redis-server.slave,其他sentinel)的信息
+    // 发送周期性的问候信息来掌握服务(包括redis-server.master,redis-server.slave,其他sentinel)的信息 #ref(sentinelSendPeriodicCommands) todo
     sentinelSendPeriodicCommands(ri);
 
-    // 确认该服务是否已经Down(主观)
+    // 确认该服务是否已经Down(主观) #ref(sentinelCheckSubjectivelyDown) todo
     sentinelCheckSubjectivelyDown(ri);
     /* Only masters */
     if (ri->flags & SRI_MASTER) {
-        // 判断redis-server.master是否仍有效,及无效时与其他sentinel讨论商量怎么failover
+        // 判断该实例是否已经触及“客观Down” todo
         sentinelCheckObjectivelyDown(ri);
+        // 判断是否需要开始failover todo
         if (sentinelStartFailoverIfNeeded(ri))
             sentinelAskMasterStateToOtherSentinels(ri,SENTINEL_ASK_FORCED);
         sentinelFailoverStateMachine(ri);
@@ -268,39 +269,71 @@ void sentinelHandleRedisInstance(sentinelRedisInstance *ri) {
 ```c
 // sentinel.c
 void sentinelSendPeriodicCommands(sentinelRedisInstance *ri) {
-    // ...
-    // 向所有已知的非sentinel进程发送info命令,并设置回调sentinelInfoReplyCallback,将返回的info信息记录,这里用到了redis本身自带的事件异步机制,见后文 __redisAsyncCommand()
+    mstime_t now = mstime();
+    mstime_t info_period, ping_period;
+    int retval;
+
+    // 连接还未建立,立刻返回,等待下一次periodc触发
+    if (ri->link->disconnected) return;
+
+    // 有过多还没得到回应的command,也立刻返回,等待下一次periodc触发
+    if (ri->link->pending_commands >=
+        SENTINEL_MAX_PENDING_COMMANDS * ri->link->refcount) return;
+
+     // 当目标实例时slave,且它的master时客观Down状态时,需要降低信息交互间隔,加快和它的信息交换
+    if ((ri->flags & SRI_SLAVE) &&
+        ((ri->master->flags & (SRI_O_DOWN|SRI_FAILOVER_IN_PROGRESS)) ||
+         (ri->master_link_down_time != 0)))
+    {
+        info_period = 1000;
+    } else {
+        info_period = SENTINEL_INFO_PERIOD;
+    }
+
+    // 控制ping的间隔时间
+    ping_period = ri->down_after_period;
+    if (ping_period > SENTINEL_PING_PERIOD) ping_period = SENTINEL_PING_PERIOD;
+
+    // sentinel之间不需要直接交换信息(通过对其他redis节点的某个通道的订阅来得到其他sentinel节点的信息)
     if ((ri->flags & SRI_SENTINEL) == 0 &&
         (ri->info_refresh == 0 ||
         (now - ri->info_refresh) > info_period))
     {
+        // 向一般redis节点(master,slave)发送 `info`命令,并设置回调sentinelInfoReplyCallback来获取目标机器的信息(异步命令)
+        // #ref(sentinelInfoReplyCallback)
         retval = redisAsyncCommand(ri->link->cc,
             sentinelInfoReplyCallback, ri, "%s",
             sentinelInstanceMapCommand(ri,"INFO"));
-        if (retval == C_OK) ri->link->pending_commands++;
+        if (retval == C_OK) ri->link->pending_commands++; //统计还未得到回应的命令+1
     }
 
-    // 对所有服务进程发送ping来获取"是否可达"信息,同样通过下面的redisAsyncCommand机制
+    // 每种类型的实例都需要ping
     if ((now - ri->link->last_pong_time) > ping_period &&
                (now - ri->link->last_ping_time) > ping_period/2) {
         sentinelSendPing(ri);
     }
 
-    /* PUBLISH hello messages to all the three kinds of instances. */
+    // todo??
     if ((now - ri->last_pub_time) > SENTINEL_PUBLISH_PERIOD) {
         sentinelSendHello(ri);
     }
 }
-```
 
-```c
-// async.c
-static int __redisAsyncCommand(redisAsyncContext *ac, redisCallbackFn *fn, void *privdata, const char *cmd, size_t len) {
-    // ...
-    // 这个宏即把要发送的命令加入写队列,redis的主循环会把写队列发送给相应的服务进程;
-    _EL_ADD_WRITE(ac);
+// 异步info命令的回调
+void sentinelInfoReplyCallback(redisAsyncContext *c, void *reply, void *privdata) {
+    sentinelRedisInstance *ri = privdata;
+    instanceLink *link = c->data;
+    redisReply *r;
+
+    if (!reply || !link) return;
+    link->pending_commands--;
+    r = reply;
+    // 更新目标服务实例的信息
+    if (r->type == REDIS_REPLY_STRING)
+        sentinelRefreshInstanceInfo(ri,r->str);
 }
 ```
+
 
 ### failover 机制
 + sentinel群独立于redis服务进程群(包括master和slave)运行,通过周期性的与各个服务进程交换信息来获取每个服务进程的健康状态;
