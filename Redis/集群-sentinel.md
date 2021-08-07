@@ -26,12 +26,12 @@ struct sentinelState {
     int deny_scripts_reconfig;// todo
 } sentinel;
 
-// “我”所监管的redis实例结构(前面的 dict *masters)
+// “我”所监管的redis实例结构
 typedef struct sentinelRedisInstance {
     int flags;      // redis实例的类型和状态(master,sentinel,slave,oshotdown等等)
     char *name;     // 实例名
     char *runid;    // 实例ID
-    uint64_t config_epoch;  /* Configuration epoch. */
+    uint64_t config_epoch;  // 信息版本epoch
     sentinelAddr *addr; /* Master host. */
     instanceLink *link; /* Link to the instance, may be shared for Sentinels. */
     mstime_t last_pub_time;   /* Last time we sent hello via Pub/Sub. */
@@ -43,20 +43,15 @@ typedef struct sentinelRedisInstance {
     mstime_t s_down_since_time; /* Subjectively down since time. */
     mstime_t o_down_since_time; /* Objectively down since time. */
     mstime_t down_after_period; /* Consider it down after that period. */
-    mstime_t info_refresh;  /* Time at which we received INFO output from it. */
+    mstime_t info_refresh;  // 更新信息的时间
     dict *renamed_commands;     /* Commands renamed in this instance:
                                    Sentinel will use the alternative commands
                                    mapped on this table to send things like
                                    SLAVEOF, CONFING, INFO, ... */
 
-    /* Role and the first time we observed it.
-     * This is useful in order to delay replacing what the instance reports
-     * with our own configuration. We need to always wait some time in order
-     * to give a chance to the leader to report the new configuration before
-     * we do silly things. */
-    int role_reported;
+    int role_reported; // 上次这个实例报告的ta的角色
     mstime_t role_reported_time;
-    mstime_t slave_conf_change_time; /* Last time slave master addr changed. */
+    mstime_t slave_conf_change_time; // slave上次更新master信息的时间
 
     /* Master specific. */
     dict *sentinels;    /* Other sentinels monitoring the same master. */
@@ -66,24 +61,25 @@ typedef struct sentinelRedisInstance {
     char *auth_pass;    /* Password to use for AUTH against master & replica. */
     char *auth_user;    /* Username for ACLs AUTH against master & replica. */
 
-    /* Slave specific. */
-    mstime_t master_link_down_time; /* Slave replication link down time. */
-    int slave_priority; /* Slave priority according to its INFO output. */
+    // slave的信息
+    mstime_t master_link_down_time; // 该slave报告的ta与ta的master断连的时间
+    int slave_priority; // todo
     mstime_t slave_reconf_sent_time; /* Time at which we sent SLAVE OF <new> */
     struct sentinelRedisInstance *master; /* Master instance if it's slave. */
-    char *slave_master_host;    /* Master host as reported by INFO */
-    int slave_master_port;      /* Master port as reported by INFO */
-    int slave_master_link_status; /* Master link status as reported by INFO */
-    unsigned long long slave_repl_offset; /* Slave replication offset. */
+    char *slave_master_host;    // 该slave报告的ta的host
+    int slave_master_port;      // port
+    int slave_master_link_status; // 与master的连接状态
+    unsigned long long slave_repl_offset; // 与master之间的基准数据的偏移量
+
     /* Failover */
     char *leader;       /* If this is a master instance, this is the runid of
                            the Sentinel that should perform the failover. If
                            this is a Sentinel, this is the runid of the Sentinel
                            that this Sentinel voted as leader. */
     uint64_t leader_epoch; /* Epoch of the 'leader' field. */
-    uint64_t failover_epoch; /* Epoch of the currently started failover. */
-    int failover_state; /* See SENTINEL_FAILOVER_STATE_* defines. */
-    mstime_t failover_state_change_time;
+    uint64_t failover_epoch; // failover的信息版本epoch
+    int failover_state; // failover过程状态 #ref(SENTINEL_FAILOVER_STATE_XXX)
+    mstime_t failover_state_change_time; // failover过程状态上次变化的时间
     mstime_t failover_start_time;   /* Last failover attempt start time. */
     mstime_t failover_timeout;      /* Max time to refresh failover state. */
     mstime_t failover_delay_logged; /* For what failover_start_time value we
@@ -95,6 +91,14 @@ typedef struct sentinelRedisInstance {
     char *client_reconfig_script;
     sds info; /* cached INFO output */
 } sentinelRedisInstance;
+
+#define SENTINEL_FAILOVER_STATE_NONE 0  /* No failover in progress. */
+#define SENTINEL_FAILOVER_STATE_WAIT_START 1  /* Wait for failover_start_time*/
+#define SENTINEL_FAILOVER_STATE_SELECT_SLAVE 2 /* Select slave to promote */
+#define SENTINEL_FAILOVER_STATE_SEND_SLAVEOF_NOONE 3 /* Slave -> Master */
+#define SENTINEL_FAILOVER_STATE_WAIT_PROMOTION 4 /* Wait slave to change role */
+#define SENTINEL_FAILOVER_STATE_RECONF_SLAVES 5 /* SLAVEOF newmaster */
+#define SENTINEL_FAILOVER_STATE_UPDATE_CONFIG 6 /* Monitor promoted slave. */
 ```
 
 
@@ -393,27 +397,23 @@ void sentinelInfoReplyCallback(redisAsyncContext *c, void *reply, void *privdata
         sentinelRefreshInstanceInfo(ri,r->str);
 }
 
-// sentinel收到发送的info命令的回应处理
+// sentinel收到info命令的结果的处理
 void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
     sds *lines;
     int numlines, j;
     int role = 0;
 
-    /* cache full INFO output for instance */
+    // 清空原来的数据,全量更新目标sentinel信息
     sdsfree(ri->info);
     ri->info = sdsnew(info);
 
-    /* The following fields must be reset to a given value in the case they
-     * are not found at all in the INFO output. */
-    ri->master_link_down_time = 0;
-
-    /* Process line by line. */
+    // 一行行解析字符串,将目标服务器的信息存好
     lines = sdssplitlen(info,strlen(info),"\r\n",2,&numlines);
     for (j = 0; j < numlines; j++) {
         sentinelRedisInstance *slave;
         sds l = lines[j];
 
-        /* run_id:<40 hex chars>*/
+        // 更新实例id
         if (sdslen(l) >= 47 && !memcmp(l,"run_id:",7)) {
             if (ri->runid == NULL) {
                 ri->runid = sdsnewlen(l+7,40);
@@ -426,97 +426,74 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
             }
         }
 
-        /* old versions: slave0:<ip>,<port>,<state>
-         * new versions: slave0:ip=127.0.0.1,port=9999,... */
+        // 当前实例时master时,更新他传过来的slave信息
         if ((ri->flags & SRI_MASTER) &&
             sdslen(l) >= 7 &&
             !memcmp(l,"slave",5) && isdigit(l[5]))
         {
-            char *ip, *port, *end;
-
-            if (strstr(l,"ip=") == NULL) {
-                /* Old format. */
-                ip = strchr(l,':'); if (!ip) continue;
-                ip++; /* Now ip points to start of ip address. */
-                port = strchr(ip,','); if (!port) continue;
-                *port = '\0'; /* nul term for easy access. */
-                port++; /* Now port points to start of port number. */
-                end = strchr(port,','); if (!end) continue;
-                *end = '\0'; /* nul term for easy access. */
-            } else {
-                /* New format. */
-                ip = strstr(l,"ip="); if (!ip) continue;
-                ip += 3; /* Now ip points to start of ip address. */
-                port = strstr(l,"port="); if (!port) continue;
-                port += 5; /* Now port points to start of port number. */
-                /* Nul term both fields for easy access. */
-                end = strchr(ip,','); if (end) *end = '\0';
-                end = strchr(port,','); if (end) *end = '\0';
-            }
-
-            /* Check if we already have this slave into our table,
-             * otherwise add it. */
+            // ...
+            // 更新当前master的slave信息
+            // ...
+            // 如果一个slave在本地没有信息,则新建个instance保存这个新slave的信息
             if (sentinelRedisInstanceLookupSlave(ri,ip,atoi(port)) == NULL) {
                 if ((slave = createSentinelRedisInstance(NULL,SRI_SLAVE,ip,
                             atoi(port), ri->quorum, ri)) != NULL)
                 {
+                    // todo
                     sentinelEvent(LL_NOTICE,"+slave",slave,"%@");
                     sentinelFlushConfig();
                 }
             }
         }
 
-        /* master_link_down_since_seconds:<seconds> */
+        // 这个消息只有slave会带,表示该slave与“ta”的master断连的时间
         if (sdslen(l) >= 32 &&
             !memcmp(l,"master_link_down_since_seconds",30))
         {
             ri->master_link_down_time = strtoll(l+31,NULL,10)*1000;
         }
 
-        /* role:<role> */
+        // 该实例的角色(master or slave)
         if (sdslen(l) >= 11 && !memcmp(l,"role:master",11)) role = SRI_MASTER;
         else if (sdslen(l) >= 10 && !memcmp(l,"role:slave",10)) role = SRI_SLAVE;
 
         if (role == SRI_SLAVE) {
-            /* master_host:<host> */
+            // 实例时slave时更新ta的master信息
             if (sdslen(l) >= 12 && !memcmp(l,"master_host:",12)) {
                 if (ri->slave_master_host == NULL ||
                     strcasecmp(l+12,ri->slave_master_host))
                 {
                     sdsfree(ri->slave_master_host);
-                    ri->slave_master_host = sdsnew(l+12);
+                    ri->slave_master_host = sdsnew(l+12); //更新host信息
                     ri->slave_conf_change_time = mstime();
                 }
             }
 
-            /* master_port:<port> */
             if (sdslen(l) >= 12 && !memcmp(l,"master_port:",12)) {
                 int slave_master_port = atoi(l+12);
 
                 if (ri->slave_master_port != slave_master_port) {
-                    ri->slave_master_port = slave_master_port;
+                    ri->slave_master_port = slave_master_port; // 更新port信息
                     ri->slave_conf_change_time = mstime();
                 }
             }
 
             /* master_link_status:<status> */
-            if (sdslen(l) >= 19 && !memcmp(l,"master_link_status:",19)) {
+            if (sdslen(l) >= 19 && !memcmp(l,"master_link_status:",19)) { // 更新与master的连接状态是信息
                 ri->slave_master_link_status =
                     (strcasecmp(l+19,"up") == 0) ?
                     SENTINEL_MASTER_LINK_STATUS_UP :
                     SENTINEL_MASTER_LINK_STATUS_DOWN;
             }
 
-            /* slave_priority:<priority> */
             if (sdslen(l) >= 15 && !memcmp(l,"slave_priority:",15))
-                ri->slave_priority = atoi(l+15);
+                ri->slave_priority = atoi(l+15); // TODO 这个priority的作用
 
-            /* slave_repl_offset:<offset> */
             if (sdslen(l) >= 18 && !memcmp(l,"slave_repl_offset:",18))
-                ri->slave_repl_offset = strtoull(l+18,NULL,10);
+                ri->slave_repl_offset = strtoull(l+18,NULL,10); //更新repl_offset
         }
     }
-    ri->info_refresh = mstime();
+    ri->info_refresh = mstime(); //更新信息时间
     sdsfreesplitres(lines,numlines);
 
     /* ---------------------------- Acting half -----------------------------
@@ -528,8 +505,7 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
         ri->role_reported_time = mstime();
         ri->role_reported = role;
         if (role == SRI_SLAVE) ri->slave_conf_change_time = mstime();
-        /* Log the event with +role-change if the new role is coherent or
-         * with -role-change if there is a mismatch with the current config. */
+        // 如果实例宣称的角色与ta上次宣称的角色不同时,不要引起重视,发送sentinelEvent // TODO
         sentinelEvent(LL_VERBOSE,
             ((ri->flags & (SRI_MASTER|SRI_SLAVE)) == role) ?
             "+role-change" : "-role-change",
@@ -538,48 +514,38 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
             ri->flags & SRI_MASTER ? "master" : "slave");
     }
 
-    /* None of the following conditions are processed when in tilt mode, so
-     * return asap. */
+    // 当处在tilt(系统现在不是很正常)模式时,返回
     if (sentinel.tilt) return;
 
-    /* Handle master -> slave role switch. */
-    if ((ri->flags & SRI_MASTER) && role == SRI_SLAVE) {
-        /* Nothing to do, but masters claiming to be slaves are
-         * considered to be unreachable by Sentinel, so eventually
-         * a failover will be triggered. */
-    }
-
-    /* Handle slave -> master role switch. */
+    // 当一个slave变成了master时
     if ((ri->flags & SRI_SLAVE) && role == SRI_MASTER) {
-        /* If this is a promoted slave we can change state to the
-         * failover state machine. */
+        // 正常的slave 提升 为master 流程(各种信息已经知道了)
         if ((ri->flags & SRI_PROMOTED) &&
             (ri->master->flags & SRI_FAILOVER_IN_PROGRESS) &&
             (ri->master->failover_state ==
                 SENTINEL_FAILOVER_STATE_WAIT_PROMOTION))
         {
-            /* Now that we are sure the slave was reconfigured as a master
-             * set the master configuration epoch to the epoch we won the
-             * election to perform this failover. This will force the other
-             * Sentinels to update their config (assuming there is not
-             * a newer one already available). */
+            // 更新原master的信息
             ri->master->config_epoch = ri->master->failover_epoch;
             ri->master->failover_state = SENTINEL_FAILOVER_STATE_RECONF_SLAVES;
             ri->master->failover_state_change_time = mstime();
             sentinelFlushConfig();
+            // 发布slave被提升的消息
             sentinelEvent(LL_WARNING,"+promoted-slave",ri,"%@");
+
+            // simfailure todo??
             if (sentinel.simfailure_flags &
                 SENTINEL_SIMFAILURE_CRASH_AFTER_PROMOTION)
                 sentinelSimFailureCrash();
+            // todo
             sentinelEvent(LL_WARNING,"+failover-state-reconf-slaves",
                 ri->master,"%@");
             sentinelCallClientReconfScript(ri->master,SENTINEL_LEADER,
                 "start",ri->master->addr,ri->addr);
             sentinelForceHelloUpdateForMaster(ri->master);
         } else {
-            /* A slave turned into a master. We want to force our view and
-             * reconfigure as slave. Wait some time after the change before
-             * going forward, to receive new configs if any. */
+            // 还存在一些疑点的情况,比如对原master的情况不太确定,需要确认状态,解决疑惑
+            // TODO ??
             mstime_t wait_time = SENTINEL_PUBLISH_PERIOD*4;
 
             if (!(ri->flags & SRI_PROMOTED) &&
@@ -596,7 +562,7 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
         }
     }
 
-    /* Handle slaves replicating to a different master address. */
+    // 当一个slave实例宣称的master变化时
     if ((ri->flags & SRI_SLAVE) &&
         role == SRI_SLAVE &&
         (ri->slave_master_port != ri->master->addr->port ||
@@ -610,6 +576,7 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
             sentinelRedisInstanceNoDownFor(ri,wait_time) &&
             mstime() - ri->slave_conf_change_time > wait_time)
         {
+            // todo ?? 为什么发送的slaveof 的目标master依然是原master的信息
             int retval = sentinelSendSlaveOf(ri,
                     ri->master->addr->ip,
                     ri->master->addr->port);
@@ -620,6 +587,7 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
 
     /* Detect if the slave that is in the process of being reconfigured
      * changed state. */
+     // TODO ??
     if ((ri->flags & SRI_SLAVE) && role == SRI_SLAVE &&
         (ri->flags & (SRI_RECONF_SENT|SRI_RECONF_INPROG)))
     {
@@ -650,7 +618,7 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
 ```c
 // ping目标机器
 int sentinelSendPing(sentinelRedisInstance *ri) {
-    // ping 和 pong 也是异步的,发送ping后,设置回调,sentinelPingReplyCallback,等待pong todo
+    // ping 和 pong 也是异步的,发送ping后,设置回调,sentinelPingReplyCallback,等待pong #ref(sentinelPingReplyCallback)
     int retval = redisAsyncCommand(ri->link->cc,
         sentinelPingReplyCallback, ri, "%s",
         sentinelInstanceMapCommand(ri,"PING"));
@@ -665,7 +633,33 @@ int sentinelSendPing(sentinelRedisInstance *ri) {
         return 0;
     }
 }
-// todo 目标机器收到ping后的反应
+// 收到pong回应更新一些时间信息
+void sentinelPingReplyCallback(redisAsyncContext *c, void *reply, void *privdata) {
+    sentinelRedisInstance *ri = privdata;
+    instanceLink *link = c->data;
+    redisReply *r;
+
+    if (!reply || !link) return;
+    link->pending_commands--;
+    r = reply;
+
+    if (r->type == REDIS_REPLY_STATUS ||
+        r->type == REDIS_REPLY_ERROR) {
+        if (strncmp(r->str,"PONG",4) == 0 ||
+            strncmp(r->str,"LOADING",7) == 0 ||
+            strncmp(r->str,"MASTERDOWN",10) == 0)
+        {
+            link->last_avail_time = mstime();
+            link->act_ping_time = 0; /* Flag the pong as received. */
+        } else {
+            //...
+        }
+    }
+    link->last_pong_time = mstime();
+}
+```
+```c
+// hello
 ```
 
 
