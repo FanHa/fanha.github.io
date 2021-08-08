@@ -34,10 +34,8 @@ typedef struct sentinelRedisInstance {
     uint64_t config_epoch;  // 信息版本epoch
     sentinelAddr *addr; /* Master host. */
     instanceLink *link; /* Link to the instance, may be shared for Sentinels. */
-    mstime_t last_pub_time;   /* Last time we sent hello via Pub/Sub. */
-    mstime_t last_hello_time; /* Only used if SRI_SENTINEL is set. Last time
-                                 we received a hello from this Sentinel
-                                 via Pub/Sub. */
+    mstime_t last_pub_time;   // 上一次我们向这个实力发送publish(hello)消息的时间
+    mstime_t last_hello_time; // 如果这个实例是个sentinel,这个字段保存的就是上次收到这个sentinel实例发hello信息的时间
     mstime_t last_master_down_reply_time; /* Time of last reply to
                                              SENTINEL is-master-down command. */
     mstime_t s_down_since_time; /* Subjectively down since time. */
@@ -54,8 +52,8 @@ typedef struct sentinelRedisInstance {
     mstime_t slave_conf_change_time; // slave上次更新master信息的时间
 
     /* Master specific. */
-    dict *sentinels;    /* Other sentinels monitoring the same master. */
-    dict *slaves;       /* Slaves for this master instance. */
+    dict *sentinels;    // 监控了这台master的sentinel们
+    dict *slaves;       // 这台master的slave们
     unsigned int quorum;/* Number of sentinels that need to agree on failure. */
     int parallel_syncs; /* How many slaves to reconfigure at same time. */
     char *auth_pass;    /* Password to use for AUTH against master & replica. */
@@ -65,7 +63,7 @@ typedef struct sentinelRedisInstance {
     mstime_t master_link_down_time; // 该slave报告的ta与ta的master断连的时间
     int slave_priority; // todo
     mstime_t slave_reconf_sent_time; /* Time at which we sent SLAVE OF <new> */
-    struct sentinelRedisInstance *master; /* Master instance if it's slave. */
+    struct sentinelRedisInstance *master; // master实例信息
     char *slave_master_host;    // 该slave报告的ta的host
     int slave_master_port;      // port
     int slave_master_link_status; // 与master的连接状态
@@ -240,10 +238,10 @@ void sentinelHandleDictOfRedisInstances(dict *instances) {
 }
 
 void sentinelHandleRedisInstance(sentinelRedisInstance *ri) {
-    // 取得与服务实体的连接 #ref(sentinelReconnectInstance) todo
+    // 取得与服务实体的连接 #ref(sentinelReconnectInstance)
     sentinelReconnectInstance(ri);
 
-    // 发送周期性的问候信息来掌握服务(包括redis-server.master,redis-server.slave,其他sentinel)的信息 #ref(sentinelSendPeriodicCommands) todo
+    // 发送周期性的问候信息来掌握服务(包括redis-server.master,redis-server.slave,其他sentinel)的信息 #ref(sentinelSendPeriodicCommands)
     sentinelSendPeriodicCommands(ri);
 
     // 确认该服务是否已经Down(主观) #ref(sentinelCheckSubjectivelyDown) todo
@@ -311,13 +309,13 @@ void sentinelSendPeriodicCommands(sentinelRedisInstance *ri) {
         if (retval == C_OK) ri->link->pending_commands++; //统计还未得到回应的命令+1
     }
 
-    // 每种类型的实例都需要周期ping todo
+    // 每种类型的实例都需要周期ping
     if ((now - ri->link->last_pong_time) > ping_period &&
                (now - ri->link->last_ping_time) > ping_period/2) {
         sentinelSendPing(ri);
     }
 
-    // todo??
+    // 周期性的publish hello信息
     if ((now - ri->last_pub_time) > SENTINEL_PUBLISH_PERIOD) {
         sentinelSendHello(ri);
     }
@@ -659,8 +657,231 @@ void sentinelPingReplyCallback(redisAsyncContext *c, void *reply, void *privdata
 }
 ```
 ```c
-// hello
+// 向实例发送异步`Publish`消息
+int sentinelSendHello(sentinelRedisInstance *ri) {
+    char ip[NET_IP_STR_LEN];
+    char payload[NET_IP_STR_LEN+1024];
+    int retval;
+    char *announce_ip;
+    int announce_port;
+    // 通过已知信息找到这个实例的master信息
+    sentinelRedisInstance *master = (ri->flags & SRI_MASTER) ? ri : ri->master;
+    sentinelAddr *master_addr = sentinelGetCurrentMasterAddress(master);
+
+    if (ri->link->disconnected) return C_ERR;
+
+    // 准备当前sentinel自己的信息
+    if (sentinel.announce_ip) {
+        announce_ip = sentinel.announce_ip;
+    } else {
+        if (anetSockName(ri->link->cc->c.fd,ip,sizeof(ip),NULL) == -1)
+            return C_ERR;
+        announce_ip = ip;
+    }
+    if (sentinel.announce_port) announce_port = sentinel.announce_port;
+    else if (server.tls_replication && server.tls_port) announce_port = server.tls_port;
+    else announce_port = server.port;
+
+    // 向目标实例发送异步的publish消息,并设置回调 #ref(sentinelPublishReplyCallback)
+    snprintf(payload,sizeof(payload),
+        "%s,%d,%s,%llu," /* Info about this sentinel. */
+        "%s,%s,%d,%llu", /* Info about current master. */
+        announce_ip, announce_port, sentinel.myid,
+        (unsigned long long) sentinel.current_epoch,
+        /* --- */
+        master->name,master_addr->ip,master_addr->port,
+        (unsigned long long) master->config_epoch);
+    retval = redisAsyncCommand(ri->link->cc,
+        sentinelPublishReplyCallback, ri, "%s %s %s",
+        sentinelInstanceMapCommand(ri,"PUBLISH"),
+        SENTINEL_HELLO_CHANNEL,payload); // SENTINEL_HELLO_CHANNEL是一个内定的Hello channel, payload就是前面组装好的master信息和sentinel信息
+    if (retval != C_OK) return C_ERR;
+    ri->link->pending_commands++;
+    return C_OK;
+}
+
+// 实例收到`Publish`消息的处理
+void sentinelPublishCommand(client *c) {
+    // 处理消息
+    sentinelProcessHelloMessage(c->argv[2]->ptr,sdslen(c->argv[2]->ptr));
+    // 回复
+    addReplyLongLong(c,1);
+}
+void sentinelProcessHelloMessage(char *hello, int hello_len) {
+    /* Format is composed of 8 tokens:
+     * 0=ip,1=port,2=runid,3=current_epoch,4=master_name,
+     * 5=master_ip,6=master_port,7=master_config_epoch. */
+    int numtokens, port, removed, master_port;
+    uint64_t current_epoch, master_config_epoch;
+    char **token = sdssplitlen(hello, hello_len, ",", 1, &numtokens);
+    sentinelRedisInstance *si, *master;
+
+    if (numtokens == 8) {
+        master = sentinelGetMasterByName(token[4]);
+        if (!master) goto cleanup; /* Unknown master, skip the message. */
+
+        // 根据发来的信息找到‘我’是否曾有这个sentinel实例的信息
+        port = atoi(token[1]);
+        master_port = atoi(token[6]);
+        si = getSentinelRedisInstanceByAddrAndRunID(
+                        master->sentinels,token[0],port,token[2]);
+        current_epoch = strtoull(token[3],NULL,10); // 发信息的sentinel的epoch版本
+        master_config_epoch = strtoull(token[7],NULL,10); // 发信息告诉‘我’,我的master是谁谁谁,这条信息的epoch版本
+
+        if (!si) {
+            // 本地找不到这个ip这个id的sentinel信息时,需要清空这个id的以往信息 TODO
+            removed = removeMatchingSentinelFromMaster(master,token[2]);
+            if (removed) {
+                // TODO,即时传播这个变动
+                sentinelEvent(LL_NOTICE,"+sentinel-address-switch",master,
+                    "%@ ip %s port %d for %s", token[0],port,token[2]);
+            } else {
+                /* Check if there is another Sentinel with the same address this
+                 * new one is reporting. What we do if this happens is to set its
+                 * port to 0, to signal the address is invalid. We'll update it
+                 * later if we get an HELLO message. */
+                sentinelRedisInstance *other =
+                    getSentinelRedisInstanceByAddrAndRunID(
+                        master->sentinels, token[0],port,NULL);
+                if (other) {
+                    sentinelEvent(LL_NOTICE,"+sentinel-invalid-addr",other,"%@");
+                    other->addr->port = 0; /* It means: invalid address. */
+                    sentinelUpdateSentinelAddressInAllMasters(other);
+                }
+            }
+
+            // 根据信息创建一个新的sentinel信息结构
+            si = createSentinelRedisInstance(token[2],SRI_SENTINEL,
+                            token[0],port,master->quorum,master);
+
+            if (si) {
+                if (!removed) sentinelEvent(LL_NOTICE,"+sentinel",si,"%@");
+                /* The runid is NULL after a new instance creation and
+                 * for Sentinels we don't have a later chance to fill it,
+                 * so do it now. */
+                si->runid = sdsnew(token[2]);
+                sentinelTryConnectionSharing(si);
+                if (removed) sentinelUpdateSentinelAddressInAllMasters(si);
+                sentinelFlushConfig();
+            }
+        }
+
+        // 如果发信息过来的sentinel 的epoch 大于我本地已知该sentinel信息的epoch,需要更新信息和epoch数值
+        if (current_epoch > sentinel.current_epoch) {
+            sentinel.current_epoch = current_epoch;
+            sentinelFlushConfig();
+            // todo sentinelEvent
+            sentinelEvent(LL_WARNING,"+new-epoch",master,"%llu",
+                (unsigned long long) sentinel.current_epoch);
+        }
+
+        // 如果发过来的master_config_epoch 大于 我本地知道的这个master 的 config_epoch,更新关于这个master的信息
+        if (si && master->config_epoch < master_config_epoch) {
+            master->config_epoch = master_config_epoch;
+            if (master_port != master->addr->port ||
+                strcmp(master->addr->ip, token[5]))
+            {
+                sentinelAddr *old_addr;
+
+                sentinelEvent(LL_WARNING,"+config-update-from",si,"%@");
+                sentinelEvent(LL_WARNING,"+switch-master",
+                    master,"%s %s %d %s %d",
+                    master->name,
+                    master->addr->ip, master->addr->port,
+                    token[5], master_port);
+
+                old_addr = dupSentinelAddr(master->addr);
+                sentinelResetMasterAndChangeAddress(master, token[5], master_port);
+                sentinelCallClientReconfScript(master,
+                    SENTINEL_OBSERVER,"start",
+                    old_addr,master->addr);
+                releaseSentinelAddr(old_addr);
+            }
+        }
+
+        // 更新sentinel的hello统计时间信息
+        if (si) si->last_hello_time = mstime();
+    }
+
+cleanup:
+    sdsfreesplitres(token,numtokens);
+}
+
+// sentinelPublishReplyCallback publish消息的回调
+void sentinelPublishReplyCallback(redisAsyncContext *c, void *reply, void *privdata) {
+    sentinelRedisInstance *ri = privdata;
+    instanceLink *link = c->data;
+    redisReply *r;
+
+    if (!reply || !link) return;
+    link->pending_commands--;
+    r = reply;
+    // 更新pub时间信息
+    if (r->type != REDIS_REPLY_ERROR)
+        ri->last_pub_time = mstime();
+}
 ```
+### 
+```c
+void sentinelEvent(int level, char *type, sentinelRedisInstance *ri,
+                   const char *fmt, ...) {
+    va_list ap;
+    char msg[LOG_MAX_LEN];
+    robj *channel, *payload;
+
+    /* Handle %@ */
+    if (fmt[0] == '%' && fmt[1] == '@') {
+        sentinelRedisInstance *master = (ri->flags & SRI_MASTER) ?
+                                         NULL : ri->master;
+
+        if (master) {
+            snprintf(msg, sizeof(msg), "%s %s %s %d @ %s %s %d",
+                sentinelRedisInstanceTypeStr(ri),
+                ri->name, ri->addr->ip, ri->addr->port,
+                master->name, master->addr->ip, master->addr->port);
+        } else {
+            snprintf(msg, sizeof(msg), "%s %s %s %d",
+                sentinelRedisInstanceTypeStr(ri),
+                ri->name, ri->addr->ip, ri->addr->port);
+        }
+        fmt += 2;
+    } else {
+        msg[0] = '\0';
+    }
+
+    /* Use vsprintf for the rest of the formatting if any. */
+    if (fmt[0] != '\0') {
+        va_start(ap, fmt);
+        vsnprintf(msg+strlen(msg), sizeof(msg)-strlen(msg), fmt, ap);
+        va_end(ap);
+    }
+
+    /* Log the message if the log level allows it to be logged. */
+    if (level >= server.verbosity)
+        serverLog(level,"%s %s",type,msg);
+
+    /* Publish the message via Pub/Sub if it's not a debugging one. */
+    if (level != LL_DEBUG) {
+        channel = createStringObject(type,strlen(type));
+        payload = createStringObject(msg,strlen(msg));
+        pubsubPublishMessage(channel,payload);
+        decrRefCount(channel);
+        decrRefCount(payload);
+    }
+
+    /* Call the notification script if applicable. */
+    if (level == LL_WARNING && ri != NULL) {
+        sentinelRedisInstance *master = (ri->flags & SRI_MASTER) ?
+                                         ri : ri->master;
+        if (master && master->notification_script) {
+            sentinelScheduleScriptExecution(master->notification_script,
+                type,msg,NULL);
+        }
+    }
+}
+
+```
+
 
 
 ### failover 机制
