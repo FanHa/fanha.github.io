@@ -90,6 +90,7 @@ typedef struct sentinelRedisInstance {
     sds info; /* cached INFO output */
 } sentinelRedisInstance;
 
+// sentinel整体状态
 #define SENTINEL_FAILOVER_STATE_NONE 0  /* No failover in progress. */
 #define SENTINEL_FAILOVER_STATE_WAIT_START 1  /* Wait for failover_start_time*/
 #define SENTINEL_FAILOVER_STATE_SELECT_SLAVE 2 /* Select slave to promote */
@@ -119,7 +120,7 @@ int main(int argc, char **argv) {
 }
 ```
 
-### initSentinel
+### initSentinel sentinel本身的初始化
 ```c
 // src/sentinel.c
 void initSentinel(void) {
@@ -155,6 +156,51 @@ void initSentinel(void) {
 
 ```
 
+### sentinel配置文件的初始化
+```c
+// src/config.c
+void loadServerConfigFromString(char *config) {
+    // ...
+
+    for (i = 0; i < totlines; i++) {
+        // ...        
+        else if (!strcasecmp(argv[0],"sentinel")) {
+            if (argc != 1) {
+                // ...
+                // 解析配置文件中与sentinel相关的参数 #ref(sentinelHandleConfiguration)
+                err = sentinelHandleConfiguration(argv+1,argc-1);
+                if (err) goto loaderr;
+            }
+        } 
+    }
+
+    // ...
+}
+
+// src/sentinel.c
+// 解析配置文件中与sentinel相关的参数
+char *sentinelHandleConfiguration(char **argv, int argc) {
+    sentinelRedisInstance *ri;
+
+    if (!strcasecmp(argv[0],"monitor") && argc == 5) {
+        /* monitor <name> <host> <port> <quorum> */
+        int quorum = atoi(argv[4]);
+
+        if (quorum <= 0) return "Quorum must be 1 or greater.";
+        // 根据配置文件的配置创建要监管的redis实例结构(加到了全局变量sentinel.masters中)
+        if (createSentinelRedisInstance(argv[1],SRI_MASTER,argv[2],
+                                        atoi(argv[3]),quorum,NULL) == NULL)
+        {
+            // ...
+        }
+    }
+    // ...
+    return NULL;
+}
+
+```
+
+### 如何告诉监管的redis实例,‘我’正在监管‘你’,‘你’需要订阅我的一些队列消息
 ### sentinel 的 cron
 当程序知道自己是sentinel时,会在这个周期性调度里执行`sentinelTimer`
 ```c
@@ -164,11 +210,9 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     if (server.sentinel_mode) sentinelTimer();
     // ...
 }
-```
 
-### sentinelTimer 需要周期执行的逻辑
-```c
 // sentinel.c
+// 需要周期执行的逻辑
 void sentinelTimer(void) {
     // 判断是否因为时间的不同步而需要进`tilt`模式 #ref(sentinelCheckTiltCondition)
     sentinelCheckTiltCondition();
@@ -266,6 +310,86 @@ void sentinelHandleRedisInstance(sentinelRedisInstance *ri) {
 
 ##### sentinelReconnectInstance 与其他服务进程连接(非阻塞)
 这个主要利用操作系统本身提供的socket非阻塞接口,完成tcp连接,并记录在册,具体就是非阻塞的`socket`,`bind`,`connect`等.
+```c
+// src/sentinel.c
+void sentinelReconnectInstance(sentinelRedisInstance *ri) {
+    if (ri->link->disconnected == 0) return;
+    if (ri->addr->port == 0) return; /* port == 0 means invalid address. */
+    instanceLink *link = ri->link;
+    mstime_t now = mstime();
+
+    if (now - ri->link->last_reconn_time < SENTINEL_PING_PERIOD) return;
+    ri->link->last_reconn_time = now;
+
+    /* Commands connection. */
+    if (link->cc == NULL) {
+        link->cc = redisAsyncConnectBind(ri->addr->ip,ri->addr->port,NET_FIRST_BIND_ADDR);
+        if (!link->cc->err && server.tls_replication &&
+                (instanceLinkNegotiateTLS(link->cc) == C_ERR)) {
+            sentinelEvent(LL_DEBUG,"-cmd-link-reconnection",ri,"%@ #Failed to initialize TLS");
+            instanceLinkCloseConnection(link,link->cc);
+        } else if (link->cc->err) {
+            sentinelEvent(LL_DEBUG,"-cmd-link-reconnection",ri,"%@ #%s",
+                link->cc->errstr);
+            instanceLinkCloseConnection(link,link->cc);
+        } else {
+            link->pending_commands = 0;
+            link->cc_conn_time = mstime();
+            link->cc->data = link;
+            redisAeAttach(server.el,link->cc);
+            redisAsyncSetConnectCallback(link->cc,
+                    sentinelLinkEstablishedCallback);
+            redisAsyncSetDisconnectCallback(link->cc,
+                    sentinelDisconnectCallback);
+            sentinelSendAuthIfNeeded(ri,link->cc);
+            sentinelSetClientName(ri,link->cc,"cmd");
+
+            /* Send a PING ASAP when reconnecting. */
+            sentinelSendPing(ri);
+        }
+    }
+    /* Pub / Sub */
+    if ((ri->flags & (SRI_MASTER|SRI_SLAVE)) && link->pc == NULL) {
+        link->pc = redisAsyncConnectBind(ri->addr->ip,ri->addr->port,NET_FIRST_BIND_ADDR);
+        if (!link->pc->err && server.tls_replication &&
+                (instanceLinkNegotiateTLS(link->pc) == C_ERR)) {
+            sentinelEvent(LL_DEBUG,"-pubsub-link-reconnection",ri,"%@ #Failed to initialize TLS");
+        } else if (link->pc->err) {
+            sentinelEvent(LL_DEBUG,"-pubsub-link-reconnection",ri,"%@ #%s",
+                link->pc->errstr);
+            instanceLinkCloseConnection(link,link->pc);
+        } else {
+            int retval;
+
+            link->pc_conn_time = mstime();
+            link->pc->data = link;
+            redisAeAttach(server.el,link->pc);
+            redisAsyncSetConnectCallback(link->pc,
+                    sentinelLinkEstablishedCallback);
+            redisAsyncSetDisconnectCallback(link->pc,
+                    sentinelDisconnectCallback);
+            sentinelSendAuthIfNeeded(ri,link->pc);
+            sentinelSetClientName(ri,link->pc,"pubsub");
+            /* Now we subscribe to the Sentinels "Hello" channel. */
+            retval = redisAsyncCommand(link->pc,
+                sentinelReceiveHelloMessages, ri, "%s %s",
+                sentinelInstanceMapCommand(ri,"SUBSCRIBE"),
+                SENTINEL_HELLO_CHANNEL);
+            if (retval != C_OK) {
+                /* If we can't subscribe, the Pub/Sub connection is useless
+                 * and we can simply disconnect it and try again. */
+                instanceLinkCloseConnection(link,link->pc);
+                return;
+            }
+        }
+    }
+    /* Clear the disconnected status only if we have both the connections
+     * (or just the commands connection if this is a sentinel instance). */
+    if (link->cc && (ri->flags & SRI_SENTINEL || link->pc))
+        link->disconnected = 0;
+}
+
+```
 
 ##### sentinelSendPeriodicCommands 发送周期性的问候和别的服务进程交换信息
 ```c
@@ -821,15 +945,26 @@ void sentinelPublishReplyCallback(redisAsyncContext *c, void *reply, void *privd
         ri->last_pub_time = mstime();
 }
 ```
-### 
+### sentinelEvent 向所有订阅了自己的服务发送事件消息
 ```c
+// level 参数
+#define LL_DEBUG 0
+#define LL_VERBOSE 1
+#define LL_NOTICE 2
+#define LL_WARNING 3
+#define LL_RAW (1<<10) /* Modifier to log without timestamp */
+
+// type参数是消息类型 
+// ri参数 这个事件是针对哪个服务实例的(target)
+// fmt...参数 具体消息内容
+
 void sentinelEvent(int level, char *type, sentinelRedisInstance *ri,
                    const char *fmt, ...) {
     va_list ap;
     char msg[LOG_MAX_LEN];
     robj *channel, *payload;
 
-    /* Handle %@ */
+    // 具体消息中以 %@ 开头时发布的消息需该target及其master信息
     if (fmt[0] == '%' && fmt[1] == '@') {
         sentinelRedisInstance *master = (ri->flags & SRI_MASTER) ?
                                          NULL : ri->master;
@@ -849,27 +984,24 @@ void sentinelEvent(int level, char *type, sentinelRedisInstance *ri,
         msg[0] = '\0';
     }
 
-    /* Use vsprintf for the rest of the formatting if any. */
+    // 消息格式化
     if (fmt[0] != '\0') {
         va_start(ap, fmt);
         vsnprintf(msg+strlen(msg), sizeof(msg)-strlen(msg), fmt, ap);
         va_end(ap);
     }
 
-    /* Log the message if the log level allows it to be logged. */
-    if (level >= server.verbosity)
-        serverLog(level,"%s %s",type,msg);
-
-    /* Publish the message via Pub/Sub if it's not a debugging one. */
+    // 发布消息到参数指定的channel
     if (level != LL_DEBUG) {
         channel = createStringObject(type,strlen(type));
         payload = createStringObject(msg,strlen(msg));
+        // todo 
         pubsubPublishMessage(channel,payload);
         decrRefCount(channel);
         decrRefCount(payload);
     }
 
-    /* Call the notification script if applicable. */
+    // todo
     if (level == LL_WARNING && ri != NULL) {
         sentinelRedisInstance *master = (ri->flags & SRI_MASTER) ?
                                          ri : ri->master;
@@ -882,6 +1014,9 @@ void sentinelEvent(int level, char *type, sentinelRedisInstance *ri,
 
 ```
 
+### 订阅sentinel事件消息
+
+### sentinel事件消息处理
 
 
 ### failover 机制
