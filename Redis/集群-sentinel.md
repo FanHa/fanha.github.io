@@ -26,7 +26,7 @@ struct sentinelState {
     int deny_scripts_reconfig;// todo
 } sentinel;
 
-// “我”所监管的redis实例结构
+// “我”所知道的redis实例结构
 typedef struct sentinelRedisInstance {
     int flags;      // redis实例的类型和状态(master,sentinel,slave,oshotdown等等)
     char *name;     // 实例名
@@ -188,6 +188,8 @@ char *sentinelHandleConfiguration(char **argv, int argc) {
 
         if (quorum <= 0) return "Quorum must be 1 or greater.";
         // 根据配置文件的配置创建要监管的redis实例结构(加到了全局变量sentinel.masters中)
+        // 并不是所有的服务器实例都是走配置流程加入到监管表中,大部分还是通过向目标实例发送‘info’命令,目标返回‘ta‘所知道的信息
+        // 或是订阅目标实例的信息通道,目标实例会在有新消息时通过通道把信息传达给sentinel
         if (createSentinelRedisInstance(argv[1],SRI_MASTER,argv[2],
                                         atoi(argv[3]),quorum,NULL) == NULL)
         {
@@ -200,9 +202,18 @@ char *sentinelHandleConfiguration(char **argv, int argc) {
 
 ```
 
-### 如何告诉监管的redis实例,‘我’正在监管‘你’,‘你’需要订阅我的一些队列消息
-### sentinel 的 cron
-当程序知道自己是sentinel时,会在这个周期性调度里执行`sentinelTimer`
+
+### sentinel 通过周期性cron和其他实例交换信息
+当程序知道自己是sentinel时,会在这个周期性调度里执行`sentinelTimer`,通过cron分批获取了整个集群的信息
+- `sentinel1`与配置好的`redis实例1`建立连接,并订阅`hello`通道;
+- 此时`sentinel1` 与 配置好的`redis实例1`知道对方存在;
+- `sentinel2` 与同一个`redis实例1`建立连接,同样订阅`hello`通道;
+- 此时`redis实例1` 与 `sentinel2` 互相知道对方存在;
+- sentinel之间的感知有两种方式
+    - `sentinel1` 和 `sentinel2` 会周期性的向`redis实例1` 发送`info`命令,通过返回的`redis实例1`视角的信息感知其他sentinel存在;
+    - `sentinel1`, `sentinel2`与`redis实例1` 建立连接时会通过向`redis实例1`的`publish`命令向`hello`通道发送信息,这样就能通过先前订阅这个通道的回调得到对方的信息;
+- 其他master,slave信息也都是通过`info`命令和`hello`通道得到(只要有一个交集实例,就能通过这个交集实例把信息传播开来)
+
 ```c
 int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     // ...
@@ -214,8 +225,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
 // sentinel.c
 // 需要周期执行的逻辑
 void sentinelTimer(void) {
-    // 判断是否因为时间的不同步而需要进`tilt`模式 #ref(sentinelCheckTiltCondition)
-    sentinelCheckTiltCondition();
+    // ...
     // 与所有已知的master间的交互
     sentinelHandleDictOfRedisInstances(sentinel.masters);
 
@@ -234,22 +244,7 @@ void sentinelTimer(void) {
 }
 
 ```
-#### sentinelCheckTiltCondition 判断是否因为时间同步问题而暂时进入`tilt`模式
-```c
-// src/sentinel.c
-void sentinelCheckTiltCondition(void) {
-    mstime_t now = mstime();
-    mstime_t delta = now - sentinel.previous_time; //算出当前时间与上次执行sentinel周期函数的差值
-
-    // 当差值小于0或者大于某个阈值时,认为不太正常,需要进入tilt模式
-    if (delta < 0 || delta > SENTINEL_TILT_TRIGGER) {
-        sentinel.tilt = 1;
-        sentinel.tilt_start_time = mstime();
-    }
-    sentinel.previous_time = mstime();
-}
-```
-#### sentinelHandleDictOfRedisInstances(sentinel.masters) 处理已知服务实例的交互
+#### sentinelHandleDictOfRedisInstances 处理已知服务实例的交互
 递归与所有已知的`redis-server(master)`服务及该服务已知的`redis-server(slave)`和其他`sentinel`; 
 具体与每个进程(服务)交互的是`sentinelHandleRedisInstance(ri)`
 ```c
@@ -303,13 +298,15 @@ void sentinelHandleRedisInstance(sentinelRedisInstance *ri) {
 }
 ```
 
-+ 整个`sentinelHandleRedisInstance`函数基于`异步非阻塞`机制;
++ `sentinelHandleRedisInstance`函数基于`异步非阻塞`机制;
 + 可以想象整个流程分为若干步骤,执行每个步骤就是把这个步骤要执行的内容丢入redis封装的一层async执行,然后返回;
 + 然后下一次循环执行到同一个地方时判断上一个步骤是否完成.如果没完成,仍然返回,如果已完成,则进行下一个步骤;
 + 这样从看代码的角度,这里时一步一步的执行下来,但在实际运行中,整个`sentinelHandleRedisInstance`可能被调度了很多次,才把整个与服务交换信息并作出决策的逻辑循环走完;
 
-##### sentinelReconnectInstance 与其他服务进程连接(非阻塞)
-这个主要利用操作系统本身提供的socket非阻塞接口,完成tcp连接,并记录在册,具体就是非阻塞的`socket`,`bind`,`connect`等.
+##### sentinelReconnectInstance 与其他服务建立进程连接(非阻塞)
+- 需要建立两个连接,一个用来发送命令,一个用来订阅消息
+    - 命令连接建立:这个主要利用操作系统本身提供的socket非阻塞接口,完成tcp连接,并记录在册,具体就是非阻塞的`socket`,`bind`,`connect`等.
+    - 订阅链接建立:订阅目标机器的一个channel(SENTINEL_HELLO_CHANNEL),设置这个channel有消息时的回调
 ```c
 // src/sentinel.c
 void sentinelReconnectInstance(sentinelRedisInstance *ri) {
@@ -321,35 +318,12 @@ void sentinelReconnectInstance(sentinelRedisInstance *ri) {
     if (now - ri->link->last_reconn_time < SENTINEL_PING_PERIOD) return;
     ri->link->last_reconn_time = now;
 
-    /* Commands connection. */
+    // 发送命令的连接
     if (link->cc == NULL) {
-        link->cc = redisAsyncConnectBind(ri->addr->ip,ri->addr->port,NET_FIRST_BIND_ADDR);
-        if (!link->cc->err && server.tls_replication &&
-                (instanceLinkNegotiateTLS(link->cc) == C_ERR)) {
-            sentinelEvent(LL_DEBUG,"-cmd-link-reconnection",ri,"%@ #Failed to initialize TLS");
-            instanceLinkCloseConnection(link,link->cc);
-        } else if (link->cc->err) {
-            sentinelEvent(LL_DEBUG,"-cmd-link-reconnection",ri,"%@ #%s",
-                link->cc->errstr);
-            instanceLinkCloseConnection(link,link->cc);
-        } else {
-            link->pending_commands = 0;
-            link->cc_conn_time = mstime();
-            link->cc->data = link;
-            redisAeAttach(server.el,link->cc);
-            redisAsyncSetConnectCallback(link->cc,
-                    sentinelLinkEstablishedCallback);
-            redisAsyncSetDisconnectCallback(link->cc,
-                    sentinelDisconnectCallback);
-            sentinelSendAuthIfNeeded(ri,link->cc);
-            sentinelSetClientName(ri,link->cc,"cmd");
-
-            /* Send a PING ASAP when reconnecting. */
-            sentinelSendPing(ri);
-        }
+        // 普通的用来发送命令的连接(ping,info啥的)
     }
-    /* Pub / Sub */
-    if ((ri->flags & (SRI_MASTER|SRI_SLAVE)) && link->pc == NULL) {
+    // 订阅channel的连接
+    if ((ri->flags & (SRI_MASTER|SRI_SLAVE)) && link->pc == NULL) { //只需要订阅master和slave的消息,sentinel的信息是通过master和slave间接知道的
         link->pc = redisAsyncConnectBind(ri->addr->ip,ri->addr->port,NET_FIRST_BIND_ADDR);
         if (!link->pc->err && server.tls_replication &&
                 (instanceLinkNegotiateTLS(link->pc) == C_ERR)) {
@@ -360,33 +334,15 @@ void sentinelReconnectInstance(sentinelRedisInstance *ri) {
             instanceLinkCloseConnection(link,link->pc);
         } else {
             int retval;
-
-            link->pc_conn_time = mstime();
-            link->pc->data = link;
-            redisAeAttach(server.el,link->pc);
-            redisAsyncSetConnectCallback(link->pc,
-                    sentinelLinkEstablishedCallback);
-            redisAsyncSetDisconnectCallback(link->pc,
-                    sentinelDisconnectCallback);
-            sentinelSendAuthIfNeeded(ri,link->pc);
-            sentinelSetClientName(ri,link->pc,"pubsub");
-            /* Now we subscribe to the Sentinels "Hello" channel. */
+            // ...
+            // 订阅SENTINEL_HELLO_CHANNEL的消息,并设置回调 #ref(`sentinelReceiveHelloMessages`),后续别的机器通过目标实例发布的消息,可以通过此channel收到并触发回调
             retval = redisAsyncCommand(link->pc,
                 sentinelReceiveHelloMessages, ri, "%s %s",
                 sentinelInstanceMapCommand(ri,"SUBSCRIBE"),
                 SENTINEL_HELLO_CHANNEL);
-            if (retval != C_OK) {
-                /* If we can't subscribe, the Pub/Sub connection is useless
-                 * and we can simply disconnect it and try again. */
-                instanceLinkCloseConnection(link,link->pc);
-                return;
-            }
+            // ...
         }
     }
-    /* Clear the disconnected status only if we have both the connections
-     * (or just the commands connection if this is a sentinel instance). */
-    if (link->cc && (ri->flags & SRI_SENTINEL || link->pc))
-        link->disconnected = 0;
 }
 
 ```
@@ -420,12 +376,13 @@ void sentinelSendPeriodicCommands(sentinelRedisInstance *ri) {
     ping_period = ri->down_after_period;
     if (ping_period > SENTINEL_PING_PERIOD) ping_period = SENTINEL_PING_PERIOD;
 
-    // sentinel之间不需要直接交换信息(通过对其他redis节点的某个通道的订阅来得到其他sentinel节点的信息)
+    // sentinel之间不需要直接交换信息(通过对其他redis实例发送‘info’命令可以返回该redis实例已知的其他实例节点的信息,包括sentinel,master,slave)
     if ((ri->flags & SRI_SENTINEL) == 0 &&
         (ri->info_refresh == 0 ||
         (now - ri->info_refresh) > info_period))
     {
         // 向一般redis节点(master,slave)发送 `info`命令,并设置回调sentinelInfoReplyCallback来获取目标机器的信息(异步命令)
+        // 目标机器会返回它已知的sentinel,master,slave的信息,‘我’就可以利用这些信息更新自己的集群信息表了
         // #ref(sentinelInfoReplyCallback)
         retval = redisAsyncCommand(ri->link->cc,
             sentinelInfoReplyCallback, ri, "%s",
@@ -446,13 +403,6 @@ void sentinelSendPeriodicCommands(sentinelRedisInstance *ri) {
 }
 ```
 ```c
-// 发送info命令
-        // ...
-        retval = redisAsyncCommand(ri->link->cc,
-            sentinelInfoReplyCallback, ri, "%s",
-            sentinelInstanceMapCommand(ri,"INFO"));
-        // ...
-
 // 目标机器收到info命令的处理
 void sentinelInfoCommand(client *c) {
     int sections = 0;
@@ -1014,10 +964,28 @@ void sentinelEvent(int level, char *type, sentinelRedisInstance *ri,
 
 ```
 
-### 订阅sentinel事件消息
 
-### sentinel事件消息处理
 
+### `tilt`模式
+```c
+// src/sentinel.c
+void sentinelTimer(void) {
+    // 判断是否因为时间的不同步而需要进`tilt`模式 #ref(sentinelCheckTiltCondition)
+    sentinelCheckTiltCondition();
+    // ...
+}
+void sentinelCheckTiltCondition(void) {
+    mstime_t now = mstime();
+    mstime_t delta = now - sentinel.previous_time; //算出当前时间与上次执行sentinel周期函数的差值
+
+    // 当差值小于0或者大于某个阈值时,认为不太正常,需要进入tilt模式
+    if (delta < 0 || delta > SENTINEL_TILT_TRIGGER) {
+        sentinel.tilt = 1;
+        sentinel.tilt_start_time = mstime();
+    }
+    sentinel.previous_time = mstime();
+}
+```
 
 ### failover 机制
 + sentinel群独立于redis服务进程群(包括master和slave)运行,通过周期性的与各个服务进程交换信息来获取每个服务进程的健康状态;
