@@ -101,7 +101,7 @@ typedef struct sentinelRedisInstance {
 ```
 
 
-## 初始化
+## 初始化 与 实例间的信息交互
 Redis sentinel 和 普通的redis程序共用一套代码(事件循环,事件处理逻辑,存储结果等),程序通过参数辨别自己是`redis`还是`sentinel`;  
 ```c
 // server.c
@@ -297,15 +297,7 @@ void sentinelHandleRedisInstance(sentinelRedisInstance *ri) {
 ```c
 // src/sentinel.c
 void sentinelReconnectInstance(sentinelRedisInstance *ri) {
-    if (ri->link->disconnected == 0) return;
-    if (ri->addr->port == 0) return; /* port == 0 means invalid address. */
-    instanceLink *link = ri->link;
-    mstime_t now = mstime();
-
-    if (now - ri->link->last_reconn_time < SENTINEL_PING_PERIOD) return;
-    ri->link->last_reconn_time = now;
-
-    // 发送命令的连接
+    // 用来发送命令的连接
     if (link->cc == NULL) {
         // 普通的用来发送命令的连接(ping,info啥的)
     }
@@ -679,7 +671,7 @@ int sentinelSendHello(sentinelRedisInstance *ri) {
     else if (server.tls_replication && server.tls_port) announce_port = server.tls_port;
     else announce_port = server.port;
 
-    // 向实例的的SENTINEL_HELLO_CHANNEL发布hello消息,告诉订阅了这个服务实例的其他sentinel,‘我’的存在,以及‘我’认为的这台实例的master信息
+    // 向实例的的SENTINEL_HELLO_CHANNEL发布hello消息,告诉订阅了这个服务实例的其他sentinel,‘我’的存在,以及‘我’认为的这个实例的master信息
     snprintf(payload,sizeof(payload),
         "%s,%d,%s,%llu," /* Info about this sentinel. */
         "%s,%s,%d,%llu", /* Info about current master. */
@@ -698,6 +690,88 @@ int sentinelSendHello(sentinelRedisInstance *ri) {
 }
 
 ```
+
+## failover
++ sentinel实例独立于redis服务集群(包括master和slave)运行,通过周期性的与各个服务实例交换信息来获取每个服务实例的健康状态;
++ 当确认master服务失效时,sentinel群从本来的slave中商量选出新的master服务,同时发送命令要求各个服务遵从新的`master-slave`关系;
++ 运行中的`redis-server`服务接到这些改变`master-slave`关系的命令时,对自身的做事方式做出相应改变,返回必要的信息;
++ 然后整个`redis-server`群和,`redis-sentinel`在新的关系下运行并继续检测这些服务的运行状况以便下一次变动
+
+### 周期性执行程序里有收集信息确认实例是否健康
+```c
+void sentinelHandleRedisInstance(sentinelRedisInstance *ri) {
+
+    // 确认该实例是否已经Down(主观) #ref(sentinelCheckSubjectivelyDown)
+    sentinelCheckSubjectivelyDown(ri);
+    /* Only masters */
+    if (ri->flags & SRI_MASTER) {
+        // 判断redis-server.master是否仍有效,及无效时与其他sentinel讨论商量怎么failover
+        sentinelCheckObjectivelyDown(ri);
+        if (sentinelStartFailoverIfNeeded(ri))
+            sentinelAskMasterStateToOtherSentinels(ri,SENTINEL_ASK_FORCED);
+        sentinelFailoverStateMachine(ri);
+        sentinelAskMasterStateToOtherSentinels(ri,SENTINEL_NO_FLAGS);
+    }
+}
+```
+#### sentinelCheckSubjectivelyDown 
+主观判断当前连接的服务进程是否down
+```c
+void sentinelCheckSubjectivelyDown(sentinelRedisInstance *ri) {
+    mstime_t elapsed = 0;
+
+    if (ri->link->act_ping_time)
+        elapsed = mstime() - ri->link->act_ping_time;
+    else if (ri->link->disconnected)
+        elapsed = mstime() - ri->link->last_avail_time;
+
+    // 判断给该实例发命令的连接是否仍活跃
+    if (ri->link->cc &&
+        (mstime() - ri->link->cc_conn_time) >
+        SENTINEL_MIN_LINK_RECONNECT_PERIOD &&
+        ri->link->act_ping_time != 0 && 
+        (mstime() - ri->link->act_ping_time) > (ri->down_after_period/2) &&
+        (mstime() - ri->link->last_pong_time) > (ri->down_after_period/2))
+    {
+        instanceLinkCloseConnection(ri->link,ri->link->cc);
+    }
+
+    // 判断用来订阅该实例的消息连接是否仍活跃
+    if (ri->link->pc &&
+        (mstime() - ri->link->pc_conn_time) >
+         SENTINEL_MIN_LINK_RECONNECT_PERIOD &&
+        (mstime() - ri->link->pc_last_activity) > (SENTINEL_PUBLISH_PERIOD*3))
+    {
+        instanceLinkCloseConnection(ri->link,ri->link->pc);
+    }
+
+    // 很久没有过联系了,将该实例标记为sdown
+    if (elapsed > ri->down_after_period ||
+        (ri->flags & SRI_MASTER &&
+         ri->role_reported == SRI_SLAVE &&
+         mstime() - ri->role_reported_time >
+          (ri->down_after_period+SENTINEL_INFO_PERIOD*2)))
+    {
+       // 标记目标机器为sdown(主观)
+        if ((ri->flags & SRI_S_DOWN) == 0) {
+            ri->s_down_since_time = mstime();
+            ri->flags |= SRI_S_DOWN;
+        }
+    }
+}
+```
+
+#### sentinelCheckObjectivelyDown
+查找其他sentinel交互过来的服务进程信息,决定是否当前连接的服务进程down确实down掉了
+
+#### sentinelStartFailoverIfNeeded
+判断是否需要启用failover 
+
+#### sentinelAskMasterStateToOtherSentinels
+向所有sentinen服务进程发送命令询问大家现在严重的master服务进程时个什么状况
+
+#### sentinelFailoverStateMachine
+开始failover
 
 ### `tilt`模式
 ```c
@@ -720,38 +794,5 @@ void sentinelCheckTiltCondition(void) {
 }
 ```
 
-### failover 机制
-+ sentinel群独立于redis服务进程群(包括master和slave)运行,通过周期性的与各个服务进程交换信息来获取每个服务进程的健康状态;
-+ 当确认master服务失效时,sentinel群从本来的slave中商量选出新的master服务,同时发送命令要求各个服务遵从新的`master-slave`关系;
-+ 运行中的`redis-server`服务接到这些改变`master-slave`关系的命令时,对自身的做事方式做出相应改变,返回必要的信息;
-+ 然后整个`redis-server`群和,`redis-sentinel`在新的关系下运行并继续检测这些服务的运行状况以便下一次变动
-
-```c
-    // 确认该服务是否已经Down(主观)
-    sentinelCheckSubjectivelyDown(ri);
-    /* Only masters */
-    if (ri->flags & SRI_MASTER) {
-        // 判断redis-server.master是否仍有效,及无效时与其他sentinel讨论商量怎么failover
-        sentinelCheckObjectivelyDown(ri);
-        if (sentinelStartFailoverIfNeeded(ri))
-            sentinelAskMasterStateToOtherSentinels(ri,SENTINEL_ASK_FORCED);
-        sentinelFailoverStateMachine(ri);
-        sentinelAskMasterStateToOtherSentinels(ri,SENTINEL_NO_FLAGS);
-    }
-```
-#### sentinelCheckSubjectivelyDown 
-主观判断当前连接的服务进程是否down
-
-#### sentinelCheckObjectivelyDown
-查找其他sentinel交互过来的服务进程信息,决定是否当前连接的服务进程down确实down掉了
-
-#### sentinelStartFailoverIfNeeded
-判断是否需要启用failover 
-
-#### sentinelAskMasterStateToOtherSentinels
-向所有sentinen服务进程发送命令询问大家现在严重的master服务进程时个什么状况
-
-#### sentinelFailoverStateMachine
-开始failover
 
 
