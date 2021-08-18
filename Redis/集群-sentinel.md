@@ -78,8 +78,8 @@ typedef struct sentinelRedisInstance {
     uint64_t failover_epoch; // failover的信息版本epoch
     int failover_state; // failover过程状态 #ref(SENTINEL_FAILOVER_STATE_XXX)
     mstime_t failover_state_change_time; // failover过程状态上次变化的时间
-    mstime_t failover_start_time;   /* Last failover attempt start time. */
-    mstime_t failover_timeout;      /* Max time to refresh failover state. */
+    mstime_t failover_start_time;   // 上一次尝试对这个实例failover的时间
+    mstime_t failover_timeout;      // 设置的failover超时时间
     mstime_t failover_delay_logged; /* For what failover_start_time value we
                                        logged the failover delay. */
     struct sentinelRedisInstance *promoted_slave; /* Promoted slave instance. */
@@ -701,15 +701,19 @@ int sentinelSendHello(sentinelRedisInstance *ri) {
 ```c
 void sentinelHandleRedisInstance(sentinelRedisInstance *ri) {
 
-    // 确认该实例是否已经Down(主观) #ref(sentinelCheckSubjectivelyDown)
+    // 确认该实例是否已经SDown(主观) #ref(sentinelCheckSubjectivelyDown)
     sentinelCheckSubjectivelyDown(ri);
     /* Only masters */
     if (ri->flags & SRI_MASTER) {
-        // 判断redis-server.master是否仍有效,及无效时与其他sentinel讨论商量怎么failover
+        // 如果实例是master,需要判断他是否ODown(客观) #ref(sentinelCheckObjectivelyDown)
         sentinelCheckObjectivelyDown(ri);
+        // 判断是否需要启动failover
         if (sentinelStartFailoverIfNeeded(ri))
+            // 确认要开始failover时,向其他sentinel广播这个master的信息,带上标记SENTINEL_ASK_FORCED强制更新他们的状态 //todo
             sentinelAskMasterStateToOtherSentinels(ri,SENTINEL_ASK_FORCED);
+        // todo
         sentinelFailoverStateMachine(ri);
+        // todo
         sentinelAskMasterStateToOtherSentinels(ri,SENTINEL_NO_FLAGS);
     }
 }
@@ -763,9 +767,74 @@ void sentinelCheckSubjectivelyDown(sentinelRedisInstance *ri) {
 
 #### sentinelCheckObjectivelyDown
 查找其他sentinel交互过来的服务进程信息,决定是否当前连接的服务进程down确实down掉了
+```c
+void sentinelCheckObjectivelyDown(sentinelRedisInstance *master) {
+    dictIterator *di;
+    dictEntry *de;
+    unsigned int quorum = 0, odown = 0;
+    //如果从‘我’的视角,该实例已经SDown了,需要遍历一下其他同样监管这个实例的sentinel对该实例的看法
+    // 这些“看法”信息从发送的sentinelAskMasterStateToOtherSentinels获得
+    if (master->flags & SRI_S_DOWN) { 
+        quorum = 1; 
+        di = dictGetIterator(master->sentinels);
+        // 遍历所有监管这个实例的sentinel信息,如果也认为该实例为SRI_MASTER_DOWN,则票数+1
+        while((de = dictNext(di)) != NULL) {
+            sentinelRedisInstance *ri = dictGetVal(de);
+
+            if (ri->flags & SRI_MASTER_DOWN) quorum++;
+        }
+        dictReleaseIterator(di);
+        if (quorum >= master->quorum) odown = 1; // 票数满足要求,设置Odown
+    }
+
+    if (odown) {
+        if ((master->flags & SRI_O_DOWN) == 0) {
+            // 设置flag为Odown
+            master->flags |= SRI_O_DOWN;
+            master->o_down_since_time = mstime();
+        }
+    } else {
+        if (master->flags & SRI_O_DOWN) {
+            // 不够票时,或者票数减少到不够时,需要解除该实例的odown标记
+            master->flags &= ~SRI_O_DOWN;
+        }
+    }
+}
+```
 
 #### sentinelStartFailoverIfNeeded
 判断是否需要启用failover 
+```c
+// 判断是否需要启动failover
+int sentinelStartFailoverIfNeeded(sentinelRedisInstance *master) {
+    // 判断flag 是否为ODown,不是则返回false
+    if (!(master->flags & SRI_O_DOWN)) return 0;
+
+    // 判断是否已经在failover进行中,是则返回false
+    if (master->flags & SRI_FAILOVER_IN_PROGRESS) return 0;
+
+    // 距离上次启动failover刚刚过去不久 
+    if (mstime() - master->failover_start_time <
+        master->failover_timeout*2)
+    {
+        // ...
+        return 0;
+    }
+    // 所有条件都满足,开始failover #ref(sentinelStartFailover) todo
+    sentinelStartFailover(master);
+    return 1;
+}
+// 开始failover,这个操作不需要再经过其他sentinel的同意,只需要‘我’这边得到的信息满足就开始
+void sentinelStartFailover(sentinelRedisInstance *master) {
+
+    master->failover_state = SENTINEL_FAILOVER_STATE_WAIT_START; //设置该实例的failover状态
+    master->flags |= SRI_FAILOVER_IN_PROGRESS; // 设置该实例的flag为正在failover
+    master->failover_epoch = ++sentinel.current_epoch; // 更新设置failoverEpoch
+
+    master->failover_start_time = mstime()+rand()%SENTINEL_MAX_DESYNC; //更新failover开始时间
+    master->failover_state_change_time = mstime(); //更新failover状态变更时间
+}
+```
 
 #### sentinelAskMasterStateToOtherSentinels
 向所有sentinen服务进程发送命令询问大家现在严重的master服务进程时个什么状况
