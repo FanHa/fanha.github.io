@@ -36,8 +36,7 @@ typedef struct sentinelRedisInstance {
     instanceLink *link; /* Link to the instance, may be shared for Sentinels. */
     mstime_t last_pub_time;   // 上一次我们向这个实力发送publish(hello)消息的时间
     mstime_t last_hello_time; // 如果这个实例是个sentinel,这个字段保存的就是上次收到这个sentinel实例发hello信息的时间
-    mstime_t last_master_down_reply_time; /* Time of last reply to
-                                             SENTINEL is-master-down command. */
+    mstime_t last_master_down_reply_time; // sentinel询问其他sentinel关于一个master是否down的回应时间
     mstime_t s_down_since_time; /* Subjectively down since time. */
     mstime_t o_down_since_time; /* Objectively down since time. */
     mstime_t down_after_period; /* Consider it down after that period. */
@@ -69,12 +68,9 @@ typedef struct sentinelRedisInstance {
     int slave_master_link_status; // 与master的连接状态
     unsigned long long slave_repl_offset; // 与master之间的基准数据的偏移量
 
-    /* Failover */
-    char *leader;       /* If this is a master instance, this is the runid of
-                           the Sentinel that should perform the failover. If
-                           this is a Sentinel, this is the runid of the Sentinel
-                           that this Sentinel voted as leader. */
-    uint64_t leader_epoch; /* Epoch of the 'leader' field. */
+    // Failover相关
+    char *leader;       // 该sentinel实例选的failover操盘sentinelid(由这个sentinel去执行后续的failover实际命令收发) todo 如果实例的master的情况
+    uint64_t leader_epoch; // 该sentinel实例选的leader的epoch
     uint64_t failover_epoch; // failover的信息版本epoch
     int failover_state; // failover过程状态 #ref(SENTINEL_FAILOVER_STATE_XXX)
     mstime_t failover_state_change_time; // failover过程状态上次变化的时间
@@ -709,7 +705,7 @@ void sentinelHandleRedisInstance(sentinelRedisInstance *ri) {
         sentinelCheckObjectivelyDown(ri);
         // 判断是否需要启动failover
         if (sentinelStartFailoverIfNeeded(ri))
-            // 确认要开始failover时,向其他sentinel广播这个master的信息,带上标记SENTINEL_ASK_FORCED强制更新他们的状态 //todo
+            // 确认要开始failover时,向其他sentinel广播这个master的信息
             sentinelAskMasterStateToOtherSentinels(ri,SENTINEL_ASK_FORCED);
         // todo
         sentinelFailoverStateMachine(ri);
@@ -837,7 +833,76 @@ void sentinelStartFailover(sentinelRedisInstance *master) {
 ```
 
 #### sentinelAskMasterStateToOtherSentinels
-向所有sentinen服务进程发送命令询问大家现在严重的master服务进程时个什么状况
+向所有sentinen服务进程发送命令询问大家这个‘我’认为down掉的master在他们眼里是什么状况
+```c
+void sentinelAskMasterStateToOtherSentinels(sentinelRedisInstance *master, int flags) {
+    dictIterator *di;
+    dictEntry *de;
+
+    di = dictGetIterator(master->sentinels);
+    while((de = dictNext(di)) != NULL) {
+        sentinelRedisInstance *ri = dictGetVal(de);
+
+        /* Ask */
+        ll2string(port,sizeof(port),master->addr->port);
+        // 向目标sentinel实例发送“sentinel is-master-down-by-addr”命令,询问该master的运行状态
+        retval = redisAsyncCommand(ri->link->cc,
+                    // 设置回调sentinelReceiveIsMasterDownReply纪录结果,下一次循环时,sentinelCheckObjectivelyDown就根据已有信息决定 是否认为该master已经ODown(客观down)了
+                    sentinelReceiveIsMasterDownReply, ri, 
+                    "%s is-master-down-by-addr %s %s %llu %s",
+                    sentinelInstanceMapCommand(ri,"SENTINEL"),
+                    master->addr->ip, port,
+                    sentinel.current_epoch,
+                    (master->failover_state > SENTINEL_FAILOVER_STATE_NONE) ? // 如果failover已经开始了,需要带上‘我’的id
+                    sentinel.myid : "*");
+        if (retval == C_OK) ri->link->pending_commands++;
+    }
+    dictReleaseIterator(di);
+}
+// todo 被调用方sentinel收到 sentinel is-master-down-by-addr 命令的处理 
+void sentinelCommand(client *c) {
+    // ...
+    if (!strcasecmp(c->argv[1]->ptr,"is-master-down-by-addr")) {
+        // 发送方sentinel带上了自己的id时表明failover已经开始,需要根据epoch大小投票选出sentinel的leader(由这个leader后续去向相关的master,slave发送failover命令) #ref(sentinelVoteLeader)
+        if (ri && ri->flags & SRI_MASTER && strcasecmp(c->argv[5]->ptr,"*")) {
+            leader = sentinelVoteLeader(ri,(uint64_t)req_epoch,
+                                            c->argv[5]->ptr,
+                                            &leader_epoch);
+        }
+
+        // 返回目标master实例的down状态, 我选出的leader, 已经我认为的leader的epoch
+        addReplyArrayLen(c,3);
+        addReply(c, isdown ? shared.cone : shared.czero);
+        addReplyBulkCString(c, leader ? leader : "*");
+        addReplyLongLong(c, (long long)leader_epoch);
+        if (leader) sdsfree(leader);
+    }
+    // ...
+}
+// 调用方sentinel 处理“sentinel is-master-down-by-addr”命令回复的回调
+void sentinelReceiveIsMasterDownReply(redisAsyncContext *c, void *reply, void *privdata) {
+    if (r->type == REDIS_REPLY_ARRAY && r->elements == 3 &&
+        r->element[0]->type == REDIS_REPLY_INTEGER &&
+        r->element[1]->type == REDIS_REPLY_STRING &&
+        r->element[2]->type == REDIS_REPLY_INTEGER)
+    {
+        ri->last_master_down_reply_time = mstime(); // 更新时间信息
+        if (r->element[0]->integer == 1) { 保存该sentinel是否认为这个master的down状态
+            ri->flags |= SRI_MASTER_DOWN;
+        } else {
+            ri->flags &= ~SRI_MASTER_DOWN;
+        }
+        if (strcmp(r->element[1]->str,"*")) {
+            // 如果该sentinel回了个投票选出的sentinelId
+            // 保存该sentinel投票的sentinelId 和 epoch
+            ri->leader = sdsnew(r->element[1]->str);
+            ri->leader_epoch = r->element[2]->integer;
+        }
+    }
+}
+
+
+```
 
 #### sentinelFailoverStateMachine
 开始failover
