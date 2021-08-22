@@ -22,7 +22,6 @@ struct sentinelState {
     list *scripts_queue;            // todo
     char *announce_ip;  // 我与其他sentinel交互用的ip
     int announce_port;  // 我与其他sentinel交互用的port
-    unsigned long simfailure_flags; // todo
     int deny_scripts_reconfig;// todo
 } sentinel;
 
@@ -60,7 +59,7 @@ typedef struct sentinelRedisInstance {
 
     // slave的信息
     mstime_t master_link_down_time; // 该slave报告的ta与ta的master断连的时间
-    int slave_priority; // todo
+    int slave_priority; // slave的优先级,在failover开始阶段,sentinel要以这个为依据选出新master
     mstime_t slave_reconf_sent_time; /* Time at which we sent SLAVE OF <new> */
     struct sentinelRedisInstance *master; // master实例信息
     char *slave_master_host;    // 该slave报告的ta的host
@@ -78,7 +77,7 @@ typedef struct sentinelRedisInstance {
     mstime_t failover_timeout;      // 设置的failover超时时间
     mstime_t failover_delay_logged; /* For what failover_start_time value we
                                        logged the failover delay. */
-    struct sentinelRedisInstance *promoted_slave; /* Promoted slave instance. */
+    struct sentinelRedisInstance *promoted_slave; // 选中来当下一个master的slave
     /* Scripts executed to notify admin or reconfigure clients: when they
      * are set to NULL no script is executed. */
     char *notification_script;
@@ -524,7 +523,7 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
             }
 
             if (sdslen(l) >= 15 && !memcmp(l,"slave_priority:",15))
-                ri->slave_priority = atoi(l+15); // TODO 这个priority的作用
+                ri->slave_priority = atoi(l+15); // slave的优先级(用来在failover时参考优先级选择新master)
 
             if (sdslen(l) >= 18 && !memcmp(l,"slave_repl_offset:",18))
                 ri->slave_repl_offset = strtoull(l+18,NULL,10); //更新repl_offset
@@ -705,11 +704,12 @@ void sentinelHandleRedisInstance(sentinelRedisInstance *ri) {
         sentinelCheckObjectivelyDown(ri);
         // 判断是否需要启动failover
         if (sentinelStartFailoverIfNeeded(ri))
-            // 确认要开始failover时,向其他sentinel广播这个master的信息
+            // 确认要开始failover时,向其他sentinel广播这个master的信息,
+            // 本来向其他sentinel实例发送信息遵循一定的规定,不会每次都发,但加上了SENTINEL_ASK_FORCED就是必发
             sentinelAskMasterStateToOtherSentinels(ri,SENTINEL_ASK_FORCED);
-        // todo
+        // 开始failover
         sentinelFailoverStateMachine(ri);
-        // todo
+        // 向其他sentinel实例广播这个master的信息
         sentinelAskMasterStateToOtherSentinels(ri,SENTINEL_NO_FLAGS);
     }
 }
@@ -816,7 +816,8 @@ int sentinelStartFailoverIfNeeded(sentinelRedisInstance *master) {
         // ...
         return 0;
     }
-    // 所有条件都满足,开始failover #ref(sentinelStartFailover) todo
+    // 所有条件都满足,开始failover #ref(sentinelStartFailover)
+    // 注:这里只是设置了failover_state的状态,真正开始还是在接下来的`sentinelFailoverStateMachine`函数里
     sentinelStartFailover(master);
     return 1;
 }
@@ -905,7 +906,151 @@ void sentinelReceiveIsMasterDownReply(redisAsyncContext *c, void *reply, void *p
 ```
 
 #### sentinelFailoverStateMachine
-开始failover
+sentinel们选出一个leader后由leader来具体执行failover相关的操作
+
+
+### 执行failover
+```c
+// failover整个过程的若干个阶段
+void sentinelFailoverStateMachine(sentinelRedisInstance *ri) {
+    // ...
+    switch(ri->failover_state) {
+        case SENTINEL_FAILOVER_STATE_WAIT_START:
+            sentinelFailoverWaitStart(ri);// 初始化阶段
+            break;
+        case SENTINEL_FAILOVER_STATE_SELECT_SLAVE:
+            sentinelFailoverSelectSlave(ri); //选择哪个slave当新的master
+            break;
+        case SENTINEL_FAILOVER_STATE_SEND_SLAVEOF_NOONE:
+            sentinelFailoverSendSlaveOfNoOne(ri);//向当选slave发送slaveOfNoOne
+            break;
+        case SENTINEL_FAILOVER_STATE_WAIT_PROMOTION:
+            sentinelFailoverWaitPromotion(ri); //提升slave为新的master
+            break;
+        case SENTINEL_FAILOVER_STATE_RECONF_SLAVES:
+            sentinelFailoverReconfNextSlave(ri); //todo
+            break;
+    }
+}
+```
+
+#### sentinelFailoverSelectSlave 选出新master
+```c
+// src/sentinel.c
+// 从原来的master里选出一个slave来做后续新的master
+void sentinelFailoverSelectSlave(sentinelRedisInstance *ri) {
+    // 比较原master下的所有slave,选出最合适的slave充当下一个master
+    sentinelRedisInstance *slave = sentinelSelectSlave(ri);
+
+    //...
+        slave->flags |= SRI_PROMOTED; / 设置flag和状态
+        ri->promoted_slave = slave;
+        ri->failover_state = SENTINEL_FAILOVER_STATE_SEND_SLAVEOF_NOONE;
+        ri->failover_state_change_time = mstime();
+    // ...
+    
+}
+
+#### sentinelFailoverSendSlaveOfNoOne 向新master发送`slave of no one`命令,清掉这个事例的主从关系
+```c
+// src/sentinel.c
+void sentinelFailoverSendSlaveOfNoOne(sentinelRedisInstance *ri) {
+    int retval;
+
+    // 向将要成为新master的slave发送`slave of no one` 命令来清空掉‘ta’的主从关系,
+    retval = sentinelSendSlaveOf(ri->promoted_slave,NULL,0);
+    if (retval != C_OK) return;
+    ri->failover_state = SENTINEL_FAILOVER_STATE_WAIT_PROMOTION;
+    ri->failover_state_change_time = mstime();
+}
+```
+
+#### sentinelFailoverWaitPromotion 等待前面的`slave of no one`执行完
+```c
+// src/sentinel.c
+void sentinelFailoverWaitPromotion(sentinelRedisInstance *ri) {
+    // 当前面的阶段执行有问题时(超过时间还没完成),需要abort掉failover,等待下一次failover
+    if (mstime() - ri->failover_state_change_time > ri->failover_timeout) {
+        // ...
+        // #ref(sentinelAbortFailover)
+        sentinelAbortFailover(ri);
+    }
+}
+void sentinelAbortFailover(sentinelRedisInstance *ri) {
+    // 还原到还没开始failover的状态
+    ri->flags &= ~(SRI_FAILOVER_IN_PROGRESS|SRI_FORCE_FAILOVER);
+    ri->failover_state = SENTINEL_FAILOVER_STATE_NONE;
+    ri->failover_state_change_time = mstime();
+    if (ri->promoted_slave) {
+        ri->promoted_slave->flags &= ~SRI_PROMOTED;
+        ri->promoted_slave = NULL;
+    }
+}
+```
+#### sentinelFailoverReconfNextSlave 新master已准备就绪,向原来的其他slave发送`slave of`命令将他们的master指向新maser实例
+```c
+// src/sentinel.c
+// TODO
+void sentinelFailoverReconfNextSlave(sentinelRedisInstance *master) {
+    dictIterator *di;
+    dictEntry *de;
+    int in_progress = 0;
+
+    di = dictGetIterator(master->slaves);
+    while((de = dictNext(di)) != NULL) {
+        sentinelRedisInstance *slave = dictGetVal(de);
+
+        if (slave->flags & (SRI_RECONF_SENT|SRI_RECONF_INPROG))
+            in_progress++;
+    }
+    dictReleaseIterator(di);
+
+    di = dictGetIterator(master->slaves);
+    while(in_progress < master->parallel_syncs &&
+          (de = dictNext(di)) != NULL)
+    {
+        sentinelRedisInstance *slave = dictGetVal(de);
+        int retval;
+
+        /* Skip the promoted slave, and already configured slaves. */
+        if (slave->flags & (SRI_PROMOTED|SRI_RECONF_DONE)) continue;
+
+        /* If too much time elapsed without the slave moving forward to
+         * the next state, consider it reconfigured even if it is not.
+         * Sentinels will detect the slave as misconfigured and fix its
+         * configuration later. */
+        if ((slave->flags & SRI_RECONF_SENT) &&
+            (mstime() - slave->slave_reconf_sent_time) >
+            SENTINEL_SLAVE_RECONF_TIMEOUT)
+        {
+            sentinelEvent(LL_NOTICE,"-slave-reconf-sent-timeout",slave,"%@");
+            slave->flags &= ~SRI_RECONF_SENT;
+            slave->flags |= SRI_RECONF_DONE;
+        }
+
+        /* Nothing to do for instances that are disconnected or already
+         * in RECONF_SENT state. */
+        if (slave->flags & (SRI_RECONF_SENT|SRI_RECONF_INPROG)) continue;
+        if (slave->link->disconnected) continue;
+
+        /* Send SLAVEOF <new master>. */
+        retval = sentinelSendSlaveOf(slave,
+                master->promoted_slave->addr->ip,
+                master->promoted_slave->addr->port);
+        if (retval == C_OK) {
+            slave->flags |= SRI_RECONF_SENT;
+            slave->slave_reconf_sent_time = mstime();
+            sentinelEvent(LL_NOTICE,"+slave-reconf-sent",slave,"%@");
+            in_progress++;
+        }
+    }
+    dictReleaseIterator(di);
+
+    /* Check if all the slaves are reconfigured and handle timeout. */
+    sentinelFailoverDetectEnd(master);
+}
+
+```
 
 ### `tilt`模式
 ```c
