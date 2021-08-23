@@ -16,13 +16,10 @@ struct sentinelState {
     uint64_t current_epoch;         // 信息版本(后续需要用这个版本比对来解决冲突)
     dict *masters;      // “我”所监管的master实例
     int tilt;           // sentinel因为系统时间的不一致而进入的一种保护模式
-    int running_scripts;    // ?? TODO
     mstime_t tilt_start_time;       // 开始tilt模式的时间
     mstime_t previous_time;         // 上次执行周期性函数的时间(用来判断是否需要进入tilt模式)
-    list *scripts_queue;            // todo
     char *announce_ip;  // 我与其他sentinel交互用的ip
     int announce_port;  // 我与其他sentinel交互用的port
-    int deny_scripts_reconfig;// todo
 } sentinel;
 
 // “我”所知道的redis实例结构
@@ -68,7 +65,7 @@ typedef struct sentinelRedisInstance {
     unsigned long long slave_repl_offset; // 与master之间的基准数据的偏移量
 
     // Failover相关
-    char *leader;       // 该sentinel实例选的failover操盘sentinelid(由这个sentinel去执行后续的failover实际命令收发) todo 如果实例的master的情况
+    char *leader;       // 该sentinel实例选的failover操盘sentinelid(由这个sentinel去执行后续的failover实际命令收发)
     uint64_t leader_epoch; // 该sentinel实例选的leader的epoch
     uint64_t failover_epoch; // failover的信息版本epoch
     int failover_state; // failover过程状态 #ref(SENTINEL_FAILOVER_STATE_XXX)
@@ -223,11 +220,7 @@ void sentinelTimer(void) {
     // ...
     // 与所有已知的master间的交互
     sentinelHandleDictOfRedisInstances(sentinel.masters);
-
-
-    sentinelRunPendingScripts(); //todo
-    sentinelCollectTerminatedScripts(); //todo
-    sentinelKillTimedoutScripts(); //todo
+    // ...
 }
 
 ```
@@ -252,13 +245,13 @@ void sentinelHandleDictOfRedisInstances(dict *instances) {
             sentinelHandleDictOfRedisInstances(ri->slaves);
             // 处理实例的sentinel #ref(sentinelHandleDictOfRedisInstances)
             sentinelHandleDictOfRedisInstances(ri->sentinels);
-            // todo
+            // 这个SENTINEL_FAILOVER_STATE_UPDATE_CONFIG表明这个master是新晋升的,需要相应修改一些信息
             if (ri->failover_state == SENTINEL_FAILOVER_STATE_UPDATE_CONFIG) {
                 switch_to_promoted = ri;
             }
         }
     }
-    if (switch_to_promoted) // todo
+    if (switch_to_promoted) // 修改新晋升为master的实例信息
         sentinelFailoverSwitchToPromotedSlave(switch_to_promoted);
     dictReleaseIterator(di);
 }
@@ -270,13 +263,13 @@ void sentinelHandleRedisInstance(sentinelRedisInstance *ri) {
     // 发送周期性的问候信息来掌握服务(包括redis-server.master,redis-server.slave,其他sentinel)的信息 #ref(sentinelSendPeriodicCommands)
     sentinelSendPeriodicCommands(ri);
 
-    // 确认该服务是否已经Down(主观) #ref(sentinelCheckSubjectivelyDown) todo
+    // 确认该服务是否已经Down(主观) #ref(sentinelCheckSubjectivelyDown) 
     sentinelCheckSubjectivelyDown(ri);
     /* Only masters */
     if (ri->flags & SRI_MASTER) {
-        // 判断该实例是否已经触及“客观Down” todo
+        // 判断该实例是否已经触及“客观Down” 
         sentinelCheckObjectivelyDown(ri);
-        // 判断是否需要开始failover todo
+        // 判断是否需要开始failover
         if (sentinelStartFailoverIfNeeded(ri))
             sentinelAskMasterStateToOtherSentinels(ri,SENTINEL_ASK_FORCED);
         sentinelFailoverStateMachine(ri);
@@ -553,13 +546,9 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
             ri->master->failover_state_change_time = mstime();
             sentinelFlushConfig();
 
-            // todo
-            sentinelCallClientReconfScript(ri->master,SENTINEL_LEADER,
-                "start",ri->master->addr,ri->addr);
             sentinelForceHelloUpdateForMaster(ri->master);
         } else {
             // 还存在一些疑点的情况,比如对原master的情况不太确定,需要确认状态,解决疑惑
-            // TODO ??
             mstime_t wait_time = SENTINEL_PUBLISH_PERIOD*4;
 
             if (!(ri->flags & SRI_PROMOTED) &&
@@ -860,7 +849,7 @@ void sentinelAskMasterStateToOtherSentinels(sentinelRedisInstance *master, int f
     }
     dictReleaseIterator(di);
 }
-// todo 被调用方sentinel收到 sentinel is-master-down-by-addr 命令的处理 
+// 被调用方sentinel收到 sentinel is-master-down-by-addr 命令的处理 
 void sentinelCommand(client *c) {
     // ...
     if (!strcasecmp(c->argv[1]->ptr,"is-master-down-by-addr")) {
@@ -928,7 +917,7 @@ void sentinelFailoverStateMachine(sentinelRedisInstance *ri) {
             sentinelFailoverWaitPromotion(ri); //提升slave为新的master
             break;
         case SENTINEL_FAILOVER_STATE_RECONF_SLAVES:
-            sentinelFailoverReconfNextSlave(ri); //todo
+            sentinelFailoverReconfNextSlave(ri); //向原来的slave们发送slaveOf命令,让他们成为新master的slave
             break;
     }
 }
@@ -990,20 +979,7 @@ void sentinelAbortFailover(sentinelRedisInstance *ri) {
 #### sentinelFailoverReconfNextSlave 新master已准备就绪,向原来的其他slave发送`slave of`命令将他们的master指向新maser实例
 ```c
 // src/sentinel.c
-// TODO
 void sentinelFailoverReconfNextSlave(sentinelRedisInstance *master) {
-    dictIterator *di;
-    dictEntry *de;
-    int in_progress = 0;
-
-    di = dictGetIterator(master->slaves);
-    while((de = dictNext(di)) != NULL) {
-        sentinelRedisInstance *slave = dictGetVal(de);
-
-        if (slave->flags & (SRI_RECONF_SENT|SRI_RECONF_INPROG))
-            in_progress++;
-    }
-    dictReleaseIterator(di);
 
     di = dictGetIterator(master->slaves);
     while(in_progress < master->parallel_syncs &&
@@ -1011,46 +987,79 @@ void sentinelFailoverReconfNextSlave(sentinelRedisInstance *master) {
     {
         sentinelRedisInstance *slave = dictGetVal(de);
         int retval;
-
-        /* Skip the promoted slave, and already configured slaves. */
-        if (slave->flags & (SRI_PROMOTED|SRI_RECONF_DONE)) continue;
-
-        /* If too much time elapsed without the slave moving forward to
-         * the next state, consider it reconfigured even if it is not.
-         * Sentinels will detect the slave as misconfigured and fix its
-         * configuration later. */
-        if ((slave->flags & SRI_RECONF_SENT) &&
-            (mstime() - slave->slave_reconf_sent_time) >
-            SENTINEL_SLAVE_RECONF_TIMEOUT)
-        {
-            sentinelEvent(LL_NOTICE,"-slave-reconf-sent-timeout",slave,"%@");
-            slave->flags &= ~SRI_RECONF_SENT;
-            slave->flags |= SRI_RECONF_DONE;
-        }
-
-        /* Nothing to do for instances that are disconnected or already
-         * in RECONF_SENT state. */
-        if (slave->flags & (SRI_RECONF_SENT|SRI_RECONF_INPROG)) continue;
-        if (slave->link->disconnected) continue;
-
-        /* Send SLAVEOF <new master>. */
+        // 向原来的每个slave发送slaveOf命令成为新master的slave
         retval = sentinelSendSlaveOf(slave,
                 master->promoted_slave->addr->ip,
                 master->promoted_slave->addr->port);
-        if (retval == C_OK) {
-            slave->flags |= SRI_RECONF_SENT;
-            slave->slave_reconf_sent_time = mstime();
-            sentinelEvent(LL_NOTICE,"+slave-reconf-sent",slave,"%@");
-            in_progress++;
-        }
     }
     dictReleaseIterator(di);
 
-    /* Check if all the slaves are reconfigured and handle timeout. */
+    // 判断是否所有旧slave都配置成了新master下的slave #ref(sentinelFailoverDetectEnd)
     sentinelFailoverDetectEnd(master);
 }
+void sentinelFailoverDetectEnd(sentinelRedisInstance *master) {
 
+    di = dictGetIterator(master->slaves);
+    while((de = dictNext(di)) != NULL) { // 遍历所有原slave,找出没有成功reconfig的实例数量
+        sentinelRedisInstance *slave = dictGetVal(de);
+
+        if (slave->flags & (SRI_PROMOTED|SRI_RECONF_DONE)) continue; 
+        if (slave->flags & SRI_S_DOWN) continue;
+        not_reconfigured++;
+    }
+    dictReleaseIterator(di);
+
+    // 整个failover有个超时时间,这个超时不是指failover没有成功,而是‘我’作为主导failover的一方尽到了最大的努力,就可以认为failover已经成功了
+    if (elapsed > master->failover_timeout) {
+        not_reconfigured = 0;
+        timeout = 1;
+    }
+
+    if (not_reconfigured == 0) {
+        //设置failover状态,下一个cron循环根据状态SENTINEL_FAILOVER_STATE_UPDATE_CONFIG更新master表和slave表信息
+        // #ref(sentinelHandleDictOfRedisInstances)
+        master->failover_state = SENTINEL_FAILOVER_STATE_UPDATE_CONFIG; 
+        master->failover_state_change_time = mstime();
+    }
+
+    // 当整个failover流程超时时,我们还要再努力尝试一下,向那些还没成功reconf的slave再最后发送一次slaveOf命令
+    // 注:这个timeout不是失败,只是‘我’尽力了,有些确实连不上的也不再多做纠缠,整体可用就行
+    if (timeout) {
+        dictIterator *di;
+        dictEntry *de;
+
+        di = dictGetIterator(master->slaves);
+        while((de = dictNext(di)) != NULL) {
+            sentinelRedisInstance *slave = dictGetVal(de);
+            retval = sentinelSendSlaveOf(slave,
+                    master->promoted_slave->addr->ip,
+                    master->promoted_slave->addr->port);
+        }
+        dictReleaseIterator(di);
+    }
+}
+
+// failover_state 状态为SENTINEL_FAILOVER_STATE_UPDATE_CONFIG 时,在主cron时间循环中需要更新信息
+void sentinelHandleDictOfRedisInstances(dict *instances) {
+    // ...
+    di = dictGetIterator(instances);
+    while((de = dictNext(di)) != NULL) {
+        // ...
+        if (ri->flags & SRI_MASTER) { // 实例为master时还需要对该master的sentine和slave作消息交流
+            // ...
+            // 这个SENTINEL_FAILOVER_STATE_UPDATE_CONFIG表明这个master是新晋升的,需要相应修改一些信息
+            if (ri->failover_state == SENTINEL_FAILOVER_STATE_UPDATE_CONFIG) {
+                switch_to_promoted = ri;
+            }
+        }
+    }
+    if (switch_to_promoted) // 修改新晋升为master的实例信息
+        sentinelFailoverSwitchToPromotedSlave(switch_to_promoted);
+    dictReleaseIterator(di);
+}
 ```
+
+### 冲突解决
 
 ### `tilt`模式
 ```c
@@ -1072,6 +1081,7 @@ void sentinelCheckTiltCondition(void) {
     sentinel.previous_time = mstime();
 }
 ```
+
 
 
 
