@@ -50,9 +50,6 @@ typedef struct sentinelRedisInstance {
     dict *sentinels;    // 监控了这台master的sentinel们
     dict *slaves;       // 这台master的slave们
     unsigned int quorum;/* Number of sentinels that need to agree on failure. */
-    int parallel_syncs; /* How many slaves to reconfigure at same time. */
-    char *auth_pass;    /* Password to use for AUTH against master & replica. */
-    char *auth_user;    /* Username for ACLs AUTH against master & replica. */
 
     // slave的信息
     mstime_t master_link_down_time; // 该slave报告的ta与ta的master断连的时间
@@ -75,10 +72,7 @@ typedef struct sentinelRedisInstance {
     mstime_t failover_delay_logged; /* For what failover_start_time value we
                                        logged the failover delay. */
     struct sentinelRedisInstance *promoted_slave; // 选中来当下一个master的slave
-    /* Scripts executed to notify admin or reconfigure clients: when they
-     * are set to NULL no script is executed. */
-    char *notification_script;
-    char *client_reconfig_script;
+
     sds info; /* cached INFO output */
 } sentinelRedisInstance;
 
@@ -1058,30 +1052,4 @@ void sentinelHandleDictOfRedisInstances(dict *instances) {
     dictReleaseIterator(di);
 }
 ```
-
-### 冲突解决
-
-### `tilt`模式
-```c
-// src/sentinel.c
-void sentinelTimer(void) {
-    // 判断是否因为时间的不同步而需要进`tilt`模式 #ref(sentinelCheckTiltCondition)
-    sentinelCheckTiltCondition();
-    // ...
-}
-void sentinelCheckTiltCondition(void) {
-    mstime_t now = mstime();
-    mstime_t delta = now - sentinel.previous_time; //算出当前时间与上次执行sentinel周期函数的差值
-
-    // 当差值小于0或者大于某个阈值时,认为不太正常,需要进入tilt模式
-    if (delta < 0 || delta > SENTINEL_TILT_TRIGGER) {
-        sentinel.tilt = 1;
-        sentinel.tilt_start_time = mstime();
-    }
-    sentinel.previous_time = mstime();
-}
-```
-
-
-
 
