@@ -96,7 +96,6 @@ robj *tryObjectEncoding(robj *o) {
             } else if (o->encoding == OBJ_ENCODING_EMBSTR) {    
                 // 如果本身的encoding属性是OBJ_ENCODING_EMBSTR
                 // 新建一个String结构
-                // TODO? 哪里来的
                 decrRefCount(o);
                 return createStringObjectFromLongLongForValue(value);
             }
@@ -273,11 +272,7 @@ void saddCommand(client *c) {
         // 往set里新增元素的接口
         if (setTypeAdd(set,c->argv[j]->ptr)) added++;
     }
-    if (added) {
-        // todo??
-        signalModifiedKey(c,c->db,c->argv[1]);
-        notifyKeyspaceEvent(NOTIFY_SET,"sadd",c->argv[1],c->db->id);
-    }
+
     server.dirty += added;
     addReplyLongLong(c,added);
 }
@@ -379,7 +374,7 @@ int setTypeAdd(robj *subject, sds value) {
         // 找到要插入的值的位置,如果值已经存在,这个函数会返回空
         dictEntry *de = dictAddRaw(ht,value,NULL);
         if (de) {
-            // Set的元素值其实是给dict的hash表设一个Key,并不需要设置这个key的值;
+            // Set的元素值其实是给dict的dict表设一个Key,并不需要设置这个key的值;
             dictSetKey(ht,de,sdsdup(value));
             dictSetVal(ht,de,NULL);
             return 1;
@@ -398,7 +393,7 @@ int setTypeAdd(robj *subject, sds value) {
             }
         } else {
             // 如果新插入的值不是Int型
-            // 需要将整个set转成hashTable类型
+            // 需要将整个set转成dict类型
             setTypeConvert(subject,OBJ_ENCODING_HT);
 
             // 按普通类型的Set插入新值
@@ -422,7 +417,6 @@ dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing)
     dictEntry *entry;
     dictht *ht;
     // 如果该dict处于Rehashing状态,则调用_dictRehashStep函数尝试Rehash
-    // TODO 什么时候会处于rehashing状态
     if (dictIsRehashing(d)) _dictRehashStep(d);
 
     // 当要set的值已经存在时,返回null
@@ -444,7 +438,6 @@ dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing)
 
 static void _dictRehashStep(dict *d) {
     // 如果当前没有人(或线程)在使用这个表,才会真正调用dictRehash
-    // TODO Rehash
     if (d->iterators == 0) dictRehash(d,1);
 }
 ```
@@ -491,7 +484,7 @@ robj *hashTypeLookupWriteOrCreate(client *c, robj *key) {
 // src/object.c
 robj *createHashObject(void) {
     // redis对外的Hash结构的内部实现其实是个ziplist
-    // 注:在刚刚开始是以ziplist形式存放,但随着Hash里的元素的增多,会相应变换数据存放方式(如HashTable);
+    // 注:在刚刚开始是以ziplist形式存放,但随着Hash里的元素的增多,会相应变换数据存放方式(dict);
     unsigned char *zl = ziplistNew();
     robj *o = createObject(OBJ_HASH, zl);
     o->encoding = OBJ_ENCODING_ZIPLIST;
@@ -542,7 +535,7 @@ int hashTypeSet(robj *o, sds field, sds value, int flags) {
         if (hashTypeLength(o) > server.hash_max_ziplist_entries)
             hashTypeConvert(o, OBJ_ENCODING_HT);
     } else if (o->encoding == OBJ_ENCODING_HT) {
-        // 当hash结构已经是使用HashTable结构编码时,调用dict数据结构的操作函数做查找和插入
+        // 当hash结构已经是使用dict结构编码时,调用dict数据结构的操作函数做查找和插入
         dictEntry *de = dictFind(o->ptr,field);
         if (de) {
             sdsfree(dictGetVal(de));
@@ -641,7 +634,7 @@ cleanup:
 robj *createZsetObject(void) {
     zset *zs = zmalloc(sizeof(*zs));
     robj *o;
-    // 初始化存放数据的普通dict(HashTable)结构
+    // 初始化存放数据的普通dict结构
     zs->dict = dictCreate(&zsetDictType,NULL);
     // 这个结构应该是用来保存顺序的
     zs->zsl = zslCreate();
