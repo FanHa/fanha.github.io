@@ -218,7 +218,7 @@ int dictRehash(dict *d, int n) {
 
     while(n-- && d->ht[0].used != 0) {
         dictEntry *de, *nextde;
-        // Rehash从地位slot往高位slot推进,直到找到存在键值对的slot
+        // Rehash从低位slot往高位slot推进,直到找到存在键值对的slot
         while(d->ht[0].table[d->rehashidx] == NULL) {
             d->rehashidx++;
             if (--empty_visits == 0) return 1;
