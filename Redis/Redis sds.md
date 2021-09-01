@@ -2,7 +2,7 @@
 redis 用一个sds结构包裹代替裸的C字符串
 
 ### 结构
-redis根据字符串长度的大小,用途异化了一系列类似结构的struct header来包裹实际存储的字符串
+redis根据字符串长度的大小,用途,异化了一系列类似结构的struct header来包裹实际存储的字符串
 ```c
 // src/sds.h
 typedef char *sds;
