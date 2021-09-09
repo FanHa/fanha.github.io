@@ -135,5 +135,3 @@ func (b *Writer) Flush() error {
 	return nil
 }
 ```
-
-## Scaner
