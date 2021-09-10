@@ -20,7 +20,7 @@ func makeslice(et *_type, len, cap int) unsafe.Pointer {
 }
 ```
 ### `growslice`增加slice大小
-当往slice里不断加入数据,直到数据量超过slice的cap值时,需要调用growslice增加slice的cap大小
+当往slice里不断加入数据(`append`),直到数据量超过slice的cap值时,需要调用growslice增加slice的cap大小
 ```go
 // runtime/slice.go
 // 参数cap是增加后的新cap值大小(这只是个期望值,实际为了效率会优化生成一个比这个值大的数字)
@@ -68,11 +68,71 @@ type slice struct {
 }
 ```
 
-
 ### slicecopy
+调用`copy(SLICEA, SLICEB)`
+```go
+// runtime/slice.go
+func slicecopy(toPtr unsafe.Pointer, toLen int, fromPtr unsafe.Pointer, fromLen int, width uintptr) int {
+	// 源slice的element数大于目标slice的element时,需要调整copy的数量
+	n := fromLen
+	if toLen < n {
+		n = toLen
+	}
+	// element数量 * element 宽度
+	size := uintptr(n) * width
+	// 复制源slice指针的内容到目标slice指针的位置,是真的新拷贝了一份值,而不是把指针指到了原值上
+		memmove(toPtr, fromPtr, size)
 
-### slice赋值
-// OSLICE       // X[Low : High] (X is untypechecked or slice)
+	return n
+}
+```
+
+### slice取值
+常见的slice取值情形
+```go
+// compile/internal/ir/node.go
+	OSLICE       // X[Low : High] (X is untypechecked or slice)
 	OSLICEARR    // X[Low : High] (X is pointer to array)
 	OSLICESTR    // X[Low : High] (X is string)
 	OSLICE3      // X[Low : High : Max] (X is untypedchecked or slice)
+	OSLICE3ARR   // X[Low : High : Max] (X is pointer to array)
+
+	OSLICEHEADER // sliceheader{Ptr, Len, Cap} (Ptr is unsafe.Pointer, Len is length, Cap is capacity)
+```
+
+#### slice在编译阶段的表达式结构
+```go
+// compile/internal/ir/expr.go
+type SliceExpr struct {
+	miniExpr
+	X    Node // slice变量名
+	Low  Node // 低位
+	High Node // 高位
+	Max  Node // max,一般切片表达式是要赋值给另一个新切片的,这个max相当于新切片的cap值
+}
+```
+#### 编译阶段遇到slice(或array)取值的处理
+```go
+// compile/internal/walk/expr.go
+func walkExpr1(n ir.Node, init *ir.Nodes) ir.Node {
+	switch n.Op() {
+	// ...
+	case ir.OSLICE, ir.OSLICEARR, ir.OSLICESTR, ir.OSLICE3, ir.OSLICE3ARR:
+		n := n.(*ir.SliceExpr)
+		return walkSlice(n, init)
+	// ...
+	}
+}
+
+func walkSlice(n *ir.SliceExpr, init *ir.Nodes) ir.Node {
+	// ...
+	// slice表达式的变量名,低位,高位,max的表达式解析成具体的值
+		n.X = walkExpr(n.X, init)
+	n.Low = walkExpr(n.Low, init)
+	n.High = walkExpr(n.High, init)
+	n.Max = walkExpr(n.Max, init)
+	// ...
+}
+```
+
+#### 运行阶段的从一个slice里取一段赋值给另一个slice的源代码 todo
