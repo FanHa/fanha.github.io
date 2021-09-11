@@ -4,9 +4,11 @@
 
 ## 序
 slice相当于一个更灵活的动态数组
+## 编译时创建slice
 
 ## 运行时的slice函数
 ### `makeslice`创建slice 
+// 这个创建是在运行时创建的实际存储slice数据的结构
 ```go
 // runtime/slice.go
 func makeslice(et *_type, len, cap int) unsafe.Pointer {
