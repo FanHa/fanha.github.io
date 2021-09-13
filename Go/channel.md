@@ -92,7 +92,7 @@ func walkSend(n *ir.SendStmt, init *ir.Nodes) ir.Node {
 	n1 = typecheck.AssignConv(n1, n.Chan.Type().Elem(), "chan send")
 	n1 = walkExpr(n1, init)
 	n1 = typecheck.NodAddr(n1)
-    // 编译时把对应的运行时代吗 chansend1 设置好了
+    // 编译时设置了对应的运行时代码 chansend1
 	return mkcall1(chanfn("chansend1", 2, n.Chan.Type()), nil, init, n.Chan, n1)
 }
 ```
@@ -112,10 +112,9 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 		panic(plainError("send on closed channel"))
 	}
     
-    // 找到一个正在等待这个channel有新的可读内容的goroutine,把消息发给‘ta’
-	if sg := c.recvq.dequeue(); sg != nil { // todo
-		// Found a waiting receiver. We pass the value we want to send
-		// directly to the receiver, bypassing the channel buffer (if any).
+    // 找到一个正在等待这个channel有新的可读内容的阻塞中的goroutine,把消息发给‘ta’
+	if sg := c.recvq.dequeue(); sg != nil { 
+        // todo
 		send(c, sg, ep, func() { unlock(&c.lock) }, 3)
 		return true
 	}
@@ -135,15 +134,11 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 		return true
 	}
 
-	// 既没有goroutine正在等待channel内容,channel也没有多的buf空间时,需要将当前goroutine阻塞,等待有别的goroutine读了这条消息后再继续运行
+	// 既没有goroutine正在等待channel内容,channel也没有多的buf空间时,需要将当前goroutine阻塞,将运行控制权利交给g0,等待有别的goroutine读了这条消息后再继续运行
 	gp := getg()
-	mysg := acquireSudog()
+	mysg := acquireSudog() // 获取一个sudoG任务
+    // 更新一些任务上下文信息
 	mysg.releasetime = 0
-	if t0 != 0 {
-		mysg.releasetime = -1
-	}
-	// No stack splits between assigning elem and enqueuing mysg
-	// on gp.waiting where copystack can find it.
 	mysg.elem = ep
 	mysg.waitlink = nil
 	mysg.g = gp
@@ -151,23 +146,14 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	mysg.c = c
 	gp.waiting = mysg
 	gp.param = nil
-	c.sendq.enqueue(mysg)
-	// Signal to anyone trying to shrink our stack that we're about
-	// to park on a channel. The window between when this G's status
-	// changes and when we set gp.activeStackChans is not safe for
-	// stack shrinking.
-	atomic.Store8(&gp.parkingOnChan, 1)
+    // 将sudoG任务加入到channel的sendq队列中,这样该channel的消费方goroutine可以取到当前goroutine的信息,在消费完后更新当前goroutine的调度状态,让当前goroutine有机会继续运行下去
+	c.sendq.enqueue(mysg) 
+	// ...
+    // 移交当前goroutine的运行权利给g0,
+    // todo 当前goroutine是否会阻塞在这里直到g0下一次调用当前goroutine??
 	gopark(chanparkcommit, unsafe.Pointer(&c.lock), waitReasonChanSend, traceEvGoBlockSend, 2)
-	// Ensure the value being sent is kept alive until the
-	// receiver copies it out. The sudog has a pointer to the
-	// stack object, but sudogs aren't considered as roots of the
-	// stack tracer.
-	KeepAlive(ep)
 
-	// someone woke us up.
-	if mysg != gp.waiting {
-		throw("G waiting list is corrupted")
-	}
+	// 到这里时说明当前goroutine又被g0唤醒了,此时当前goroutine因往channel里写而阻塞的消息已经被消费者goroutine读取了,当前goroutine继续做该做的事,更新信息以及释放sudoG
 	gp.waiting = nil
 	gp.activeStackChans = false
 	closed := !mysg.success
@@ -176,13 +162,96 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 		blockevent(mysg.releasetime-t0, 2)
 	}
 	mysg.c = nil
-	releaseSudog(mysg)
-	if closed {
-		if c.closed == 0 {
-			throw("chansend: spurious wakeup")
-		}
-		panic(plainError("send on closed channel"))
-	}
+	releaseSudog(mysg) // 释放sudoG
 	return true
 }
 ```
+### send 直接把消息发到阻塞的读队列里 todo
+
+## channel 读
+### 编译时
+```go
+// cmd/compile/internal/walk/assign.go
+func walkAssignRecv(init *ir.Nodes, n *ir.AssignListStmt) ir.Node {
+	// ...
+    // 编译时设置了对应的运行时代码 chanrecv2
+	fn := chanfn("chanrecv2", 2, r.X.Type())
+	ok := n.Lhs[1]
+	call := mkcall1(fn, types.Types[types.TBOOL], init, r.X, n1)
+	return typecheck.Stmt(ir.NewAssignStmt(base.Pos, ok, call))
+}
+```
+### 运行时
+```go
+// runtime/chan.go
+func chanrecv2(c *hchan, elem unsafe.Pointer) (received bool) {
+	_, received = chanrecv(c, elem, true)
+	return
+}
+func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool) {
+    // ...
+    // channel锁
+	lock(&c.lock)
+
+	if c.closed != 0 && c.qcount == 0 { // channel已经关闭,且没有内容了,需要返回给调用方知道这个信息(return true, false)
+        //...
+		unlock(&c.lock)
+		return true, false
+	}
+
+	if sg := c.sendq.dequeue(); sg != nil {  // 如果有goroutine阻塞在写消息到channel的阶段,调用recv直接从c.sendq里拿消息出来
+		// todo
+		recv(c, sg, ep, func() { unlock(&c.lock) }, 3)
+		return true, true
+	}
+
+    // 如果是那种带buf的channel,buf里有内容,则从buf里取消息
+	if c.qcount > 0 {
+		// ...
+		if ep != nil {
+			typedmemmove(c.elemtype, ep, qp)
+		}
+		typedmemclr(c.elemtype, qp)
+		c.recvx++
+		if c.recvx == c.dataqsiz {
+			c.recvx = 0
+		}
+		c.qcount--
+		unlock(&c.lock)
+		return true, true
+	}
+
+    // 既没有阻塞的goroutine写入方,buf里也没内容可读,需要阻塞当前读取方,直到有goroutine往channel里写内容
+	// 注:逻辑与写阻塞类似
+	gp := getg()
+	mysg := acquireSudog()
+	mysg.releasetime = 0
+	// ...
+	mysg.elem = ep
+	mysg.waitlink = nil
+	gp.waiting = mysg
+	mysg.g = gp
+	mysg.isSelect = false
+	mysg.c = c
+	gp.param = nil
+    // 把当前sudog入队recvq,这样有写入channel的goroutine就可以直接把消息写入
+	c.recvq.enqueue(mysg)
+	
+	atomic.Store8(&gp.parkingOnChan, 1)
+    // 移交当前goroutine的运行权利给g0
+	gopark(chanparkcommit, unsafe.Pointer(&c.lock), waitReasonChanReceive, traceEvGoBlockRecv, 2)
+
+	// 到这里时说明当前goroutine又被g0唤醒了,此时当前goroutine因读阻塞的消息已经被读到了相应的空间了,当前goroutine继续做该做的事,更新信息以及释放sudoG
+	gp.waiting = nil
+	gp.activeStackChans = false
+	if mysg.releasetime > 0 {
+		blockevent(mysg.releasetime-t0, 2)
+	}
+	success := mysg.success
+	gp.param = nil
+	mysg.c = nil
+	releaseSudog(mysg)
+	return true, success
+}
+```
+### recv 直接从阻塞的写队列里取消息 todo
