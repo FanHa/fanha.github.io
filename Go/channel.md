@@ -37,14 +37,14 @@ type hchan struct {
 	dataqsiz uint           // channel的buf长度
 	buf      unsafe.Pointer // 存放channel里的消息的地方
 	elemsize uint16 // channel内元素的大小
-	closed   uint32
+	closed   uint32 // channel是否已关闭
 	elemtype *_type // channel内元素的类型
-	sendx    uint   // send index
-	recvx    uint   // receive index
-	recvq    waitq  // list of recv waiters
-	sendq    waitq  // list of send waiters
+	sendx    uint   // 当前写进buf的index
+	recvx    uint   // 当前从buf读的index
+	recvq    waitq  // 读阻塞的gotoutine
+	sendq    waitq  // 写阻塞的goroutine
 
-	lock mutex // 保护channel能在多goroutine下的临界区
+	lock mutex // 保护channel在多goroutine下的临界区
 }
 ```
 #### makechan
@@ -166,11 +166,39 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	return true
 }
 ```
-### send 直接把消息发到阻塞的读队列里 todo
+### send 直接把消息发到阻塞的读goroutine里
+```go
+// runtime/chan.go
+func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
+
+	if sg.elem != nil {
+        // 直接将内容写到读阻塞的goroutine里
+		sendDirect(c.elemtype, sg, ep)
+		sg.elem = nil
+	}
+	gp := sg.g
+	unlockf()
+	gp.param = unsafe.Pointer(sg)
+	sg.success = true
+	if sg.releasetime != 0 {
+		sg.releasetime = cputicks()
+	}
+    // 更改阻塞的读goroutine的状态,让ta有机会继续运行
+	goready(gp, skip+1)
+}
+```
 
 ## channel 读
 ### 编译时
+#### 返回两个变量的情况
 ```go
+// cmd/compile/internal/walk/expr.go
+    // x, y = <-c
+	// order.stmt made sure x is addressable or blank.
+	case ir.OAS2RECV:
+		n := n.(*ir.AssignListStmt)
+		return walkAssignRecv(init, n)
+
 // cmd/compile/internal/walk/assign.go
 func walkAssignRecv(init *ir.Nodes, n *ir.AssignListStmt) ir.Node {
 	// ...
@@ -181,9 +209,25 @@ func walkAssignRecv(init *ir.Nodes, n *ir.AssignListStmt) ir.Node {
 	return typecheck.Stmt(ir.NewAssignStmt(base.Pos, ok, call))
 }
 ```
+####  返回一个变量的情况
+```go
+// compile/internal/walk/assign.go
+    case ir.ORECV:
+		// x = <-c; as.Left is x, as.Right.Left is c.
+		// order.stmt made sure x is addressable.
+		recv := as.Y.(*ir.UnaryExpr)
+		recv.X = walkExpr(recv.X, init)
+
+		n1 := typecheck.NodAddr(as.X)
+		r := recv.X // the channel
+		return mkcall1(chanfn("chanrecv1", 2, r.Type()), nil, init, r, n1)
+```
 ### 运行时
 ```go
 // runtime/chan.go
+func chanrecv1(c *hchan, elem unsafe.Pointer) {
+	chanrecv(c, elem, true)
+}
 func chanrecv2(c *hchan, elem unsafe.Pointer) (received bool) {
 	_, received = chanrecv(c, elem, true)
 	return
@@ -254,4 +298,47 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 	return true, success
 }
 ```
-### recv 直接从阻塞的写队列里取消息 todo
+### recv 直接从阻塞的写goroutine里读
+```go
+// runtime/chan.go
+func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
+	if c.dataqsiz == 0 { // 无buf的channel,直接从sender把消息取出来
+		// ...
+		if ep != nil {
+			// 直接把值复制过来
+			recvDirect(c.elemtype, sg, ep)
+		}
+	} else {
+		// 有buf的channel,需要讲究个先来后到,把buf里最前面的消息取了,然后把阻塞的sender消息添加到buf里去
+
+        // 先找到当前buf的读位置
+		qp := chanbuf(c, c.recvx)
+		// 将buf当前可读位置的内容复制出来
+		if ep != nil {
+			typedmemmove(c.elemtype, ep, qp)
+		}
+		// 然后复制阻塞的消息到buf里
+		typedmemmove(c.elemtype, qp, sg.elem)
+
+        // 更新buf的读位置
+		c.recvx++
+		if c.recvx == c.dataqsiz {
+			c.recvx = 0
+		}
+		c.sendx = c.recvx // c.sendx = (c.sendx+1) % c.dataqsiz
+	}
+	sg.elem = nil
+	gp := sg.g
+	unlockf()
+	gp.param = unsafe.Pointer(sg)
+	sg.success = true
+	if sg.releasetime != 0 {
+		sg.releasetime = cputicks()
+	}
+    // 更改阻塞的写goroutine的状态,让ta有机会继续运行
+	goready(gp, skip+1)
+}
+
+```
+
+## select 中的读 todo
