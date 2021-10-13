@@ -1,0 +1,271 @@
+## 版本
++ Github:golang/go
++ 分支:release-branch.go.1.17
+
+## 序
+go 编译器将代码经过分析后生成了可以代表代码的AST(或加工后的IR树),函数对应树中的一个节点,但函数内的变量需要根据实际情形决定是存放在堆中还是存放在栈中(仅本地使用的一般放在栈中,需要共享使用的要`escape`到堆中)
+
+## escape 入口
+```go
+// cmd/compile/internal/gc/main.go
+func Main(archInit func(*ssagen.ArchInfo)) {
+	// ...
+    // escape 分析
+    escape.Funcs(typecheck.Target.Decls)
+    // ...
+}
+```
+
+```go
+// cmd/compile/internal/escape/escape.go
+// 如函数名,对 ‘所有’ func节点进行逃逸分析, Batch 是注入的一系列回调
+// todo Batch
+func Funcs(all []ir.Node) {
+	ir.VisitFuncsBottomUp(all, Batch)
+}
+```
+
+```go
+// cmd/compile/internal/ir/scc.go
+func VisitFuncsBottomUp(list []Node, analyze func(list []*Func, recursive bool)) {
+	var v bottomUpVisitor
+	v.analyze = analyze // 注册要分析的回调方法
+	v.nodeID = make(map[*Func]uint32)
+	for _, n := range list { // 遍历所有节点
+		if n.Op() == ODCLFUNC { // 只对声明的Func进行escape分析
+			n := n.(*Func)
+			if !n.IsHiddenClosure() {
+				v.visit(n) //开工
+			}
+		}
+	}
+}
+```
+## 数据结构
+### Func 节点结构
+```go
+// cmd/compile/internal/ir/func.go
+type Func struct {
+	miniNode
+	Body Nodes
+	Iota int64
+
+	Nname    *Name        // ONAME node
+	OClosure *ClosureExpr // OCLOSURE node
+
+	Shortname *types.Sym
+
+	// Extra entry code for the function. For example, allocate and initialize
+	// memory for escaping parameters.
+	Enter Nodes
+	Exit  Nodes
+
+	// ONAME nodes for all params/locals for this func/closure, does NOT
+	// include closurevars until transforming closures during walk.
+	// Names must be listed PPARAMs, PPARAMOUTs, then PAUTOs,
+	// with PPARAMs and PPARAMOUTs in order corresponding to the function signature.
+	// However, as anonymous or blank PPARAMs are not actually declared,
+	// they are omitted from Dcl.
+	// Anonymous and blank PPARAMOUTs are declared as ~rNN and ~bNN Names, respectively.
+	Dcl []*Name
+
+	// ClosureVars lists the free variables that are used within a
+	// function literal, but formally declared in an enclosing
+	// function. The variables in this slice are the closure function's
+	// own copy of the variables, which are used within its function
+	// body. They will also each have IsClosureVar set, and will have
+	// Byval set if they're captured by value.
+	ClosureVars []*Name
+
+	// Enclosed functions that need to be compiled.
+	// Populated during walk.
+	Closures []*Func
+
+	// Parents records the parent scope of each scope within a
+	// function. The root scope (0) has no parent, so the i'th
+	// scope's parent is stored at Parents[i-1].
+	Parents []ScopeID
+
+	// Marks records scope boundary changes.
+	Marks []Mark
+
+	FieldTrack map[*obj.LSym]struct{}
+	DebugInfo  interface{}
+	LSym       *obj.LSym // Linker object in this function's native ABI (Func.ABI)
+
+	Inl *Inline
+
+	// Closgen tracks how many closures have been generated within
+	// this function. Used by closurename for creating unique
+	// function names.
+	Closgen int32
+
+	Label int32 // largest auto-generated label in this function
+
+	Endlineno src.XPos
+	WBPos     src.XPos // position of first write barrier; see SetWBPos
+
+	Pragma PragmaFlag // go:xxx function annotations
+
+	flags bitset16
+
+	// ABI is a function's "definition" ABI. This is the ABI that
+	// this function's generated code is expecting to be called by.
+	//
+	// For most functions, this will be obj.ABIInternal. It may be
+	// a different ABI for functions defined in assembly or ABI wrappers.
+	//
+	// This is included in the export data and tracked across packages.
+	ABI obj.ABI
+	// ABIRefs is the set of ABIs by which this function is referenced.
+	// For ABIs other than this function's definition ABI, the
+	// compiler generates ABI wrapper functions. This is only tracked
+	// within a package.
+	ABIRefs obj.ABISet
+
+	NumDefers  int32 // number of defer calls in the function
+	NumReturns int32 // number of explicit returns in the function
+
+	// nwbrCalls records the LSyms of functions called by this
+	// function for go:nowritebarrierrec analysis. Only filled in
+	// if nowritebarrierrecCheck != nil.
+	NWBRCalls *[]SymAndPos
+}
+```
+### Visitor 结构
+```go
+// cmd/compile/internal/ir/scc.go
+type bottomUpVisitor struct {
+	analyze  func([]*Func, bool) // 注入的分析方法组
+	visitgen uint32 // 自增visitID
+	nodeID   map[*Func]uint32 // 纪录一个函数是否已经被visit过
+	stack    []*Func // todo
+}
+```
+## 分析
+```go
+// cmd/compile/internal/ir/scc.go
+func (v *bottomUpVisitor) visit(n *Func) uint32 {
+	if id := v.nodeID[n]; id > 0 {
+		// already visited
+		return id
+	}
+
+	v.visitgen++
+	id := v.visitgen
+	v.nodeID[n] = id
+	v.visitgen++
+	min := v.visitgen
+	v.stack = append(v.stack, n)
+
+	do := func(defn Node) {
+		if defn != nil {
+			if m := v.visit(defn.(*Func)); m < min {
+				min = m
+			}
+		}
+	}
+
+	Visit(n, func(n Node) {
+		switch n.Op() {
+		case ONAME:
+			if n := n.(*Name); n.Class == PFUNC {
+				do(n.Defn)
+			}
+		case ODOTMETH, OCALLPART, OMETHEXPR:
+			if fn := MethodExprName(n); fn != nil {
+				do(fn.Defn)
+			}
+		case OCLOSURE:
+			n := n.(*ClosureExpr)
+			do(n.Func)
+		}
+	})
+
+	if (min == id || min == id+1) && !n.IsHiddenClosure() {
+		// This node is the root of a strongly connected component.
+
+		// The original min passed to visitcodelist was v.nodeID[n]+1.
+		// If visitcodelist found its way back to v.nodeID[n], then this
+		// block is a set of mutually recursive functions.
+		// Otherwise it's just a lone function that does not recurse.
+		recursive := min == id
+
+		// Remove connected component from stack.
+		// Mark walkgen so that future visits return a large number
+		// so as not to affect the caller's min.
+
+		var i int
+		for i = len(v.stack) - 1; i >= 0; i-- {
+			x := v.stack[i]
+			if x == n {
+				break
+			}
+			v.nodeID[x] = ^uint32(0)
+		}
+		v.nodeID[n] = ^uint32(0)
+		block := v.stack[i:]
+		// Run escape analysis on this set of functions.
+		v.stack = v.stack[:i]
+		v.analyze(block, recursive)
+	}
+
+	return min
+}
+```
+
+## analyze
+### 结构
+```go
+// cmd/compile/internal/escape/escape.go
+type batch struct {
+	allLocs  []*location
+	closures []closure
+
+	heapLoc  location
+	blankLoc location
+}
+```
+### Batch方法
+v.analyze方法是前面注入的 `Batch`方法
+```go
+// cmd/compile/internal/escape/escape.go
+func Batch(fns []*ir.Func, recursive bool) {
+	// ...
+
+	var b batch
+	b.heapLoc.escapes = true
+
+	// Construct data-flow graph from syntax trees.
+	for _, fn := range fns {
+		if base.Flag.W > 1 {
+			s := fmt.Sprintf("\nbefore escape %v", fn)
+			ir.Dump(s, fn)
+		}
+		b.initFunc(fn)
+	}
+	for _, fn := range fns {
+		if !fn.IsHiddenClosure() {
+			b.walkFunc(fn)
+		}
+	}
+
+	// We've walked the function bodies, so we've seen everywhere a
+	// variable might be reassigned or have it's address taken. Now we
+	// can decide whether closures should capture their free variables
+	// by value or reference.
+	for _, closure := range b.closures {
+		b.flowClosure(closure.k, closure.clo)
+	}
+	b.closures = nil
+
+	for _, loc := range b.allLocs {
+		if why := HeapAllocReason(loc.n); why != "" {
+			b.flow(b.heapHole().addr(loc.n, why), loc)
+		}
+	}
+
+	b.walkAll()
+	b.finish(fns)
+}
+```
