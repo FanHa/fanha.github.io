@@ -30,7 +30,7 @@ func Funcs(all []ir.Node) {
 func VisitFuncsBottomUp(list []Node, analyze func(list []*Func, recursive bool)) {
 	var v bottomUpVisitor
 	v.analyze = analyze // 注册要分析的回调方法
-	v.nodeID = make(map[*Func]uint32)
+	v.nodeID = make(map[*Func]uint32) // 存放已经分析过的Func的 nodeId
 	for _, n := range list { // 遍历所有节点
 		if n.Op() == ODCLFUNC { // 只对声明的Func进行escape分析
 			n := n.(*Func)
@@ -142,30 +142,35 @@ type bottomUpVisitor struct {
 	stack    []*Func // todo
 }
 ```
-## 分析
+## `escape`分析过程
 ```go
 // cmd/compile/internal/ir/scc.go
 func (v *bottomUpVisitor) visit(n *Func) uint32 {
+	// 判断当前Func是否已被visit过
 	if id := v.nodeID[n]; id > 0 {
-		// already visited
 		return id
 	}
 
+	// 当前Func节点没有被分析过,递增生成新的NodeId,
 	v.visitgen++
 	id := v.visitgen
 	v.nodeID[n] = id
+	// todo 这个min是啥?
 	v.visitgen++
 	min := v.visitgen
+	// 所有遍历去重后的节点线放到stack上,后面再统一分析
 	v.stack = append(v.stack, n)
 
 	do := func(defn Node) {
 		if defn != nil {
+			// 递归visit
 			if m := v.visit(defn.(*Func)); m < min {
 				min = m
 			}
 		}
 	}
 
+	// 深度优先遍历以当前节点为root的树
 	Visit(n, func(n Node) {
 		switch n.Op() {
 		case ONAME:
@@ -183,17 +188,8 @@ func (v *bottomUpVisitor) visit(n *Func) uint32 {
 	})
 
 	if (min == id || min == id+1) && !n.IsHiddenClosure() {
-		// This node is the root of a strongly connected component.
-
-		// The original min passed to visitcodelist was v.nodeID[n]+1.
-		// If visitcodelist found its way back to v.nodeID[n], then this
-		// block is a set of mutually recursive functions.
-		// Otherwise it's just a lone function that does not recurse.
+		// todo 精简stack(估计是存在递归调用啥的)
 		recursive := min == id
-
-		// Remove connected component from stack.
-		// Mark walkgen so that future visits return a large number
-		// so as not to affect the caller's min.
 
 		var i int
 		for i = len(v.stack) - 1; i >= 0; i-- {
@@ -205,7 +201,7 @@ func (v *bottomUpVisitor) visit(n *Func) uint32 {
 		}
 		v.nodeID[n] = ^uint32(0)
 		block := v.stack[i:]
-		// Run escape analysis on this set of functions.
+		// 遍历精简后的stack,调用注入的analyze方法
 		v.stack = v.stack[:i]
 		v.analyze(block, recursive)
 	}
