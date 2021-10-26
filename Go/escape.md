@@ -232,12 +232,9 @@ func Batch(fns []*ir.Func, recursive bool) {
 	var b batch
 	b.heapLoc.escapes = true
 
-	// Construct data-flow graph from syntax trees.
+	// 初始化所有Func
 	for _, fn := range fns {
-		if base.Flag.W > 1 {
-			s := fmt.Sprintf("\nbefore escape %v", fn)
-			ir.Dump(s, fn)
-		}
+		// #ref initFunc
 		b.initFunc(fn)
 	}
 	for _, fn := range fns {
@@ -263,5 +260,63 @@ func Batch(fns []*ir.Func, recursive bool) {
 
 	b.walkAll()
 	b.finish(fns)
+}
+```
+
+```go
+// src/cmd/compile/internal/escape/escape.go
+func (b *batch) initFunc(fn *ir.Func) {
+	// 创建一个包裹当前Func节点 和 batch信息的 escape结构 #ref with
+	e := b.with(fn)
+	// ...
+
+	// 遍历当前Func的所有声明
+	for _, n := range fn.Dcl {
+		if n.Op() == ir.ONAME {
+			// 为每一个变量创建一个location #ref newLoc
+			e.newLoc(n, false)
+		}
+	}
+
+	// Initialize resultIndex for result parameters.
+	for i, f := range fn.Type().Results().FieldSlice() {
+		e.oldLoc(f.Nname.(*ir.Name)).resultIndex = 1 + i
+	}
+}
+
+// escape结构包裹一个func节点和batch信息
+func (b *batch) with(fn *ir.Func) *escape {
+	return &escape{
+		batch:     b,
+		curfn:     fn,
+		loopDepth: 1,
+	}
+}
+
+// 给这个变量信息分配存储位置
+func (e *escape) newLoc(n ir.Node, transient bool) *location {
+	// ...
+
+	loc := &location{
+		n:         n,
+		curfn:     e.curfn,
+		loopDepth: e.loopDepth,
+		transient: transient,
+	}
+	e.allLocs = append(e.allLocs, loc)
+	if n != nil {
+		if n.Op() == ir.ONAME {
+			n := n.(*ir.Name)
+			if n.Curfn != e.curfn {
+				base.Fatalf("curfn mismatch: %v != %v for %v", n.Curfn, e.curfn, n)
+			}
+
+			if n.Opt != nil {
+				base.Fatalf("%v already has a location", n)
+			}
+			n.Opt = loc
+		}
+	}
+	return loc
 }
 ```
