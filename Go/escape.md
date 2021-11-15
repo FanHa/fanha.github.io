@@ -239,10 +239,12 @@ func Batch(fns []*ir.Func, recursive bool) {
 	}
 	for _, fn := range fns {
 		if !fn.IsHiddenClosure() {
+			// 解析Func里的各个变量的关系 #ref walkFunc
 			b.walkFunc(fn)
 		}
 	}
 
+	// ...todo
 	// We've walked the function bodies, so we've seen everywhere a
 	// variable might be reassigned or have it's address taken. Now we
 	// can decide whether closures should capture their free variables
@@ -252,17 +254,20 @@ func Batch(fns []*ir.Func, recursive bool) {
 	}
 	b.closures = nil
 
+	// 遍历所有变量的location结构,形成一张变量节点间的有向图 #ref flow
 	for _, loc := range b.allLocs {
 		if why := HeapAllocReason(loc.n); why != "" {
 			b.flow(b.heapHole().addr(loc.n, why), loc)
 		}
 	}
 
+	// 遍历所有location,根据有向图,给需要逃逸的变量打上escapes标记
 	b.walkAll()
 	b.finish(fns)
 }
 ```
 
+#### initFunc 初始化Func节点
 ```go
 // src/cmd/compile/internal/escape/escape.go
 func (b *batch) initFunc(fn *ir.Func) {
@@ -278,7 +283,8 @@ func (b *batch) initFunc(fn *ir.Func) {
 		}
 	}
 
-	// Initialize resultIndex for result parameters.
+	// 当前Func的返回参数的处理
+	// todo ??
 	for i, f := range fn.Type().Results().FieldSlice() {
 		e.oldLoc(f.Nname.(*ir.Name)).resultIndex = 1 + i
 	}
@@ -296,27 +302,404 @@ func (b *batch) with(fn *ir.Func) *escape {
 // 给这个变量信息分配存储位置
 func (e *escape) newLoc(n ir.Node, transient bool) *location {
 	// ...
-
+	// 初始化一个location结构
 	loc := &location{
 		n:         n,
 		curfn:     e.curfn,
 		loopDepth: e.loopDepth,
 		transient: transient,
 	}
+	// 默认都保存在allLocs里
 	e.allLocs = append(e.allLocs, loc)
 	if n != nil {
 		if n.Op() == ir.ONAME {
 			n := n.(*ir.Name)
-			if n.Curfn != e.curfn {
-				base.Fatalf("curfn mismatch: %v != %v for %v", n.Curfn, e.curfn, n)
-			}
-
-			if n.Opt != nil {
-				base.Fatalf("%v already has a location", n)
-			}
+			// 将变量节点的Opt属性设置为刚生成的location
 			n.Opt = loc
 		}
 	}
 	return loc
+}
+```
+
+#### walkFunc Func节点的
+什么情形下需要把变量逃逸到堆上?
+##### return
+##### 闭包
+##### 大变量
+##### 循环逃逸
+```go
+// src/cmd/compile/internal/escape/escape.go
+func (b *batch) walkFunc(fn *ir.Func) {
+	e := b.with(fn)
+	fn.SetEsc(escFuncStarted)
+
+	//Goto相关语法的处理 todo
+	ir.Visit(fn, func(n ir.Node) {
+		switch n.Op() {
+		case ir.OLABEL:
+			n := n.(*ir.LabelStmt)
+			if e.labels == nil {
+				e.labels = make(map[*types.Sym]labelState)
+			}
+			e.labels[n.Label] = nonlooping
+
+		case ir.OGOTO:
+			// If we visited the label before the goto,
+			// then this is a looping label.
+			n := n.(*ir.BranchStmt)
+			if e.labels[n.Label] == nonlooping {
+				e.labels[n.Label] = looping
+			}
+		}
+	})
+
+	// 解析节点的body #ref block
+	e.block(fn.Body)
+
+	// ...
+}
+
+func (e *escape) block(l ir.Nodes) {
+	old := e.loopDepth
+	e.stmts(l)
+	e.loopDepth = old
+}
+
+func (e *escape) stmts(l ir.Nodes) {
+	// 遍历Func body里的每一个节点并解析
+	for _, n := range l {
+		e.stmt(n)
+	}
+}
+
+func (e *escape) stmt(n ir.Node) {
+
+	lno := ir.SetPos(n)
+	defer func() {
+		base.Pos = lno
+	}()
+
+	e.stmts(n.Init())
+
+	switch n.Op() {
+	default:
+		base.Fatalf("unexpected stmt: %v", n)
+
+	case ir.ODCLCONST, ir.ODCLTYPE, ir.OFALL, ir.OINLMARK:
+		// nop
+
+	case ir.OBREAK, ir.OCONTINUE, ir.OGOTO:
+		// TODO(mdempsky): Handle dead code?
+
+	case ir.OBLOCK:
+		n := n.(*ir.BlockStmt)
+		e.stmts(n.List)
+
+	case ir.ODCL:
+		// Record loop depth at declaration.
+		n := n.(*ir.Decl)
+		if !ir.IsBlank(n.X) {
+			e.dcl(n.X)
+		}
+
+	case ir.OLABEL:
+		n := n.(*ir.LabelStmt)
+		switch e.labels[n.Label] {
+		case nonlooping:
+			if base.Flag.LowerM > 2 {
+				fmt.Printf("%v:%v non-looping label\n", base.FmtPos(base.Pos), n)
+			}
+		case looping:
+			if base.Flag.LowerM > 2 {
+				fmt.Printf("%v: %v looping label\n", base.FmtPos(base.Pos), n)
+			}
+			e.loopDepth++
+		default:
+			base.Fatalf("label missing tag")
+		}
+		delete(e.labels, n.Label)
+
+	case ir.OIF:
+		n := n.(*ir.IfStmt)
+		e.discard(n.Cond)
+		e.block(n.Body)
+		e.block(n.Else)
+
+	case ir.OFOR, ir.OFORUNTIL:
+		n := n.(*ir.ForStmt)
+		e.loopDepth++
+		e.discard(n.Cond)
+		e.stmt(n.Post)
+		e.block(n.Body)
+		e.loopDepth--
+
+	case ir.ORANGE:
+		// for Key, Value = range X { Body }
+		n := n.(*ir.RangeStmt)
+
+		// X is evaluated outside the loop.
+		tmp := e.newLoc(nil, false)
+		e.expr(tmp.asHole(), n.X)
+
+		e.loopDepth++
+		ks := e.addrs([]ir.Node{n.Key, n.Value})
+		if n.X.Type().IsArray() {
+			e.flow(ks[1].note(n, "range"), tmp)
+		} else {
+			e.flow(ks[1].deref(n, "range-deref"), tmp)
+		}
+		e.reassigned(ks, n)
+
+		e.block(n.Body)
+		e.loopDepth--
+
+	case ir.OSWITCH:
+		n := n.(*ir.SwitchStmt)
+
+		if guard, ok := n.Tag.(*ir.TypeSwitchGuard); ok {
+			var ks []hole
+			if guard.Tag != nil {
+				for _, cas := range n.Cases {
+					cv := cas.Var
+					k := e.dcl(cv) // type switch variables have no ODCL.
+					if cv.Type().HasPointers() {
+						ks = append(ks, k.dotType(cv.Type(), cas, "switch case"))
+					}
+				}
+			}
+			e.expr(e.teeHole(ks...), n.Tag.(*ir.TypeSwitchGuard).X)
+		} else {
+			e.discard(n.Tag)
+		}
+
+		for _, cas := range n.Cases {
+			e.discards(cas.List)
+			e.block(cas.Body)
+		}
+
+	case ir.OSELECT:
+		n := n.(*ir.SelectStmt)
+		for _, cas := range n.Cases {
+			e.stmt(cas.Comm)
+			e.block(cas.Body)
+		}
+	case ir.ORECV:
+		// TODO(mdempsky): Consider e.discard(n.Left).
+		n := n.(*ir.UnaryExpr)
+		e.exprSkipInit(e.discardHole(), n) // already visited n.Ninit
+	case ir.OSEND:
+		n := n.(*ir.SendStmt)
+		e.discard(n.Chan)
+		e.assignHeap(n.Value, "send", n)
+
+	case ir.OAS:
+		n := n.(*ir.AssignStmt)
+		e.assignList([]ir.Node{n.X}, []ir.Node{n.Y}, "assign", n)
+	case ir.OASOP:
+		n := n.(*ir.AssignOpStmt)
+		// TODO(mdempsky): Worry about OLSH/ORSH?
+		e.assignList([]ir.Node{n.X}, []ir.Node{n.Y}, "assign", n)
+	case ir.OAS2:
+		n := n.(*ir.AssignListStmt)
+		e.assignList(n.Lhs, n.Rhs, "assign-pair", n)
+
+	case ir.OAS2DOTTYPE: // v, ok = x.(type)
+		n := n.(*ir.AssignListStmt)
+		e.assignList(n.Lhs, n.Rhs, "assign-pair-dot-type", n)
+	case ir.OAS2MAPR: // v, ok = m[k]
+		n := n.(*ir.AssignListStmt)
+		e.assignList(n.Lhs, n.Rhs, "assign-pair-mapr", n)
+	case ir.OAS2RECV, ir.OSELRECV2: // v, ok = <-ch
+		n := n.(*ir.AssignListStmt)
+		e.assignList(n.Lhs, n.Rhs, "assign-pair-receive", n)
+
+	case ir.OAS2FUNC:
+		n := n.(*ir.AssignListStmt)
+		e.stmts(n.Rhs[0].Init())
+		ks := e.addrs(n.Lhs)
+		e.call(ks, n.Rhs[0], nil)
+		e.reassigned(ks, n)
+	case ir.ORETURN:
+		n := n.(*ir.ReturnStmt)
+		results := e.curfn.Type().Results().FieldSlice()
+		dsts := make([]ir.Node, len(results))
+		for i, res := range results {
+			dsts[i] = res.Nname.(*ir.Name)
+		}
+		e.assignList(dsts, n.Results, "return", n)
+	case ir.OCALLFUNC, ir.OCALLMETH, ir.OCALLINTER, ir.OCLOSE, ir.OCOPY, ir.ODELETE, ir.OPANIC, ir.OPRINT, ir.OPRINTN, ir.ORECOVER:
+		e.call(nil, n, nil)
+	case ir.OGO, ir.ODEFER:
+		n := n.(*ir.GoDeferStmt)
+		e.stmts(n.Call.Init())
+		e.call(nil, n.Call, n)
+
+	case ir.OTAILCALL:
+		// TODO(mdempsky): Treat like a normal call? esc.go used to just ignore it.
+	}
+}
+```
+
+#### flow 更具前面关于变量的解析信息,形成一个`图`
+```go
+// src/cmd/compile/internal/escape/escape.go
+func (b *batch) flow(k hole, src *location) {
+	if k.addrtaken {
+		src.addrtaken = true
+	}
+
+	dst := k.dst
+	if dst == &b.blankLoc {
+		return
+	}
+	if dst == src && k.derefs >= 0 { // dst = dst, dst = *dst, ...
+		return
+	}
+	if dst.escapes && k.derefs < 0 { // dst = &src
+		if base.Flag.LowerM >= 2 || logopt.Enabled() {
+			pos := base.FmtPos(src.n.Pos())
+			if base.Flag.LowerM >= 2 {
+				fmt.Printf("%s: %v escapes to heap:\n", pos, src.n)
+			}
+			explanation := b.explainFlow(pos, dst, src, k.derefs, k.notes, []*logopt.LoggedOpt{})
+			if logopt.Enabled() {
+				var e_curfn *ir.Func // TODO(mdempsky): Fix.
+				logopt.LogOpt(src.n.Pos(), "escapes", "escape", ir.FuncName(e_curfn), fmt.Sprintf("%v escapes to heap", src.n), explanation)
+			}
+
+		}
+		src.escapes = true
+		return
+	}
+
+	// TODO(mdempsky): Deduplicate edges?
+	dst.edges = append(dst.edges, edge{src: src, derefs: k.derefs, notes: k.notes})
+}
+```
+
+#### walkAll
+```go
+// src/cmd/compile/internal/escape/escape.go
+func (b *batch) walkAll() {
+	// 将所有location结构存入一个队列‘todo’中
+	todo := make([]*location, 0, len(b.allLocs)+1)
+	enqueue := func(loc *location) {
+		if !loc.queued {
+			todo = append(todo, loc)
+			loc.queued = true
+		}
+	}
+
+	for _, loc := range b.allLocs {
+		enqueue(loc)
+	}
+	enqueue(&b.heapLoc)
+
+	var walkgen uint32
+	for len(todo) > 0 {
+		// 将队列末尾的‘location’节点作为‘root’,
+		root := todo[len(todo)-1]
+		// todo列表中去除掉将要深入探究的root节点
+		todo = todo[:len(todo)-1]
+		root.queued = false
+
+		walkgen++
+		// 深入root节点 #ref walkOne
+		b.walkOne(root, walkgen, enqueue)
+	}
+}
+
+func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location)) {
+
+	root.walkgen = walkgen
+	root.derefs = 0 // (以root为初始点设为0)
+	root.dst = nil
+
+	todo := []*location{root} // LIFO queue
+	for len(todo) > 0 {
+		// 这里相当于pop出todo列表里的最后一个元素
+		l := todo[len(todo)-1]
+		todo = todo[:len(todo)-1]
+
+		// 当前location的derefs属性
+		derefs := l.derefs
+
+		// 初始节点的derefs == 0 ,所有第一遍遍历时addressOf 为 false,当出现derefs < 0 时表明该location被初始节点引用
+		addressOf := derefs < 0
+		if addressOf {·
+			// For a flow path like "root = &l; l = x",
+			// l's address flows to root, but x's does
+			// not. We recognize this by lower bounding
+			// derefs at 0.
+			derefs = 0
+
+			// If l's address flows to a non-transient
+			// location, then l can't be transiently
+			// allocated.
+			if !root.transient && l.transient {
+				l.transient = false
+				enqueue(l)
+			}
+		}
+
+		if b.outlives(root, l) {
+			// l's value flows to root. If l is a function
+			// parameter and root is the heap or a
+			// corresponding result parameter, then record
+			// that value flow for tagging the function
+			// later.
+			if l.isName(ir.PPARAM) {
+				if (logopt.Enabled() || base.Flag.LowerM >= 2) && !l.escapes {
+					if base.Flag.LowerM >= 2 {
+						fmt.Printf("%s: parameter %v leaks to %s with derefs=%d:\n", base.FmtPos(l.n.Pos()), l.n, b.explainLoc(root), derefs)
+					}
+					explanation := b.explainPath(root, l)
+					if logopt.Enabled() {
+						var e_curfn *ir.Func // TODO(mdempsky): Fix.
+						logopt.LogOpt(l.n.Pos(), "leak", "escape", ir.FuncName(e_curfn),
+							fmt.Sprintf("parameter %v leaks to %s with derefs=%d", l.n, b.explainLoc(root), derefs), explanation)
+					}
+				}
+				l.leakTo(root, derefs)
+			}
+
+			// If l's address flows somewhere that
+			// outlives it, then l needs to be heap
+			// allocated.
+			if addressOf && !l.escapes {
+				if logopt.Enabled() || base.Flag.LowerM >= 2 {
+					if base.Flag.LowerM >= 2 {
+						fmt.Printf("%s: %v escapes to heap:\n", base.FmtPos(l.n.Pos()), l.n)
+					}
+					explanation := b.explainPath(root, l)
+					if logopt.Enabled() {
+						var e_curfn *ir.Func // TODO(mdempsky): Fix.
+						logopt.LogOpt(l.n.Pos(), "escape", "escape", ir.FuncName(e_curfn), fmt.Sprintf("%v escapes to heap", l.n), explanation)
+					}
+				}
+				l.escapes = true
+				enqueue(l)
+				continue
+			}
+		}
+
+		// 遍历所有指向当前location的边,打算将所有边加入到todo队列里
+		for i, edge := range l.edges {
+			if edge.src.escapes { // 边的Src location已经确定要逃逸了,不需要再做处理
+				continue
+			}
+
+			d := derefs + edge.derefs
+			if edge.src.walkgen != walkgen || edge.src.derefs > d {
+				//当前location相对于初始root location的引用信息权值小于已知的最小引用信息权值,则更新这个信息
+				edge.src.walkgen = walkgen
+				edge.src.derefs = d 
+				edge.src.dst = l
+				edge.src.dstEdgeIdx = i
+				todo = append(todo, edge.src) // 将最新的最小引用权值的src location加入到todo列表中
+			}
+		}
+	}
 }
 ```
