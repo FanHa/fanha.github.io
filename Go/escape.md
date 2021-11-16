@@ -578,12 +578,14 @@ func (b *batch) flow(k hole, src *location) {
 }
 ```
 
-#### walkAll
+#### walkAll 遍历所有location,标记所有需要escape的location
 ```go
 // src/cmd/compile/internal/escape/escape.go
 func (b *batch) walkAll() {
 	// 将所有location结构存入一个队列‘todo’中
 	todo := make([]*location, 0, len(b.allLocs)+1)
+
+	// 定义了一个enqueue方法,把一个location入队 todo 队列中
 	enqueue := func(loc *location) {
 		if !loc.queued {
 			todo = append(todo, loc)
@@ -605,11 +607,12 @@ func (b *batch) walkAll() {
 		root.queued = false
 
 		walkgen++
-		// 深入root节点 #ref walkOne
+		// #ref walkOne 深入root节点,同时传入了enqueue方法,当root引用的一个location 需要escape时,调用enqueue将该location入队todo中,下一个循环以该location为根,深入递归里面的边喝需要escape的location
 		b.walkOne(root, walkgen, enqueue)
 	}
 }
 
+// 以一个location为root,遍历该location的边,标记需要escape的location并通过enqueue将该location入队需要walk的节点列表中
 func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location)) {
 
 	root.walkgen = walkgen
@@ -625,7 +628,8 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 		// 当前location的derefs属性
 		derefs := l.derefs
 
-		// 初始节点的derefs == 0 ,所有第一遍遍历时addressOf 为 false,当出现derefs < 0 时表明该location被初始节点引用
+		// 初始节点的derefs == 0 ,第一遍遍历时,只有root节点,所以addressOf 为 false,
+		// 后续的遍历当出现derefs < 0 时表明该location被初始节点引用
 		addressOf := derefs < 0
 		if addressOf {·
 			// For a flow path like "root = &l; l = x",
@@ -643,6 +647,8 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 			}
 		}
 
+		// 判断root是否在l的生命周期外依然存在
+		// todo outlives
 		if b.outlives(root, l) {
 			// l's value flows to root. If l is a function
 			// parameter and root is the heap or a
@@ -664,27 +670,16 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 				l.leakTo(root, derefs)
 			}
 
-			// If l's address flows somewhere that
-			// outlives it, then l needs to be heap
-			// allocated.
+			// root的生命周期大于l,且root引用了l,则需要把l的escape值置换true
 			if addressOf && !l.escapes {
-				if logopt.Enabled() || base.Flag.LowerM >= 2 {
-					if base.Flag.LowerM >= 2 {
-						fmt.Printf("%s: %v escapes to heap:\n", base.FmtPos(l.n.Pos()), l.n)
-					}
-					explanation := b.explainPath(root, l)
-					if logopt.Enabled() {
-						var e_curfn *ir.Func // TODO(mdempsky): Fix.
-						logopt.LogOpt(l.n.Pos(), "escape", "escape", ir.FuncName(e_curfn), fmt.Sprintf("%v escapes to heap", l.n), explanation)
-					}
-				}
 				l.escapes = true
+				// 还需要把l入队walk队列,递归l的边里需要escape的location
 				enqueue(l)
 				continue
 			}
 		}
 
-		// 遍历所有指向当前location的边,打算将所有边加入到todo队列里
+		// 遍历所有指向当前location的边
 		for i, edge := range l.edges {
 			if edge.src.escapes { // 边的Src location已经确定要逃逸了,不需要再做处理
 				continue
@@ -698,6 +693,76 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 				edge.src.dst = l
 				edge.src.dstEdgeIdx = i
 				todo = append(todo, edge.src) // 将最新的最小引用权值的src location加入到todo列表中
+			}
+		}
+	}
+}
+```
+
+#### finish
+```go
+// src/cmd/compile/internal/escape/escape.go
+func (b *batch) finish(fns []*ir.Func) {
+	// Record parameter tags for package export data.
+	for _, fn := range fns {
+		fn.SetEsc(escFuncTagged)
+
+		narg := 0
+		for _, fs := range &types.RecvsParams {
+			for _, f := range fs(fn.Type()).Fields().Slice() {
+				narg++
+				f.Note = b.paramTag(fn, narg, f)
+			}
+		}
+	}
+
+	for _, loc := range b.allLocs {
+		n := loc.n
+		if n == nil {
+			continue
+		}
+		if n.Op() == ir.ONAME {
+			n := n.(*ir.Name)
+			n.Opt = nil
+		}
+
+		// Update n.Esc based on escape analysis results.
+
+		if loc.escapes {
+			if n.Op() == ir.ONAME {
+				if base.Flag.CompilingRuntime {
+					base.ErrorfAt(n.Pos(), "%v escapes to heap, not allowed in runtime", n)
+				}
+				if base.Flag.LowerM != 0 {
+					base.WarnfAt(n.Pos(), "moved to heap: %v", n)
+				}
+			} else {
+				if base.Flag.LowerM != 0 {
+					base.WarnfAt(n.Pos(), "%v escapes to heap", n)
+				}
+				if logopt.Enabled() {
+					var e_curfn *ir.Func // TODO(mdempsky): Fix.
+					logopt.LogOpt(n.Pos(), "escape", "escape", ir.FuncName(e_curfn))
+				}
+			}
+			n.SetEsc(ir.EscHeap)
+		} else {
+			if base.Flag.LowerM != 0 && n.Op() != ir.ONAME {
+				base.WarnfAt(n.Pos(), "%v does not escape", n)
+			}
+			n.SetEsc(ir.EscNone)
+			if loc.transient {
+				switch n.Op() {
+				case ir.OCLOSURE:
+					n := n.(*ir.ClosureExpr)
+					n.SetTransient(true)
+				case ir.OCALLPART:
+					n := n.(*ir.SelectorExpr)
+					n.SetTransient(true)
+				case ir.OSLICELIT:
+					n := n.(*ir.CompLitExpr)
+					n.SetTransient(true)
+				}
 			}
 		}
 	}
