@@ -516,7 +516,7 @@ func (e *escape) expr(k hole, n ir.Node) {
 func (e *escape) exprSkipInit(k hole, n ir.Node) {
 	// ...
 
-	switch n.Op() {
+	switch n.Op() { //一些常见的赋值语句语法的有向边解析
 	// ... 
 	// src 是个普通的变量时,调用flow方法新建一条普通边,derefs值为0
 	case ir.ONAME:
@@ -530,98 +530,41 @@ func (e *escape) exprSkipInit(k hole, n ir.Node) {
 		e.flow(k, e.oldLoc(n))
 
 	// ... 
-	// x:= &y src是地址引用的情况
-	case ir.OADDR:
+	case ir.OADDR: 	// x:= &y src是地址引用的情况
 		n := n.(*ir.AddrExpr)
 		// addr(n, “address-of”)新建了一个derefs值为 -1 的hole,这里就相当于新建了一条 derefs值为-1的边
 		e.expr(k.addr(n, "address-of"), n.X) // "address-of"
-	// x := *y 指针deref
-	case ir.ODEREF:
+	case ir.ODEREF: 	// x := *y 指针deref
 		n := n.(*ir.StarExpr)
 		// deref(n, "indirection") 新建了一个derefs值为1 的hole,这里相当于新建了一条 derefs 值为 1 的边
 		e.expr(k.deref(n, "indirection"), n.X) // "indirection"
-	case ir.ODOT, ir.ODOTMETH, ir.ODOTINTER:
+	case ir.ODOT, ir.ODOTMETH, ir.ODOTINTER: // 赋值的是个对象中的属性时
 		n := n.(*ir.SelectorExpr)
+		// note(n, "dot") 新建了一个derefs值为0 的hole,这里相当于建了一条derefs 值为0 的边
 		e.expr(k.note(n, "dot"), n.X)
-	case ir.ODOTPTR:
+	case ir.ODOTPTR: // 对象指针同前面的`ODEREF`指针
 		n := n.(*ir.SelectorExpr)
 		e.expr(k.deref(n, "dot of pointer"), n.X) // "dot of pointer"
-	case ir.ODOTTYPE, ir.ODOTTYPE2:
-		n := n.(*ir.TypeAssertExpr)
-		e.expr(k.dotType(n.Type(), n, "dot"), n.X)
-	case ir.OINDEX:
-		n := n.(*ir.IndexExpr)
-		if n.X.Type().IsArray() {
-			e.expr(k.note(n, "fixed-array-index-of"), n.X)
-		} else {
-			// TODO(mdempsky): Fix why reason text.
-			e.expr(k.deref(n, "dot of pointer"), n.X)
-		}
-		e.discard(n.Index)
-	case ir.OINDEXMAP:
-		n := n.(*ir.IndexExpr)
-		e.discard(n.X)
-		e.discard(n.Index)
-	case ir.OSLICE, ir.OSLICEARR, ir.OSLICE3, ir.OSLICE3ARR, ir.OSLICESTR:
-		n := n.(*ir.SliceExpr)
-		e.expr(k.note(n, "slice"), n.X)
-		e.discard(n.Low)
-		e.discard(n.High)
-		e.discard(n.Max)
-
-	case ir.OCONV, ir.OCONVNOP:
-		n := n.(*ir.ConvExpr)
-		if ir.ShouldCheckPtr(e.curfn, 2) && n.Type().IsUnsafePtr() && n.X.Type().IsPtr() {
-			// When -d=checkptr=2 is enabled, treat
-			// conversions to unsafe.Pointer as an
-			// escaping operation. This allows better
-			// runtime instrumentation, since we can more
-			// easily detect object boundaries on the heap
-			// than the stack.
-			e.assignHeap(n.X, "conversion to unsafe.Pointer", n)
-		} else if n.Type().IsUnsafePtr() && n.X.Type().IsUintptr() {
-			e.unsafeValue(k, n.X)
-		} else {
-			e.expr(k, n.X)
-		}
-	case ir.OCONVIFACE:
-		n := n.(*ir.ConvExpr)
-		if !n.X.Type().IsInterface() && !types.IsDirectIface(n.X.Type()) {
-			k = e.spill(k, n)
-		}
-		e.expr(k.note(n, "interface-converted"), n.X)
-	case ir.OSLICE2ARRPTR:
-		// the slice pointer flows directly to the result
-		n := n.(*ir.ConvExpr)
-		e.expr(k, n.X)
-	case ir.ORECV:
-		n := n.(*ir.UnaryExpr)
-		e.discard(n.X)
-
+	// ...
+	// 方法,函数或系统调用时,需要解析表达式的内容 
 	case ir.OCALLMETH, ir.OCALLFUNC, ir.OCALLINTER, ir.OLEN, ir.OCAP, ir.OCOMPLEX, ir.OREAL, ir.OIMAG, ir.OAPPEND, ir.OCOPY, ir.OUNSAFEADD, ir.OUNSAFESLICE:
-		e.call([]hole{k}, n, nil)
+		e.call([]hole{k}, n, nil) // todo call
 
-	case ir.ONEW:
+	/****** new, make 等等语法需要调用spill(这个方法内会调用 addr(n,“xxx“))生成derefs 为 -1 的有向边 *****/
+	case ir.ONEW: // new
 		n := n.(*ir.UnaryExpr)
-		e.spill(k, n)
+		e.spill(k, n) 
 
-	case ir.OMAKESLICE:
+	case ir.OMAKESLICE: //make []
 		n := n.(*ir.MakeExpr)
 		e.spill(k, n)
 		e.discard(n.Len)
 		e.discard(n.Cap)
-	case ir.OMAKECHAN:
-		n := n.(*ir.MakeExpr)
-		e.discard(n.Len)
-	case ir.OMAKEMAP:
+	case ir.OMAKEMAP: //make map
 		n := n.(*ir.MakeExpr)
 		e.spill(k, n)
 		e.discard(n.Len)
-
-	case ir.ORECOVER:
-		// nop
-
-	case ir.OCALLPART:
+	case ir.OCALLPART: // 方法(非调用)
 		// Flow the receiver argument to both the closure and
 		// to the receiver parameter.
 
@@ -630,71 +573,29 @@ func (e *escape) exprSkipInit(k hole, n ir.Node) {
 
 		m := n.Selection
 
-		// We don't know how the method value will be called
-		// later, so conservatively assume the result
-		// parameters all flow to the heap.
-		//
-		// TODO(mdempsky): Change ks into a callback, so that
-		// we don't have to create this slice?
+		// 保守的为该方法所有的返回属性创建一个heapHole
 		var ks []hole
 		for i := m.Type.NumResults(); i > 0; i-- {
 			ks = append(ks, e.heapHole())
 		}
-		name, _ := m.Nname.(*ir.Name)
-		paramK := e.tagHole(ks, name, m.Type.Recv())
+		name, _ := m.Nname.(*ir.Name) // nName是该方法的参数列表
+		paramK := e.tagHole(ks, name, m.Type.Recv()) // todo ??
 
 		e.expr(e.teeHole(paramK, closureK), n.X)
 
-	case ir.OPTRLIT:
-		n := n.(*ir.AddrExpr)
-		e.expr(e.spill(k, n), n.X)
-
-	case ir.OARRAYLIT:
-		n := n.(*ir.CompLitExpr)
-		for _, elt := range n.List {
-			if elt.Op() == ir.OKEY {
-				elt = elt.(*ir.KeyExpr).Value
-			}
-			e.expr(k.note(n, "array literal element"), elt)
-		}
-
-	case ir.OSLICELIT:
-		n := n.(*ir.CompLitExpr)
-		k = e.spill(k, n)
-		k.uintptrEscapesHack = uintptrEscapesHack // for ...uintptr parameters
-
-		for _, elt := range n.List {
-			if elt.Op() == ir.OKEY {
-				elt = elt.(*ir.KeyExpr).Value
-			}
-			e.expr(k.note(n, "slice-literal-element"), elt)
-		}
-
-	case ir.OSTRUCTLIT:
-		n := n.(*ir.CompLitExpr)
-		for _, elt := range n.List {
-			e.expr(k.note(n, "struct literal element"), elt.(*ir.StructKeyExpr).Value)
-		}
-
-	case ir.OMAPLIT:
-		n := n.(*ir.CompLitExpr)
-		e.spill(k, n)
-
-		// Map keys and values are always stored in the heap.
-		for _, elt := range n.List {
-			elt := elt.(*ir.KeyExpr)
-			e.assignHeap(elt.Key, "map literal key", n)
-			e.assignHeap(elt.Value, "map literal value", n)
-		}
-
+	// ...
+	/****   ***************************** *****/
+	// 闭包
 	case ir.OCLOSURE:
 		n := n.(*ir.ClosureExpr)
-		k = e.spill(k, n)
+		k = e.spill(k, n) // 先为闭包本身创建一个location ,并通过spill创建一个变量到该location 的 derefs值为-1的有向边
 		e.closures = append(e.closures, closure{k, n})
 
 		if fn := n.Func; fn.IsHiddenClosure() {
-			for _, cv := range fn.ClosureVars {
+			// 遍历闭包中用到的闭包外变量
+			for _, cv := range fn.ClosureVars { 
 				if loc := e.oldLoc(cv); !loc.captured {
+					// 标记这个变量被闭包使用
 					loc.captured = true
 
 					// Ignore reassignments to the variable in straightline code
@@ -704,33 +605,19 @@ func (e *escape) exprSkipInit(k hole, n ir.Node) {
 					}
 				}
 			}
-
-			for _, n := range fn.Dcl {
-				// Add locations for local variables of the
-				// closure, if needed, in case we're not including
-				// the closure func in the batch for escape
-				// analysis (happens for escape analysis called
-				// from reflectdata.methodWrapper)
-				if n.Op() == ir.ONAME && n.Opt == nil {
-					e.with(fn).newLoc(n, false)
-				}
-			}
+			// ...
+			// 递归调用walkFunc解析闭包内的escape
 			e.walkFunc(fn)
 		}
-
-	case ir.ORUNES2STR, ir.OBYTES2STR, ir.OSTR2RUNES, ir.OSTR2BYTES, ir.ORUNESTR:
-		n := n.(*ir.ConvExpr)
-		e.spill(k, n)
-		e.discard(n.X)
-
-	case ir.OADDSTR:
-		n := n.(*ir.AddStringExpr)
-		e.spill(k, n)
-
-		// Arguments of OADDSTR never escape;
-		// runtime.concatstrings makes sure of that.
-		e.discards(n.List)
-	}
+		// ...
+}
+```
+```go
+// spill 主动申请一个新location, 然后调用addr(n, "spill"),生成一个derefs为-1的hole,继而生成一个derefs为-1的有向边
+func (e *escape) spill(k hole, n ir.Node) hole {
+	loc := e.newLoc(n, true)
+	e.flow(k.addr(n, "spill"), loc)
+	return loc.asHole()
 }
 ```
 
