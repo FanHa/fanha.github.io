@@ -460,17 +460,17 @@ func (e *escape) stmt(n ir.Node) {
 		n := n.(*ir.AssignListStmt)
 		e.assignList(n.Lhs, n.Rhs, "assign-pair-receive", n)
 
-	case ir.OAS2FUNC:
+	case ir.OAS2FUNC: // 语句是个函数(方法)调用时
 		n := n.(*ir.AssignListStmt)
-		e.stmts(n.Rhs[0].Init())
+		e.stmts(n.Rhs[0].Init()) // 递归解析函数内部的escape情况
 		ks := e.addrs(n.Lhs)
-		e.call(ks, n.Rhs[0], nil)
+		e.call(ks, n.Rhs[0], nil) // 把函数作为一个整体 和 当前上下文的escape分析
 		e.reassigned(ks, n)
-	case ir.ORETURN:
+	case ir.ORETURN: // 函数的return
 		n := n.(*ir.ReturnStmt)
 		results := e.curfn.Type().Results().FieldSlice()
 		dsts := make([]ir.Node, len(results))
-		for i, res := range results {
+		for i, res := range results { // 为return的所有属性占一个位置
 			dsts[i] = res.Nname.(*ir.Name)
 		}
 		e.assignList(dsts, n.Results, "return", n)
@@ -478,12 +478,9 @@ func (e *escape) stmt(n ir.Node) {
 		e.call(nil, n, nil)
 	case ir.OGO, ir.ODEFER:
 		n := n.(*ir.GoDeferStmt)
-		e.stmts(n.Call.Init())
-		e.call(nil, n.Call, n)
-
-	case ir.OTAILCALL:
-		// TODO(mdempsky): Treat like a normal call? esc.go used to just ignore it.
-	}
+		e.stmts(n.Call.Init()) // go 或 defer 函数内部的内容递归到内部去解析
+		e.call(nil, n.Call, n) // 把函数作为一个整体 和 当前上下文的escape的分析
+	//...
 }
 ```
 
@@ -620,6 +617,84 @@ func (e *escape) spill(k hole, n ir.Node) hole {
 	return loc.asHole()
 }
 ```
+##### call 把函数当作一个整体 作escape分析
+```go
+func (e *escape) call(ks []hole, call, where ir.Node) {
+	topLevelDefer := where != nil && where.Op() == ir.ODEFER && e.loopDepth == 1
+	if topLevelDefer {
+		// force stack allocation of defer record, unless
+		// open-coded defers are used (see ssa.go)
+		where.SetEsc(ir.EscNever)
+	}
+
+	// 对函数的入参的有向图处理
+	argument := func(k hole, arg ir.Node) {
+		if topLevelDefer {
+			// todo 函数的defer处理
+			k = e.later(k)
+		} else if where != nil {
+			k = e.heapHole()
+		}
+
+		e.expr(k.note(call, "call parameter"), arg)
+	}
+
+	switch call.Op() {
+	// ...
+
+	case ir.OCALLFUNC, ir.OCALLMETH, ir.OCALLINTER: // 普通的函数,方法调用
+		call := call.(*ir.CallExpr)
+		typecheck.FixVariadicCall(call)
+
+		// Pick out the function callee, if statically known.
+		var fn *ir.Name
+		// ...
+
+		fntype := call.X.Type()
+		if fn != nil {
+			fntype = fn.Type()
+		}
+
+		if ks != nil && fn != nil && e.inMutualBatch(fn) {
+			for i, result := range fn.Type().Results().FieldSlice() { // 取出函数的返回列表
+				e.expr(ks[i], ir.AsNode(result.Nname)) // 在这里,函数的返回 于 函数的调用方建立了有向边的联系
+			}
+		}
+
+		if r := fntype.Recv(); r != nil { // 方法有一个receiver时,需要对参数做处理,相当于把receiver本身作为函数的一个参数
+			argument(e.tagHole(ks, fn, r), call.X.(*ir.SelectorExpr).X)
+		} else {
+			// Evaluate callee function expression.
+			argument(e.discardHole(), call.X)
+		}
+
+		args := call.Args // 函数的参数与调用方的 有向边分析
+		for i, param := range fntype.Params().FieldSlice() {
+			argument(e.tagHole(ks, fn, param), args[i])
+		}
+	/** 一些系统自带函数的输入输出的有向边解析**/
+	case ir.OAPPEND:
+		// ...
+
+	case ir.OCOPY:
+		// ...
+
+	case ir.OPANIC:
+		// ...
+
+	case ir.OCOMPLEX:
+		// ...
+	case ir.ODELETE, ir.OPRINT, ir.OPRINTN, ir.ORECOVER:
+		// ...
+	case ir.OLEN, ir.OCAP, ir.OREAL, ir.OIMAG, ir.OCLOSE:
+		// ...
+
+	case ir.OUNSAFEADD, ir.OUNSAFESLICE:
+		// ...
+	}
+}
+```
+
 
 #### flow 生成一条边,根据边的derefs值决定src要不要escape
 ```go
