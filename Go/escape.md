@@ -245,11 +245,7 @@ func Batch(fns []*ir.Func, recursive bool) {
 		}
 	}
 
-	// ...todo
-	// We've walked the function bodies, so we've seen everywhere a
-	// variable might be reassigned or have it's address taken. Now we
-	// can decide whether closures should capture their free variables
-	// by value or reference.
+	// 普通的函数和方法已经解析完了,开始解析闭包
 	for _, closure := range b.closures {
 		b.flowClosure(closure.k, closure.clo)
 	}
@@ -287,8 +283,7 @@ func (b *batch) initFunc(fn *ir.Func) {
 		}
 	}
 
-	// 当前Func的返回参数的处理
-	// todo ??
+	// 当前Func的返回属性的处理,返回的属性可能是前面Dcl中的变量,所以使用oldLoc #ref oldLoc
 	for i, f := range fn.Type().Results().FieldSlice() {
 		e.oldLoc(f.Nname.(*ir.Name)).resultIndex = 1 + i
 	}
@@ -323,6 +318,10 @@ func (e *escape) newLoc(n ir.Node, transient bool) *location {
 		}
 	}
 	return loc
+}
+
+func (b *batch) oldLoc(n *ir.Name) *location {
+	return n.Canonical().Opt.(*location)
 }
 ```
 
@@ -695,6 +694,24 @@ func (e *escape) call(ks []hole, call, where ir.Node) {
 }
 ```
 
+
+#### flowClosure 解析闭包
+```go
+func (b *batch) flowClosure(k hole, clo *ir.ClosureExpr) {
+	for _, cv := range clo.Func.ClosureVars { // 遍历闭包所有对外部变量的使用
+		n := cv.Canonical()
+		loc := b.oldLoc(cv) //找到外部变量的原始location
+
+		// todo ??
+		k := k
+		if !cv.Byval() {
+			k = k.addr(cv, "reference")
+		}
+		// 建立一条由闭包内到闭包外的变量location的有向边
+		b.flow(k.note(cv, "captured by a closure"), loc)
+	}
+}
+```
 
 #### flow 生成一条边,根据边的derefs值决定src要不要escape
 ```go
