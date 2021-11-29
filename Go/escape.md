@@ -263,6 +263,7 @@ func Batch(fns []*ir.Func, recursive bool) {
 
 	// 遍历所有location,根据有向图,给需要逃逸的变量打上escapes标记
 	b.walkAll()
+	// 收尾工作
 	b.finish(fns)
 }
 ```
@@ -283,7 +284,7 @@ func (b *batch) initFunc(fn *ir.Func) {
 		}
 	}
 
-	// 当前Func的返回属性的处理,返回的属性可能是前面Dcl中的变量,所以使用oldLoc #ref oldLoc
+	// 当前Func的返回属性的处理,返回属性可能是前面Dcl中的变量,所以使用oldLoc #ref oldLoc
 	for i, f := range fn.Type().Results().FieldSlice() {
 		e.oldLoc(f.Nname.(*ir.Name)).resultIndex = 1 + i
 	}
@@ -321,19 +322,19 @@ func (e *escape) newLoc(n ir.Node, transient bool) *location {
 }
 
 func (b *batch) oldLoc(n *ir.Name) *location {
-	return n.Canonical().Opt.(*location)
+	return n.Canonical().Opt.(*location) // 通过变量名找到已有location
 }
 ```
 
-#### walkFunc 遍历Func节点,形成一张变量引用图
-遍历func
+#### walkFunc 解析Func节点,形成一张变量引用图
+解析Func节点
 ```go
 // src/cmd/compile/internal/escape/escape.go
 func (b *batch) walkFunc(fn *ir.Func) {
 	e := b.with(fn)
-	fn.SetEsc(escFuncStarted)
+	fn.SetEsc(escFuncStarted) // 设置Func的Esc状态为escFuncStarted
 	// ...
-	// 解析节点的body,在这个里面需要生成func内变量的有向边 #ref block
+	// 解析节点的body
 	e.block(fn.Body)
 
 	// ...
@@ -363,69 +364,58 @@ func (e *escape) stmt(n ir.Node) {
 
 	switch n.Op() {
 		// ...
+	case ir.ODCL:
+		n := n.(*ir.Decl)
+		if !ir.IsBlank(n.X) {
+			e.dcl(n.X)
+		}
 	case ir.OIF:
 		n := n.(*ir.IfStmt)
 		e.discard(n.Cond)
-		e.block(n.Body)
-		e.block(n.Else)
+		e.block(n.Body) // 递归解析if语句的body
+		e.block(n.Else) // 递归解析else语句的body
 
 	case ir.OFOR, ir.OFORUNTIL:
 		n := n.(*ir.ForStmt)
 		e.loopDepth++
 		e.discard(n.Cond)
-		e.stmt(n.Post)
-		e.block(n.Body)
+		e.stmt(n.Post) // 解析for语句的post内容
+		e.block(n.Body) // 递归解析for语句的body
 		e.loopDepth--
 
 	case ir.ORANGE:
 		// for Key, Value = range X { Body }
 		n := n.(*ir.RangeStmt)
 
-		// X is evaluated outside the loop.
+		// 生成一个新的临时location(tmp) 指向 要range解构 的变量 
 		tmp := e.newLoc(nil, false)
 		e.expr(tmp.asHole(), n.X)
 
 		e.loopDepth++
 		ks := e.addrs([]ir.Node{n.Key, n.Value})
-		if n.X.Type().IsArray() {
-			e.flow(ks[1].note(n, "range"), tmp)
+		if n.X.Type().IsArray() { // 要range解构的变量是个数组时
+			e.flow(ks[1].note(n, "range"), tmp) // 为key,value 和 临时location(tmp)间生成普通的边(derefs = 0)
 		} else {
-			e.flow(ks[1].deref(n, "range-deref"), tmp)
+			e.flow(ks[1].deref(n, "range-deref"), tmp) // 为key, value 和 临时location(tmp)生成引用边(derefs = -1)
 		}
-		e.reassigned(ks, n)
+		e.reassigned(ks, n) // todo reassigned ??
 
-		e.block(n.Body)
+		e.block(n.Body) // 递归解析range的body内容
 		e.loopDepth--
 
-	case ir.OSWITCH:
+	case ir.OSWITCH: // switch语法
 		n := n.(*ir.SwitchStmt)
-
-		if guard, ok := n.Tag.(*ir.TypeSwitchGuard); ok {
-			var ks []hole
-			if guard.Tag != nil {
-				for _, cas := range n.Cases {
-					cv := cas.Var
-					k := e.dcl(cv) // type switch variables have no ODCL.
-					if cv.Type().HasPointers() {
-						ks = append(ks, k.dotType(cv.Type(), cas, "switch case"))
-					}
-				}
-			}
-			e.expr(e.teeHole(ks...), n.Tag.(*ir.TypeSwitchGuard).X)
-		} else {
-			e.discard(n.Tag)
-		}
-
+		// ...
 		for _, cas := range n.Cases {
 			e.discards(cas.List)
-			e.block(cas.Body)
+			e.block(cas.Body) // 递归解析所有case的body内容
 		}
 
-	case ir.OSELECT:
+	case ir.OSELECT: // select 语法
 		n := n.(*ir.SelectStmt)
 		for _, cas := range n.Cases {
 			e.stmt(cas.Comm)
-			e.block(cas.Body)
+			e.block(cas.Body) // 递归解析所有case的body内容
 		}
 	case ir.ORECV:
 		// TODO(mdempsky): Consider e.discard(n.Left).
@@ -480,6 +470,14 @@ func (e *escape) stmt(n ir.Node) {
 		e.stmts(n.Call.Init()) // go 或 defer 函数内部的内容递归到内部去解析
 		e.call(nil, n.Call, n) // 把函数作为一个整体 和 当前上下文的escape的分析
 	//...
+}
+```
+##### dcl 变量声明就是新建一个包裹这个变量的hole
+```go
+func (e *escape) dcl(n *ir.Name) hole {
+	loc := e.oldLoc(n)
+	loc.loopDepth = e.loopDepth //todo e的loopDepth 和 loc 的loopDepth的作用
+	return loc.asHole()
 }
 ```
 
@@ -698,7 +696,7 @@ func (e *escape) call(ks []hole, call, where ir.Node) {
 #### flowClosure 解析闭包
 ```go
 func (b *batch) flowClosure(k hole, clo *ir.ClosureExpr) {
-	for _, cv := range clo.Func.ClosureVars { // 遍历闭包所有对外部变量的使用
+	for _, cv := range clo.Func.ClosureVars { // 遍历闭包所有用到的外部变量
 		n := cv.Canonical()
 		loc := b.oldLoc(cv) //找到外部变量的原始location
 
@@ -728,24 +726,12 @@ func (b *batch) flow(k hole, src *location) {
 	if dst == src && k.derefs >= 0 { // dst = dst, dst = *dst, ...
 		return
 	}
-	if dst.escapes && k.derefs < 0 { // dst = &src
-		if base.Flag.LowerM >= 2 || logopt.Enabled() {
-			pos := base.FmtPos(src.n.Pos())
-			if base.Flag.LowerM >= 2 {
-				fmt.Printf("%s: %v escapes to heap:\n", pos, src.n)
-			}
-			explanation := b.explainFlow(pos, dst, src, k.derefs, k.notes, []*logopt.LoggedOpt{})
-			if logopt.Enabled() {
-				var e_curfn *ir.Func // TODO(mdempsky): Fix.
-				logopt.LogOpt(src.n.Pos(), "escapes", "escape", ir.FuncName(e_curfn), fmt.Sprintf("%v escapes to heap", src.n), explanation)
-			}
-
-		}
+	if dst.escapes && k.derefs < 0 { // dst = &src 出现了dst的escapes值为true且derefs值为-1的情况,直接将src的escapes值也置为true(根据heap上的数据不能指向stack上的数据的原则)
 		src.escapes = true
 		return
 	}
 
-	// TODO(mdempsky): Deduplicate edges?
+	// 加一条dst 到 src 的有向边,便于其他用到了dst的地方掂量自己需不需要escape
 	dst.edges = append(dst.edges, edge{src: src, derefs: k.derefs, notes: k.notes})
 }
 ```
@@ -871,59 +857,25 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 }
 ```
 
-#### finish
+#### finish 对解析后的escape结果做些收尾工作
 ```go
 // src/cmd/compile/internal/escape/escape.go
 func (b *batch) finish(fns []*ir.Func) {
-	// Record parameter tags for package export data.
 	for _, fn := range fns {
-		fn.SetEsc(escFuncTagged)
-
-		narg := 0
-		for _, fs := range &types.RecvsParams {
-			for _, f := range fs(fn.Type()).Fields().Slice() {
-				narg++
-				f.Note = b.paramTag(fn, narg, f)
-			}
-		}
+		fn.SetEsc(escFuncTagged) // 给函数设置escape阶段的状态
+		// ...
 	}
 
 	for _, loc := range b.allLocs {
 		n := loc.n
-		if n == nil {
-			continue
-		}
-		if n.Op() == ir.ONAME {
-			n := n.(*ir.Name)
-			n.Opt = nil
-		}
+		// ...
 
-		// Update n.Esc based on escape analysis results.
-
-		if loc.escapes {
-			if n.Op() == ir.ONAME {
-				if base.Flag.CompilingRuntime {
-					base.ErrorfAt(n.Pos(), "%v escapes to heap, not allowed in runtime", n)
-				}
-				if base.Flag.LowerM != 0 {
-					base.WarnfAt(n.Pos(), "moved to heap: %v", n)
-				}
-			} else {
-				if base.Flag.LowerM != 0 {
-					base.WarnfAt(n.Pos(), "%v escapes to heap", n)
-				}
-				if logopt.Enabled() {
-					var e_curfn *ir.Func // TODO(mdempsky): Fix.
-					logopt.LogOpt(n.Pos(), "escape", "escape", ir.FuncName(e_curfn))
-				}
-			}
+		if loc.escapes { // 当location的escapes分析结果为true时,设置节点的Esc属性为 EscHeap
+			
 			n.SetEsc(ir.EscHeap)
 		} else {
-			if base.Flag.LowerM != 0 && n.Op() != ir.ONAME {
-				base.WarnfAt(n.Pos(), "%v does not escape", n)
-			}
-			n.SetEsc(ir.EscNone)
-			if loc.transient {
+			n.SetEsc(ir.EscNone) // 普通location 设置Esc属性为EscNone
+			if loc.transient { // todo transient的用处
 				switch n.Op() {
 				case ir.OCLOSURE:
 					n := n.(*ir.ClosureExpr)
