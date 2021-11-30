@@ -19,7 +19,6 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 ```go
 // cmd/compile/internal/escape/escape.go
 // 如函数名,对 ‘所有’ func节点进行逃逸分析, Batch 是注入的一系列回调
-// todo Batch
 func Funcs(all []ir.Node) {
 	ir.VisitFuncsBottomUp(all, Batch)
 }
@@ -276,17 +275,17 @@ func (b *batch) initFunc(fn *ir.Func) {
 	e := b.with(fn)
 	// ...
 
-	// 遍历当前Func的所有声明
+	// 遍历当前Func的所有变量声明
 	for _, n := range fn.Dcl {
 		if n.Op() == ir.ONAME {
-			// 为每一个变量创建一个location #ref newLoc
+			// 为每一个变量创建一个location,新location初始都是放在了batch的Alllocs里 #ref newLoc
 			e.newLoc(n, false)
 		}
 	}
 
 	// 当前Func的返回属性的处理,返回属性可能是前面Dcl中的变量,所以使用oldLoc #ref oldLoc
 	for i, f := range fn.Type().Results().FieldSlice() {
-		e.oldLoc(f.Nname.(*ir.Name)).resultIndex = 1 + i
+		e.oldLoc(f.Nname.(*ir.Name)).resultIndex = 1 + i // resultIndex!=0表明该location是Func的返回属性, 数值表示该返回属性的位置顺序
 	}
 }
 
@@ -334,7 +333,7 @@ func (b *batch) walkFunc(fn *ir.Func) {
 	e := b.with(fn)
 	fn.SetEsc(escFuncStarted) // 设置Func的Esc状态为escFuncStarted
 	// ...
-	// 解析节点的body
+	// 解析节点的body,body是一个节点数组,包含Func函数体内的所有节点
 	e.block(fn.Body)
 
 	// ...
@@ -354,12 +353,7 @@ func (e *escape) stmts(l ir.Nodes) {
 }
 
 func (e *escape) stmt(n ir.Node) {
-
-	lno := ir.SetPos(n)
-	defer func() {
-		base.Pos = lno
-	}()
-
+	// ...
 	e.stmts(n.Init())
 
 	switch n.Op() {
@@ -367,7 +361,7 @@ func (e *escape) stmt(n ir.Node) {
 	case ir.ODCL:
 		n := n.(*ir.Decl)
 		if !ir.IsBlank(n.X) {
-			e.dcl(n.X)
+			e.dcl(n.X) //解析声明
 		}
 	case ir.OIF:
 		n := n.(*ir.IfStmt)
@@ -379,7 +373,7 @@ func (e *escape) stmt(n ir.Node) {
 		n := n.(*ir.ForStmt)
 		e.loopDepth++
 		e.discard(n.Cond)
-		e.stmt(n.Post) // 解析for语句的post内容
+		e.stmt(n.Post) // 解析for语句的post区域内容
 		e.block(n.Body) // 递归解析for语句的body
 		e.loopDepth--
 
@@ -417,16 +411,16 @@ func (e *escape) stmt(n ir.Node) {
 			e.stmt(cas.Comm)
 			e.block(cas.Body) // 递归解析所有case的body内容
 		}
-	case ir.ORECV:
+	case ir.ORECV: // todo ??
 		// TODO(mdempsky): Consider e.discard(n.Left).
 		n := n.(*ir.UnaryExpr)
 		e.exprSkipInit(e.discardHole(), n) // already visited n.Ninit
-	case ir.OSEND:
+	case ir.OSEND: // send 语法
 		n := n.(*ir.SendStmt)
 		e.discard(n.Chan)
-		e.assignHeap(n.Value, "send", n)
+		e.assignHeap(n.Value, "send", n) // 要发送到chan里的变量自然是要存到堆上的 #ref assignHeap
 
-	// 最直观的场景,赋值语句 x := y
+	/** 各种类型赋值语句 dst := src 都是通过assignList建立dst 与 src 的有向边 #ref assignList **/
 	case ir.OAS:
 		n := n.(*ir.AssignStmt)
 		// 解析赋值语句,生成有向边 #ref assignList
@@ -475,7 +469,7 @@ func (e *escape) stmt(n ir.Node) {
 ##### dcl 变量声明就是新建一个包裹这个变量的hole
 ```go
 func (e *escape) dcl(n *ir.Name) hole {
-	loc := e.oldLoc(n)
+	loc := e.oldLoc(n) // 变量声明的location早在InitFunc阶段就已经生成好了,所以这里用oldLoc取到这个location的地址
 	loc.loopDepth = e.loopDepth //todo e的loopDepth 和 loc 的loopDepth的作用
 	return loc.asHole()
 }
@@ -498,12 +492,13 @@ func (e *escape) assignList(dsts, srcs []ir.Node, why string, where ir.Node) {
 	e.reassigned(ks, where)
 }
 
+// 创建一个srcNode(n) 到 dstHole(k) 的有向边
 func (e *escape) expr(k hole, n ir.Node) {
 	if n == nil {
 		return
 	}
 	e.stmts(n.Init()) // n是个表达式的话,需要先解析
-	// 
+	// #ref exprSkipInit
 	e.exprSkipInit(k, n)
 }
 
@@ -515,12 +510,7 @@ func (e *escape) exprSkipInit(k hole, n ir.Node) {
 	// src 是个普通的变量时,调用flow方法新建一条普通边,derefs值为0
 	case ir.ONAME:
 		n := n.(*ir.Name)
-		if n.Class == ir.PFUNC || n.Class == ir.PEXTERN {
-			return
-		}
-		if n.IsClosureVar() && n.Defn == nil {
-			return // ".this" from method value wrapper
-		}
+		// ...
 		e.flow(k, e.oldLoc(n))
 
 	// ... 
@@ -542,9 +532,9 @@ func (e *escape) exprSkipInit(k hole, n ir.Node) {
 	// ...
 	// 方法,函数或系统调用时,需要解析表达式的内容 
 	case ir.OCALLMETH, ir.OCALLFUNC, ir.OCALLINTER, ir.OLEN, ir.OCAP, ir.OCOMPLEX, ir.OREAL, ir.OIMAG, ir.OAPPEND, ir.OCOPY, ir.OUNSAFEADD, ir.OUNSAFESLICE:
-		e.call([]hole{k}, n, nil) // todo call
+		e.call([]hole{k}, n, nil) // 新建一条dst 到 函数节点location的边(call会解析函数的输出) #ref call
 
-	/****** new, make 等等语法需要调用spill(这个方法内会调用 addr(n,“xxx“))生成derefs 为 -1 的有向边 *****/
+	/****** new, make 等等语法需要调用spill(这个方法内会调用 addr(n,“xxx“))生成derefs为-1的hole,然后用这个hole生成与src节点的有向边 *****/
 	case ir.ONEW: // new
 		n := n.(*ir.UnaryExpr)
 		e.spill(k, n) 
@@ -605,15 +595,15 @@ func (e *escape) exprSkipInit(k hole, n ir.Node) {
 		}
 		// ...
 }
-```
-```go
-// spill 主动申请一个新location, 然后调用addr(n, "spill"),生成一个derefs为-1的hole,继而生成一个derefs为-1的有向边
+
+// spill 主动申请一个新location, 然后调用addr(n, "spill"),生成一个derefs为-1的hole,用这个hole生成一个与src节点derefs为-1的有向边
 func (e *escape) spill(k hole, n ir.Node) hole {
 	loc := e.newLoc(n, true)
 	e.flow(k.addr(n, "spill"), loc)
 	return loc.asHole()
 }
 ```
+
 ##### call 把函数当作一个整体 作escape分析
 ```go
 func (e *escape) call(ks []hole, call, where ir.Node) {
@@ -692,6 +682,12 @@ func (e *escape) call(ks []hole, call, where ir.Node) {
 }
 ```
 
+##### assignHeap 相当于为要发送到chan 的变量创建一个临时变量,这个临时变量的位置放在堆上,再计算变量与临时变量的有向边数值
+```go
+func (e *escape) assignHeap(src ir.Node, why string, where ir.Node) {
+	e.expr(e.heapHole().note(where, why), src)
+}
+```
 
 #### flowClosure 解析闭包
 ```go
