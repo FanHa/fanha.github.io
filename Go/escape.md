@@ -498,7 +498,7 @@ func (e *escape) expr(k hole, n ir.Node) {
 		return
 	}
 	e.stmts(n.Init()) // n是个表达式的话,需要先解析
-	// #ref exprSkipInit
+	// 解析赋值语句右边的表达式 #ref exprSkipInit
 	e.exprSkipInit(k, n)
 }
 
@@ -607,20 +607,15 @@ func (e *escape) spill(k hole, n ir.Node) hole {
 ##### call 把函数当作一个整体 作escape分析
 ```go
 func (e *escape) call(ks []hole, call, where ir.Node) {
-	topLevelDefer := where != nil && where.Op() == ir.ODEFER && e.loopDepth == 1
-	if topLevelDefer {
-		// force stack allocation of defer record, unless
-		// open-coded defers are used (see ssa.go)
-		where.SetEsc(ir.EscNever)
-	}
+	// ...
 
-	// 对函数的入参的有向图处理
+	// 对函数的入参的有向图处理(k为函数的入参的hole, arg)
 	argument := func(k hole, arg ir.Node) {
 		if topLevelDefer {
 			// todo 函数的defer处理
 			k = e.later(k)
 		} else if where != nil {
-			k = e.heapHole()
+			k = e.heapHole() // 普通函数的参数 都是要外部heapHole (derefs 为 -1 的hole)
 		}
 
 		e.expr(k.note(call, "call parameter"), arg)
@@ -651,13 +646,12 @@ func (e *escape) call(ks []hole, call, where ir.Node) {
 		if r := fntype.Recv(); r != nil { // 方法有一个receiver时,需要对参数做处理,相当于把receiver本身作为函数的一个参数
 			argument(e.tagHole(ks, fn, r), call.X.(*ir.SelectorExpr).X)
 		} else {
-			// Evaluate callee function expression.
-			argument(e.discardHole(), call.X)
+			argument(e.discardHole(), call.X) 
 		}
 
 		args := call.Args // 函数的参数与调用方的 有向边分析
-		for i, param := range fntype.Params().FieldSlice() {
-			argument(e.tagHole(ks, fn, param), args[i])
+		for i, param := range fntype.Params().FieldSlice() { // 相当于为每一个传进来的参数src,新建一个虚拟变量dst = src
+			argument(e.tagHole(ks, fn, param), args[i]) // todo 这里可能包含go函数传值传址的原理解析!!
 		}
 	/** 一些系统自带函数的输入输出的有向边解析**/
 	case ir.OAPPEND:
@@ -707,7 +701,7 @@ func (b *batch) flowClosure(k hole, clo *ir.ClosureExpr) {
 }
 ```
 
-#### flow 生成一条边,根据边的derefs值决定src要不要escape
+#### flow 生成一条边,根据dst的escapes值和边的derefs值决定src要不要escape
 ```go
 // src/cmd/compile/internal/escape/escape.go
 func (b *batch) flow(k hole, src *location) {
@@ -732,7 +726,7 @@ func (b *batch) flow(k hole, src *location) {
 }
 ```
 
-#### walkAll 遍历所有location,标记所有需要escape的location
+#### walkAll 遍历所有location,根据已经escape的location,标记所有需要escape的location
 ```go
 // src/cmd/compile/internal/escape/escape.go
 func (b *batch) walkAll() {
@@ -743,25 +737,25 @@ func (b *batch) walkAll() {
 	enqueue := func(loc *location) {
 		if !loc.queued {
 			todo = append(todo, loc)
-			loc.queued = true
+			loc.queued = true //标记queued,当ta被拎出来walk时,会先标记回false,避免无限循环
 		}
 	}
 
-	for _, loc := range b.allLocs {
+	for _, loc := range b.allLocs { // 所有location都入队
 		enqueue(loc)
 	}
-	enqueue(&b.heapLoc)
+	enqueue(&b.heapLoc) // todo 这个heapLoc是干啥的?
 
 	var walkgen uint32
 	for len(todo) > 0 {
-		// 将队列末尾的‘location’节点作为‘root’,
+		// 相当于pop出todo的最后一个元素
 		root := todo[len(todo)-1]
-		// todo列表中去除掉将要深入探究的root节点
 		todo = todo[:len(todo)-1]
-		root.queued = false
+
+		root.queued = false // 标记queued 为false,防无限循环
 
 		walkgen++
-		// #ref walkOne 深入root节点,同时传入了enqueue方法,当root引用的一个location 需要escape时,调用enqueue将该location入队todo中,下一个循环以该location为根,深入递归里面的边喝需要escape的location
+		// #ref walkOne 深入root节点,同时传入了enqueue方法,当与root相关的location 需要escape时,调用enqueue将该location入队todo中,接下来的循环中需要以该location为root,递归该root的边和需要escape的location
 		b.walkOne(root, walkgen, enqueue)
 	}
 }
