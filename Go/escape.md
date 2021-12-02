@@ -790,7 +790,7 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 			// location, then l can't be transiently
 			// allocated.
 			if !root.transient && l.transient {
-				l.transient = false
+				l.transient = false // todo transient的作用
 				enqueue(l)
 			}
 		}
@@ -818,16 +818,16 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 				l.leakTo(root, derefs)
 			}
 
-			// root的生命周期大于l,且root引用了l,则需要把l的escape值置换true
+			// root的生命周期大于l,且root与l的边小于0,则需要把l的escape值置换true
 			if addressOf && !l.escapes {
 				l.escapes = true
-				// 还需要把l入队walk队列,递归l的边里需要escape的location
+				// 还需要把l入队walk队列,递归l的边里需要escape的location(l已经escape了,那么ta指向的地址也需要escape)
 				enqueue(l)
 				continue
 			}
 		}
 
-		// 遍历所有指向当前location的边
+		// 遍历所有当前location的边
 		for i, edge := range l.edges {
 			if edge.src.escapes { // 边的Src location已经确定要逃逸了,不需要再做处理
 				continue
