@@ -142,6 +142,7 @@ type bottomUpVisitor struct {
 	stack    []*Func // todo
 }
 ```
+
 ## `escape`分析过程
 ```go
 // cmd/compile/internal/ir/scc.go
@@ -220,6 +221,23 @@ type batch struct {
 
 	heapLoc  location
 	blankLoc location
+}
+
+// 表示一个赋值语句的hole
+// 比如 "x = **p", 就新建一个 hole  dst==x and derefs==2.
+type hole struct {
+	dst    *location
+	derefs int // >= -1
+	notes  *note
+
+	// addrtaken indicates whether this context is taking the address of
+	// the expression, independent of whether the address will actually
+	// be stored into a variable.
+	addrtaken bool
+
+	// uintptrEscapesHack indicates this context is evaluating an
+	// argument for a //go:uintptrescapes function.
+	uintptrEscapesHack bool
 }
 ```
 ### Batch方法
@@ -392,7 +410,7 @@ func (e *escape) stmt(n ir.Node) {
 		} else {
 			e.flow(ks[1].deref(n, "range-deref"), tmp) // 为key, value 和 临时location(tmp)生成引用边(derefs = -1)
 		}
-		e.reassigned(ks, n) // todo reassigned ??
+		e.reassigned(ks, n) // 尝试给ks(dst为key的location的hole)打上reassigned标记
 
 		e.block(n.Body) // 递归解析range的body内容
 		e.loopDepth--
@@ -448,7 +466,7 @@ func (e *escape) stmt(n ir.Node) {
 		e.stmts(n.Rhs[0].Init()) // 递归解析函数内部的escape情况
 		ks := e.addrs(n.Lhs)
 		e.call(ks, n.Rhs[0], nil) // 把函数作为一个整体 和 当前上下文的escape分析
-		e.reassigned(ks, n)
+		e.reassigned(ks, n) // 尝试给ks(dst为左值的location的hole) 打上reassigned标记
 	case ir.ORETURN: // 函数的return
 		n := n.(*ir.ReturnStmt)
 		results := e.curfn.Type().Results().FieldSlice()
@@ -489,7 +507,7 @@ func (e *escape) assignList(dsts, srcs []ir.Node, why string, where ir.Node) {
 		e.expr(k.note(where, why), src)
 	}
 
-	e.reassigned(ks, where)
+	e.reassigned(ks, where) // 尝试给ks(包裹dst location的hole) 打上 reassigned 标记
 }
 
 // 创建一个srcNode(n) 到 dstHole(k) 的有向边
@@ -683,6 +701,22 @@ func (e *escape) assignHeap(src ir.Node, why string, where ir.Node) {
 }
 ```
 
+##### reassigned 给一个location标记reassigned属性
+```go
+func (e *escape) reassigned(ks []hole, where ir.Node) {
+	// ...
+
+	for _, k := range ks {
+		loc := k.dst
+		// Variables declared by range statements are assigned on every iteration.
+		if n, ok := loc.n.(*ir.Name); ok && n.Defn == where && where.Op() != ir.ORANGE {
+			continue
+		}
+		loc.reassigned = true
+	}
+}
+```
+
 #### flowClosure 解析闭包
 ```go
 func (b *batch) flowClosure(k hole, clo *ir.ClosureExpr) {
@@ -796,26 +830,10 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 		}
 
 		// 判断root是否在l的生命周期外依然存在
-		// todo outlives
 		if b.outlives(root, l) {
-			// l's value flows to root. If l is a function
-			// parameter and root is the heap or a
-			// corresponding result parameter, then record
-			// that value flow for tagging the function
-			// later.
+			// l 是函数的入参的情形
 			if l.isName(ir.PPARAM) {
-				if (logopt.Enabled() || base.Flag.LowerM >= 2) && !l.escapes {
-					if base.Flag.LowerM >= 2 {
-						fmt.Printf("%s: parameter %v leaks to %s with derefs=%d:\n", base.FmtPos(l.n.Pos()), l.n, b.explainLoc(root), derefs)
-					}
-					explanation := b.explainPath(root, l)
-					if logopt.Enabled() {
-						var e_curfn *ir.Func // TODO(mdempsky): Fix.
-						logopt.LogOpt(l.n.Pos(), "leak", "escape", ir.FuncName(e_curfn),
-							fmt.Sprintf("parameter %v leaks to %s with derefs=%d", l.n, b.explainLoc(root), derefs), explanation)
-					}
-				}
-				l.leakTo(root, derefs)
+				l.leakTo(root, derefs) // 判断是否需要leakTo #ref leakTo
 			}
 
 			// root的生命周期大于l,且root与l的边小于0,则需要把l的escape值置换true
@@ -833,7 +851,7 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 				continue
 			}
 
-			d := derefs + edge.derefs
+			d := derefs + edge.derefs // 当前location的derefs + 当前location的边的derefs
 			if edge.src.walkgen != walkgen || edge.src.derefs > d {
 				//当前location相对于初始root location的引用信息权值小于已知的最小引用信息权值,则更新这个信息
 				edge.src.walkgen = walkgen
@@ -844,6 +862,56 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 			}
 		}
 	}
+}
+```
+
+##### leakTo(sink, derefs) 
+```go
+func (l *location) leakTo(sink *location, derefs int) {
+	// 判断sink是否是一个函数的返回属性,且sink还没有被标记为escape
+	if !sink.escapes && sink.isName(ir.PPARAMOUT) && sink.curfn == l.curfn {
+		ri := sink.resultIndex - 1
+		if ri < numEscResults {
+			// 增加result leak todo paramEsc
+			l.paramEsc.AddResult(ri, derefs)
+			return
+		}
+	}
+
+	// 增加heapleak
+	l.paramEsc.AddHeap(derefs)
+}
+```
+
+##### outlives(l, other) 判断`l`的存在时间是否大于`other`在stack上的生命周期
+```go
+func (b *batch) outlives(l, other *location) bool {
+	if l.escapes { // l已经被标记需要escape到堆上了,堆的存在时间大于所有
+
+		return true
+	}
+
+	// 当l是一个函数的返回属性时,因为不知道ta返回后会被调用者怎么折腾,保守的认为ta比其他相关变量声明周期更长
+	if l.isName(ir.PPARAMOUT) {
+		// 例外情况: 闭包的直接调用
+		if containsClosure(other.curfn, l.curfn) && l.curfn.ClosureCalled() {
+			return false
+		}
+
+		return true
+	}
+
+	// l 和 other 在同一个函数内,但l的在other所在的循环block{}的外面时,也认为l的生命周期大于other
+	if l.curfn == other.curfn && l.loopDepth < other.loopDepth {
+		return true
+	}
+
+	// other所在的函数是l所在的函数的内的闭包时,认为l的生命周期大雨other
+	if containsClosure(l.curfn, other.curfn) {
+		return true
+	}
+
+	return false
 }
 ```
 
