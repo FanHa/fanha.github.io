@@ -219,12 +219,22 @@ type batch struct {
 	allLocs  []*location
 	closures []closure
 
-	heapLoc  location
-	blankLoc location
+	heapLoc  location // 堆location
+	blankLoc location // 空白location 用来存放一些 匿名或或用不到的变量 比如 _ := XXX 语句就需要为 "_"创建一个hole,这个hole的dst就是blankLoc
+}
+
+// 每解析一个函数时需要新建一个这样的结构,包裹了传入的batch,当前要解析的函数节点curfn,以及一个状态标记loopDepth表明当前函数内的解析深度(比如解析到一个for循环内时,loopDepth+1)
+type escape struct {
+	*batch
+	curfn *ir.Func // 当前解析的函数
+
+	labels map[*types.Sym]labelState // known labels
+
+	loopDepth int //当前解析的深度(比如解析到当前函数的一个for循环内时,loopDepth+1)
 }
 
 // 表示一个赋值语句的hole
-// 比如 "x = **p", 就新建一个 hole  dst==x and derefs==2.
+// 比如 "x = **p", 就新建一个 hole,  dst==x and derefs==2.
 type hole struct {
 	dst    *location
 	derefs int // >= -1
@@ -238,6 +248,49 @@ type hole struct {
 	// uintptrEscapesHack indicates this context is evaluating an
 	// argument for a //go:uintptrescapes function.
 	uintptrEscapesHack bool
+}
+
+// location 表示一个变量位置
+type location struct {
+	n         ir.Node  // 节点信息
+	curfn     *ir.Func // 变量所在的函数
+	edges     []edge   // 所有指向当前变量的边 #ref struct edge
+	loopDepth int      // loopDepth at declaration
+
+	// 如果当前变量是函数的返回属性,则这个数值不为0,数值n代表函数的第n个返回属性
+	resultIndex int
+
+	// derefs and walkgen are used during walkOne to track the
+	// minimal dereferences from the walk root.
+	derefs  int // >= -1 //todo
+	walkgen uint32
+
+	// dst and dstEdgeindex track the next immediate assignment
+	// destination location during walkone, along with the index
+	// of the edge pointing back to this location.
+	dst        *location
+	dstEdgeIdx int
+
+	queued bool // 在escape解析过程中标记这个location是否已经被push到了todo队列里
+
+	// 标记一个变量是否必须保存到堆上 escape!
+	escapes bool
+
+	// 如果变量的生命周期没有超过声明所在stack,则这个值为true
+	transient bool
+
+	// paramEsc records the represented parameter's leak set.
+	paramEsc leaks
+
+	captured   bool // 是否有一个闭包函数用到了这个变量
+	reassigned bool // has this variable been reassigned?
+	addrtaken  bool // has this variable's address been taken?
+}
+
+type edge struct {
+	src    *location // 边的src的location (dst := src)
+	derefs int // 边相对于dst的derefs值
+	notes  *note
 }
 ```
 ### Batch方法
@@ -316,7 +369,7 @@ func (b *batch) with(fn *ir.Func) *escape {
 	}
 }
 
-// 给这个变量信息分配存储位置
+// 给这个变量新建一个location,初始化时需要指定transient属性
 func (e *escape) newLoc(n ir.Node, transient bool) *location {
 	// ...
 	// 初始化一个location结构
@@ -419,7 +472,7 @@ func (e *escape) stmt(n ir.Node) {
 		n := n.(*ir.SwitchStmt)
 		// ...
 		for _, cas := range n.Cases {
-			e.discards(cas.List)
+			e.discards(cas.List) // todo
 			e.block(cas.Body) // 递归解析所有case的body内容
 		}
 
@@ -429,10 +482,11 @@ func (e *escape) stmt(n ir.Node) {
 			e.stmt(cas.Comm)
 			e.block(cas.Body) // 递归解析所有case的body内容
 		}
-	case ir.ORECV: // todo ??
-		// TODO(mdempsky): Consider e.discard(n.Left).
+	case ir.ORECV: // <-X语法 阻塞直到从Chan X中得到数据(但这个数据又不需要保存)
 		n := n.(*ir.UnaryExpr)
-		e.exprSkipInit(e.discardHole(), n) // already visited n.Ninit
+		// e.discardHole()创建一个dst为blankLoc 的Hole, 
+		// exprSkipInit()解析变量n的形式(得到derefs值),创建一条dst 为blankLoc, src为n的location的边
+		e.exprSkipInit(e.discardHole(), n)  
 	case ir.OSEND: // send 语法
 		n := n.(*ir.SendStmt)
 		e.discard(n.Chan)
@@ -445,7 +499,6 @@ func (e *escape) stmt(n ir.Node) {
 		e.assignList([]ir.Node{n.X}, []ir.Node{n.Y}, "assign", n)
 	case ir.OASOP:
 		n := n.(*ir.AssignOpStmt)
-		// TODO(mdempsky): Worry about OLSH/ORSH?
 		e.assignList([]ir.Node{n.X}, []ir.Node{n.Y}, "assign", n)
 	case ir.OAS2:
 		n := n.(*ir.AssignListStmt)
@@ -488,7 +541,7 @@ func (e *escape) stmt(n ir.Node) {
 ```go
 func (e *escape) dcl(n *ir.Name) hole {
 	loc := e.oldLoc(n) // 变量声明的location早在InitFunc阶段就已经生成好了,所以这里用oldLoc取到这个location的地址
-	loc.loopDepth = e.loopDepth //todo e的loopDepth 和 loc 的loopDepth的作用
+	loc.loopDepth = e.loopDepth //将location的loopDepth 值变为当前函数的解析深度(e.loopDepth)
 	return loc.asHole()
 }
 ```
@@ -515,11 +568,11 @@ func (e *escape) expr(k hole, n ir.Node) {
 	if n == nil {
 		return
 	}
-	e.stmts(n.Init()) // n是个表达式的话,需要先解析
 	// 解析赋值语句右边的表达式 #ref exprSkipInit
 	e.exprSkipInit(k, n)
 }
 
+// 解析一个变量节点的表达式(变量的形式可能是X, *X, &X, make xxxxx, 闭包等等)
 func (e *escape) exprSkipInit(k hole, n ir.Node) {
 	// ...
 
@@ -590,7 +643,7 @@ func (e *escape) exprSkipInit(k hole, n ir.Node) {
 	// 闭包
 	case ir.OCLOSURE:
 		n := n.(*ir.ClosureExpr)
-		k = e.spill(k, n) // 先为闭包本身创建一个location ,并通过spill创建一个变量到该location 的 derefs值为-1的有向边
+		k = e.spill(k, n) // 先为闭包本身创建一个location ,并通过spill创建一个变量到该location 的 derefs值为-1的有向边 #ref spill
 		e.closures = append(e.closures, closure{k, n})
 
 		if fn := n.Func; fn.IsHiddenClosure() {
@@ -851,14 +904,14 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 				continue
 			}
 
-			d := derefs + edge.derefs // 当前location的derefs + 当前location的边的derefs
+			d := derefs + edge.derefs // 当前location相对root的derefs + 当前location的边的derefs
 			if edge.src.walkgen != walkgen || edge.src.derefs > d {
-				//当前location相对于初始root location的引用信息权值小于已知的最小引用信息权值,则更新这个信息
+				//当前location相对于初始root location的derefs值小于已知的这条边的src location的derefs值,则更新这条边的src location的信息
 				edge.src.walkgen = walkgen
 				edge.src.derefs = d 
 				edge.src.dst = l
 				edge.src.dstEdgeIdx = i
-				todo = append(todo, edge.src) // 将最新的最小引用权值的src location加入到todo列表中
+				todo = append(todo, edge.src) // 更新了信息后的边的src 需要加入到todo列表中
 			}
 		}
 	}
