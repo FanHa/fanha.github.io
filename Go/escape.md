@@ -40,97 +40,7 @@ func VisitFuncsBottomUp(list []Node, analyze func(list []*Func, recursive bool))
 	}
 }
 ```
-## 数据结构
-### Func 节点结构
-```go
-// cmd/compile/internal/ir/func.go
-type Func struct {
-	miniNode
-	Body Nodes 
-	Iota int64
-
-	Nname    *Name        // ONAME node
-	OClosure *ClosureExpr // OCLOSURE node
-
-	Shortname *types.Sym
-
-	// Extra entry code for the function. For example, allocate and initialize
-	// memory for escaping parameters.
-	Enter Nodes
-	Exit  Nodes
-
-	// ONAME nodes for all params/locals for this func/closure, does NOT
-	// include closurevars until transforming closures during walk.
-	// Names must be listed PPARAMs, PPARAMOUTs, then PAUTOs,
-	// with PPARAMs and PPARAMOUTs in order corresponding to the function signature.
-	// However, as anonymous or blank PPARAMs are not actually declared,
-	// they are omitted from Dcl.
-	// Anonymous and blank PPARAMOUTs are declared as ~rNN and ~bNN Names, respectively.
-	Dcl []*Name
-
-	// ClosureVars lists the free variables that are used within a
-	// function literal, but formally declared in an enclosing
-	// function. The variables in this slice are the closure function's
-	// own copy of the variables, which are used within its function
-	// body. They will also each have IsClosureVar set, and will have
-	// Byval set if they're captured by value.
-	ClosureVars []*Name
-
-	// Enclosed functions that need to be compiled.
-	// Populated during walk.
-	Closures []*Func
-
-	// Parents records the parent scope of each scope within a
-	// function. The root scope (0) has no parent, so the i'th
-	// scope's parent is stored at Parents[i-1].
-	Parents []ScopeID
-
-	// Marks records scope boundary changes.
-	Marks []Mark
-
-	FieldTrack map[*obj.LSym]struct{}
-	DebugInfo  interface{}
-	LSym       *obj.LSym // Linker object in this function's native ABI (Func.ABI)
-
-	Inl *Inline
-
-	// Closgen tracks how many closures have been generated within
-	// this function. Used by closurename for creating unique
-	// function names.
-	Closgen int32
-
-	Label int32 // largest auto-generated label in this function
-
-	Endlineno src.XPos
-	WBPos     src.XPos // position of first write barrier; see SetWBPos
-
-	Pragma PragmaFlag // go:xxx function annotations
-
-	flags bitset16
-
-	// ABI is a function's "definition" ABI. This is the ABI that
-	// this function's generated code is expecting to be called by.
-	//
-	// For most functions, this will be obj.ABIInternal. It may be
-	// a different ABI for functions defined in assembly or ABI wrappers.
-	//
-	// This is included in the export data and tracked across packages.
-	ABI obj.ABI
-	// ABIRefs is the set of ABIs by which this function is referenced.
-	// For ABIs other than this function's definition ABI, the
-	// compiler generates ABI wrapper functions. This is only tracked
-	// within a package.
-	ABIRefs obj.ABISet
-
-	NumDefers  int32 // number of defer calls in the function
-	NumReturns int32 // number of explicit returns in the function
-
-	// nwbrCalls records the LSyms of functions called by this
-	// function for go:nowritebarrierrec analysis. Only filled in
-	// if nowritebarrierrecCheck != nil.
-	NWBRCalls *[]SymAndPos
-}
-```
+## `escape`分析过程入口
 
 ### Visitor 结构
 ```go
@@ -139,80 +49,11 @@ type bottomUpVisitor struct {
 	analyze  func([]*Func, bool) // 注入的分析方法组
 	visitgen uint32 // 自增visitID
 	nodeID   map[*Func]uint32 // 纪录一个函数是否已经被visit过
-	stack    []*Func // todo
+	stack    []*Func
 }
 ```
 
-## `escape`分析过程
-```go
-// cmd/compile/internal/ir/scc.go
-func (v *bottomUpVisitor) visit(n *Func) uint32 {
-	// 判断当前Func是否已被visit过
-	if id := v.nodeID[n]; id > 0 {
-		return id
-	}
-
-	// 当前Func节点没有被分析过,递增生成新的NodeId,
-	v.visitgen++
-	id := v.visitgen
-	v.nodeID[n] = id
-	// todo 这个min是啥?
-	v.visitgen++
-	min := v.visitgen
-	// 所有遍历去重后的节点线放到stack上,后面再统一分析
-	v.stack = append(v.stack, n)
-
-	do := func(defn Node) {
-		if defn != nil {
-			// 递归visit
-			if m := v.visit(defn.(*Func)); m < min {
-				min = m
-			}
-		}
-	}
-
-	// 深度优先遍历以当前节点为root的树
-	Visit(n, func(n Node) {
-		switch n.Op() {
-		case ONAME:
-			if n := n.(*Name); n.Class == PFUNC {
-				do(n.Defn)
-			}
-		case ODOTMETH, OCALLPART, OMETHEXPR:
-			if fn := MethodExprName(n); fn != nil {
-				do(fn.Defn)
-			}
-		case OCLOSURE:
-			n := n.(*ClosureExpr)
-			do(n.Func)
-		}
-	})
-
-	if (min == id || min == id+1) && !n.IsHiddenClosure() {
-		// todo 精简stack(估计是存在递归调用啥的)
-		recursive := min == id
-
-		var i int
-		for i = len(v.stack) - 1; i >= 0; i-- {
-			x := v.stack[i]
-			if x == n {
-				break
-			}
-			v.nodeID[x] = ^uint32(0)
-		}
-		v.nodeID[n] = ^uint32(0)
-		block := v.stack[i:]
-		// 遍历精简后的stack,调用注入的analyze方法
-		v.stack = v.stack[:i]
-		v.analyze(block, recursive)
-	}
-
-	return min
-}
-```
-
-## analyze
-### 结构
+### escape 结构
 ```go
 // cmd/compile/internal/escape/escape.go
 type batch struct {
@@ -260,9 +101,7 @@ type location struct {
 	// 如果当前变量是函数的返回属性,则这个数值不为0,数值n代表函数的第n个返回属性
 	resultIndex int
 
-	// derefs and walkgen are used during walkOne to track the
-	// minimal dereferences from the walk root.
-	derefs  int // >= -1 //todo
+	derefs  int // 用来记录在escape walk过程中,当前location 和 root location 的derefs值
 	walkgen uint32
 
 	// dst and dstEdgeindex track the next immediate assignment
@@ -271,7 +110,7 @@ type location struct {
 	dst        *location
 	dstEdgeIdx int
 
-	queued bool // 在escape解析过程中标记这个location是否已经被push到了todo队列里
+	queued bool // 在escape解析过程中标记这个location是否已经被push到了要作为root来walk的 todo队列里
 
 	// 标记一个变量是否必须保存到堆上 escape!
 	escapes bool
@@ -294,7 +133,7 @@ type edge struct {
 }
 ```
 ### Batch方法
-v.analyze方法是前面注入的 `Batch`方法
+分析调用的analyze方法是这里注入的 `Batch`方法
 ```go
 // cmd/compile/internal/escape/escape.go
 func Batch(fns []*ir.Func, recursive bool) {
@@ -471,8 +310,8 @@ func (e *escape) stmt(n ir.Node) {
 	case ir.OSWITCH: // switch语法
 		n := n.(*ir.SwitchStmt)
 		// ...
-		for _, cas := range n.Cases {
-			e.discards(cas.List) // todo
+		for _, cas := range n.Cases { // 遍历每一个case节点
+			e.discards(cas.List) // case的值都可以创建一个dst为blankLoc的hole,然后创建一个flow到这个dst的边
 			e.block(cas.Body) // 递归解析所有case的body内容
 		}
 
@@ -484,7 +323,7 @@ func (e *escape) stmt(n ir.Node) {
 		}
 	case ir.ORECV: // <-X语法 阻塞直到从Chan X中得到数据(但这个数据又不需要保存)
 		n := n.(*ir.UnaryExpr)
-		// e.discardHole()创建一个dst为blankLoc 的Hole, 
+		// e.discardHole()创建一个dst为blankLoc 的hole, 
 		// exprSkipInit()解析变量n的形式(得到derefs值),创建一条dst 为blankLoc, src为n的location的边
 		e.exprSkipInit(e.discardHole(), n)  
 	case ir.OSEND: // send 语法
@@ -605,7 +444,7 @@ func (e *escape) exprSkipInit(k hole, n ir.Node) {
 	case ir.OCALLMETH, ir.OCALLFUNC, ir.OCALLINTER, ir.OLEN, ir.OCAP, ir.OCOMPLEX, ir.OREAL, ir.OIMAG, ir.OAPPEND, ir.OCOPY, ir.OUNSAFEADD, ir.OUNSAFESLICE:
 		e.call([]hole{k}, n, nil) // 新建一条dst 到 函数节点location的边(call会解析函数的输出) #ref call
 
-	/****** new, make 等等语法需要调用spill(这个方法内会调用 addr(n,“xxx“))生成derefs为-1的hole,然后用这个hole生成与src节点的有向边 *****/
+	/****** new, make 等等语法需要调用spill(这个方法内会调用 k.addr(n,“xxx“))将hole k 的derefs值变为-1,然后用这个hole生成与n节点的有向边 *****/
 	case ir.ONEW: // new
 		n := n.(*ir.UnaryExpr)
 		e.spill(k, n) 
@@ -613,19 +452,16 @@ func (e *escape) exprSkipInit(k hole, n ir.Node) {
 	case ir.OMAKESLICE: //make []
 		n := n.(*ir.MakeExpr)
 		e.spill(k, n)
-		e.discard(n.Len)
+		// make 语法的 len 和 cap参数只需要生成 一个 dst为 _blankLoc 的hole,然后用这个hole生成与对应参数的有向边
+		e.discard(n.Len) 
 		e.discard(n.Cap)
 	case ir.OMAKEMAP: //make map
 		n := n.(*ir.MakeExpr)
 		e.spill(k, n)
 		e.discard(n.Len)
 	case ir.OCALLPART: // 方法(非调用)
-		// Flow the receiver argument to both the closure and
-		// to the receiver parameter.
-
 		n := n.(*ir.SelectorExpr)
-		closureK := e.spill(k, n)
-
+		closureK := e.spill(k, n) // 先为右值创建一个新location, 在创建一条k(左值的hole)到新location的derefs值为-1的边,返回的是包裹了新location的hole
 		m := n.Selection
 
 		// 保守的为该方法所有的返回属性创建一个heapHole
@@ -633,17 +469,18 @@ func (e *escape) exprSkipInit(k hole, n ir.Node) {
 		for i := m.Type.NumResults(); i > 0; i-- {
 			ks = append(ks, e.heapHole())
 		}
-		name, _ := m.Nname.(*ir.Name) // nName是该方法的参数列表
-		paramK := e.tagHole(ks, name, m.Type.Recv()) // todo ??
-
-		e.expr(e.teeHole(paramK, closureK), n.X)
+		name, _ := m.Nname.(*ir.Name) // Nname是该方法的节点结构
+		paramK := e.tagHole(ks, name, m.Type.Recv()) // 返回一个包裹新建的location的hole,前面生成的ks都流向这个新location
+		// closureK 是调用的方法的hole
+		// teeHole返回一个包裹新建location得hole, 参数里的hole都流向这个新hole.
+		e.expr(e.teeHole(paramK, closureK), n.X) // 虽然右值是个方法,但建立flow关系时传入的是该方法的`载体`
 
 	// ...
 	/****   ***************************** *****/
 	// 闭包
 	case ir.OCLOSURE:
 		n := n.(*ir.ClosureExpr)
-		k = e.spill(k, n) // 先为闭包本身创建一个location ,并通过spill创建一个变量到该location 的 derefs值为-1的有向边 #ref spill
+		k = e.spill(k, n) // spill先为闭包本身创建一个location ,再创建一个k(左值的hole)到该location 的 derefs值为-1的有向边 #ref spill
 		e.closures = append(e.closures, closure{k, n})
 
 		if fn := n.Func; fn.IsHiddenClosure() {
@@ -667,11 +504,58 @@ func (e *escape) exprSkipInit(k hole, n ir.Node) {
 		// ...
 }
 
-// spill 主动申请一个新location, 然后调用addr(n, "spill"),生成一个derefs为-1的hole,用这个hole生成一个与src节点derefs为-1的有向边
+// spill 为n生成一个新location, 然后调用k.addr(n, "spill"),将hole k的derefs值变为-1, 用这个hole生成一个与n节点derefs为-1的有向边
 func (e *escape) spill(k hole, n ir.Node) hole {
 	loc := e.newLoc(n, true)
 	e.flow(k.addr(n, "spill"), loc)
-	return loc.asHole()
+	return loc.asHole() // 返回的是一个包裹新location的hole(有的地方需要用到)
+}
+
+// ?? todo 
+func (e *escape) tagHole(ks []hole, fn *ir.Name, param *types.Field) hole {
+	// If this is a dynamic call, we can't rely on param.Note.
+	if fn == nil {
+		return e.heapHole()
+	}
+
+	if e.inMutualBatch(fn) {
+		return e.addr(ir.AsNode(param.Nname))
+	}
+
+	// Call to previously tagged function.
+
+	if param.Note == UintptrEscapesNote {
+		k := e.heapHole()
+		k.uintptrEscapesHack = true
+		return k
+	}
+
+	var tagKs []hole
+
+	esc := parseLeaks(param.Note)
+	if x := esc.Heap(); x >= 0 {
+		tagKs = append(tagKs, e.heapHole().shift(x))
+	}
+
+	if ks != nil {
+		for i := 0; i < numEscResults; i++ {
+			if x := esc.Result(i); x >= 0 {
+				tagKs = append(tagKs, ks[i].shift(x))
+			}
+		}
+	}
+
+	return e.teeHole(tagKs...)
+}
+
+func (e *escape) teeHole(ks ...hole) hole {
+	// 创建一个临时location
+	loc := e.newLoc(nil, true)
+	for _, k := range ks { // 遍历参数 hole 数组
+		// 为每一个hole创建到新location的边
+		e.flow(k, loc)
+	}
+	return loc.asHole()// 返回新建的包裹新location的hole
 }
 ```
 
@@ -817,7 +701,7 @@ func (b *batch) flow(k hole, src *location) {
 ```go
 // src/cmd/compile/internal/escape/escape.go
 func (b *batch) walkAll() {
-	// 将所有location结构存入一个队列‘todo’中
+	// 将所有location结构存入一个队列‘todo’中,这个队列里的多有元素都将作为root walk一次
 	todo := make([]*location, 0, len(b.allLocs)+1)
 
 	// 定义了一个enqueue方法,把一个location入队 todo 队列中
@@ -831,7 +715,7 @@ func (b *batch) walkAll() {
 	for _, loc := range b.allLocs { // 所有location都入队
 		enqueue(loc)
 	}
-	enqueue(&b.heapLoc) // todo 这个heapLoc是干啥的?
+	enqueue(&b.heapLoc) // 把heapLoc也push到需要作为root walk的队列里(因为很多特殊变量会直接流向这个heapLoc)
 
 	var walkgen uint32
 	for len(todo) > 0 {
@@ -864,35 +748,33 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 		derefs := l.derefs
 
 		// 初始节点的derefs == 0 ,第一遍遍历时,只有root节点,所以addressOf 为 false,
-		// 后续的遍历当出现derefs < 0 时表明该location被初始节点引用
+		// 后续的遍历当出现derefs < 0 时表明该location被root节点引用了地址
 		addressOf := derefs < 0
 		if addressOf {·
 			// For a flow path like "root = &l; l = x",
 			// l's address flows to root, but x's does
 			// not. We recognize this by lower bounding
 			// derefs at 0.
-			derefs = 0
+			derefs = 0 
 
-			// If l's address flows to a non-transient
-			// location, then l can't be transiently
-			// allocated.
-			if !root.transient && l.transient {
-				l.transient = false // todo transient的作用
-				enqueue(l)
+			// root 非临时变量, l的dst为root时,l也不能为临时变量(因为root的值为l的地址,l临时的话,root有指向未知区域的风险)
+			if !root.transient && l.transient { // 这个&&后面的条件 和下面的设置值为false,防止了重复enqueue一个变量location
+				l.transient = false
+				enqueue(l) // 将l push到 需要作为root walk的队列里
 			}
 		}
 
 		// 判断root是否在l的生命周期外依然存在
 		if b.outlives(root, l) {
-			// l 是函数的入参的情形
+			// l 是函数的入参的情形处理
 			if l.isName(ir.PPARAM) {
 				l.leakTo(root, derefs) // 判断是否需要leakTo #ref leakTo
 			}
 
-			// root的生命周期大于l,且root与l的边小于0,则需要把l的escape值置换true
+			// root的生命周期大于l,且root(dst)与l(src)的边小于0,则需要把l的escapes值置换true
 			if addressOf && !l.escapes {
 				l.escapes = true
-				// 还需要把l入队walk队列,递归l的边里需要escape的location(l已经escape了,那么ta指向的地址也需要escape)
+				// 还需要把l入队walk队列,递归l的边里需要escape的location(l已经escape了,那么流向l的变量可能也需要escape)
 				enqueue(l)
 				continue
 			}
@@ -903,7 +785,6 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 			if edge.src.escapes { // 边的Src location已经确定要逃逸了,不需要再做处理
 				continue
 			}
-
 			d := derefs + edge.derefs // 当前location相对root的derefs + 当前location的边的derefs
 			if edge.src.walkgen != walkgen || edge.src.derefs > d {
 				//当前location相对于初始root location的derefs值小于已知的这条边的src location的derefs值,则更新这条边的src location的信息
@@ -911,7 +792,7 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 				edge.src.derefs = d 
 				edge.src.dst = l
 				edge.src.dstEdgeIdx = i
-				todo = append(todo, edge.src) // 更新了信息后的边的src 需要加入到todo列表中
+				todo = append(todo, edge.src) // 更新了信息后的边的src 需要加入到当前root的walk todo列表中
 			}
 		}
 	}
@@ -919,13 +800,14 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 ```
 
 ##### leakTo(sink, derefs) 
+当一个变量是一个函数的入参,且流向了另一个函数内的变量(sink)
 ```go
 func (l *location) leakTo(sink *location, derefs int) {
-	// 判断sink是否是一个函数的返回属性,且sink还没有被标记为escape
+	// sink还没有被标记为escapes, sink是函数的返回属性,sink与l在同一个函数内
 	if !sink.escapes && sink.isName(ir.PPARAMOUT) && sink.curfn == l.curfn {
 		ri := sink.resultIndex - 1
 		if ri < numEscResults {
-			// 增加result leak todo paramEsc
+			// 增加result leak // leaks 的作用?? todo
 			l.paramEsc.AddResult(ri, derefs)
 			return
 		}
@@ -986,7 +868,7 @@ func (b *batch) finish(fns []*ir.Func) {
 			n.SetEsc(ir.EscHeap)
 		} else {
 			n.SetEsc(ir.EscNone) // 普通location 设置Esc属性为EscNone
-			if loc.transient { // todo transient的用处
+			if loc.transient { // 设置变量节点的transient属性
 				switch n.Op() {
 				case ir.OCLOSURE:
 					n := n.(*ir.ClosureExpr)
