@@ -353,11 +353,10 @@ func (e *escape) stmt(n ir.Node) {
 		n := n.(*ir.AssignListStmt)
 		e.assignList(n.Lhs, n.Rhs, "assign-pair-receive", n)
 
-	case ir.OAS2FUNC: // 语句是个函数(方法)调用时
+	case ir.OAS2FUNC: // 语句是将函数调用结果赋值时
 		n := n.(*ir.AssignListStmt)
-		e.stmts(n.Rhs[0].Init()) // 递归解析函数内部的escape情况
-		ks := e.addrs(n.Lhs)
-		e.call(ks, n.Rhs[0], nil) // 把函数作为一个整体 和 当前上下文的escape分析
+		ks := e.addrs(n.Lhs) // 为每一个左值生成一个hole todo e.addrs
+		e.call(ks, n.Rhs[0], nil) // 把右值作为一个整体 和 左值的hole进行分析 #ref escape.call
 		e.reassigned(ks, n) // 尝试给ks(dst为左值的location的hole) 打上reassigned标记
 	case ir.ORETURN: // 函数的return
 		n := n.(*ir.ReturnStmt)
@@ -368,7 +367,7 @@ func (e *escape) stmt(n ir.Node) {
 		}
 		e.assignList(dsts, n.Results, "return", n)
 	case ir.OCALLFUNC, ir.OCALLMETH, ir.OCALLINTER, ir.OCLOSE, ir.OCOPY, ir.ODELETE, ir.OPANIC, ir.OPRINT, ir.OPRINTN, ir.ORECOVER:
-		e.call(nil, n, nil)
+		e.call(nil, n, nil)·
 	case ir.OGO, ir.ODEFER:
 		n := n.(*ir.GoDeferStmt)
 		e.stmts(n.Call.Init()) // go 或 defer 函数内部的内容递归到内部去解析
@@ -559,18 +558,22 @@ func (e *escape) teeHole(ks ...hole) hole {
 }
 ```
 
-##### call 把函数当作一个整体 作escape分析
+##### call 把函数调用当作一个整体 和左值 作escape分析
 ```go
 func (e *escape) call(ks []hole, call, where ir.Node) {
-	// ...
+	topLevelDefer := where != nil && where.Op() == ir.ODEFER && e.loopDepth == 1 // 一个函数的顶层defer语句需要作特别标记
+	if topLevelDefer {
+		// 标记整个defer节点为EscNever(never escape)
+		where.SetEsc(ir.EscNever)
+	}
 
 	// 对函数的入参的有向图处理(k为函数的入参的hole, arg)
 	argument := func(k hole, arg ir.Node) {
 		if topLevelDefer {
-			// todo 函数的defer处理
-			k = e.later(k)
+			// 函数的defer处理,相当于新建了个虚拟变量x = defer语句 #ref e.later
+			k = e.later(k) 
 		} else if where != nil {
-			k = e.heapHole() // 普通函数的参数 都是要外部heapHole (derefs 为 -1 的hole)
+			k = e.heapHole() // 普通函数的参数, 直接使用heapHole创建flow
 		}
 
 		e.expr(k.note(call, "call parameter"), arg)
@@ -598,7 +601,7 @@ func (e *escape) call(ks []hole, call, where ir.Node) {
 			}
 		}
 
-		if r := fntype.Recv(); r != nil { // 方法有一个receiver时,需要对参数做处理,相当于把receiver本身作为函数的一个参数
+		if r := fntype.Recv(); r != nil { // 方法有一个receiver时,相当于把receiver本身作为函数的一个参数处理
 			argument(e.tagHole(ks, fn, r), call.X.(*ir.SelectorExpr).X)
 		} else {
 			argument(e.discardHole(), call.X) 
@@ -628,6 +631,13 @@ func (e *escape) call(ks []hole, call, where ir.Node) {
 	case ir.OUNSAFEADD, ir.OUNSAFESLICE:
 		// ...
 	}
+}
+
+// 用来处理顶层defer语句,相当于新建一个虚拟的变量 x = defer语句,为虚拟变量新建一个location,然后defer语句所代表的hole流向这个新location
+func (e *escape) later(k hole) hole {
+	loc := e.newLoc(nil, false) // 生成一个节点为nil的location
+	e.flow(k, loc) // 用新location与参数k 生成有向边
+	return loc.asHole()
 }
 ```
 
