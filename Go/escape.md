@@ -570,7 +570,7 @@ func (e *escape) call(ks []hole, call, where ir.Node) {
 	// 对函数的入参的有向图处理(k为函数的入参的hole, arg)
 	argument := func(k hole, arg ir.Node) {
 		if topLevelDefer {
-			// 函数的defer处理,相当于新建了个虚拟变量x = defer语句 #ref e.later
+			// 函数的defer处理,相当于新建了个虚拟location, 原来的k(hole) 所包裹的location流向这个新location #ref e.later
 			k = e.later(k) 
 		} else if where != nil {
 			k = e.heapHole() // 普通函数的参数, 直接使用heapHole创建flow
@@ -633,7 +633,7 @@ func (e *escape) call(ks []hole, call, where ir.Node) {
 	}
 }
 
-// 用来处理顶层defer语句,相当于新建一个虚拟的变量 x = defer语句,为虚拟变量新建一个location,然后defer语句所代表的hole流向这个新location
+// 用来处理顶层defer语句,相当于新建一个虚拟location,然后把原来的k(hole)所包裹的location流向这个新location
 func (e *escape) later(k hole) hole {
 	loc := e.newLoc(nil, false) // 生成一个节点为nil的location
 	e.flow(k, loc) // 用新location与参数k 生成有向边
