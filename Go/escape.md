@@ -164,8 +164,9 @@ func Batch(fns []*ir.Func, recursive bool) {
 	for _, loc := range b.allLocs {
 		// 找出需要放在堆上的变量,目前主要是“too large for stack“ 和 “non-constant size”
 		if why := HeapAllocReason(loc.n); why != "" {
-			// 这里b.heapHole.addr(loc.n, why)相当于新建了一个隐藏变量x,(x.derefs 值为-1)
-			// 调用flow相当于x = &loc,增加了一条x指向loc地址的边
+			// b.heapHole() 新建了一个 dst location指向 heapLoc的hole,
+			// addr(loc.n, why)将新建的location的derefs值 -1
+			// flow增加一个该hole 与 location的有向边
 			b.flow(b.heapHole().addr(loc.n, why), loc) 
 		}
 	}
@@ -355,7 +356,7 @@ func (e *escape) stmt(n ir.Node) {
 
 	case ir.OAS2FUNC: // 语句是将函数调用结果赋值时
 		n := n.(*ir.AssignListStmt)
-		ks := e.addrs(n.Lhs) // 为每一个左值生成一个hole todo e.addrs
+		ks := e.addrs(n.Lhs) // 为每一个左值生成一个hole(derefs 值 -1)
 		e.call(ks, n.Rhs[0], nil) // 把右值作为一个整体 和 左值的hole进行分析 #ref escape.call
 		e.reassigned(ks, n) // 尝试给ks(dst为左值的location的hole) 打上reassigned标记
 	case ir.ORETURN: // 函数的return
@@ -443,7 +444,7 @@ func (e *escape) exprSkipInit(k hole, n ir.Node) {
 	case ir.OCALLMETH, ir.OCALLFUNC, ir.OCALLINTER, ir.OLEN, ir.OCAP, ir.OCOMPLEX, ir.OREAL, ir.OIMAG, ir.OAPPEND, ir.OCOPY, ir.OUNSAFEADD, ir.OUNSAFESLICE:
 		e.call([]hole{k}, n, nil) // 新建一条dst 到 函数节点location的边(call会解析函数的输出) #ref call
 
-	/****** new, make 等等语法需要调用spill(这个方法内会调用 k.addr(n,“xxx“))将hole k 的derefs值变为-1,然后用这个hole生成与n节点的有向边 *****/
+	/****** new, make 等等语法需要调用spill(这个方法内会调用 k.addr(n,“xxx“))将hole k 的derefs值-1,然后生成一个dst为n节点的location,然后将这个新生成的location流向hole k(生成有向边) *****/
 	case ir.ONEW: // new
 		n := n.(*ir.UnaryExpr)
 		e.spill(k, n) 
@@ -503,7 +504,7 @@ func (e *escape) exprSkipInit(k hole, n ir.Node) {
 		// ...
 }
 
-// spill 为n生成一个新location, 然后调用k.addr(n, "spill"),将hole k的derefs值变为-1, 用这个hole生成一个与n节点derefs为-1的有向边
+// spill 为n生成一个新location, 然后调用k.addr(n, "spill"),将hole k的derefs值-1, 将新生成的location流向hole k(生成有向边)
 func (e *escape) spill(k hole, n ir.Node) hole {
 	loc := e.newLoc(n, true)
 	e.flow(k.addr(n, "spill"), loc)
@@ -511,22 +512,12 @@ func (e *escape) spill(k hole, n ir.Node) hole {
 }
 
 // ?? todo 
+// 当一个函数调用时,传入了外部参数,函数并不直接使用这些外部变量,而是使用ta们的复制
+// 参数ks是函数调用结果的流向(接受方变量), fn是调用的函数, param是函数的参数本身
 func (e *escape) tagHole(ks []hole, fn *ir.Name, param *types.Field) hole {
-	// If this is a dynamic call, we can't rely on param.Note.
-	if fn == nil {
-		return e.heapHole()
-	}
 
-	if e.inMutualBatch(fn) {
+	if e.inMutualBatch(fn) { // todo ??
 		return e.addr(ir.AsNode(param.Nname))
-	}
-
-	// Call to previously tagged function.
-
-	if param.Note == UintptrEscapesNote {
-		k := e.heapHole()
-		k.uintptrEscapesHack = true
-		return k
 	}
 
 	var tagKs []hole
@@ -536,7 +527,7 @@ func (e *escape) tagHole(ks []hole, fn *ir.Name, param *types.Field) hole {
 		tagKs = append(tagKs, e.heapHole().shift(x))
 	}
 
-	if ks != nil {
+	if ks != nil { // todo 所有leaks 值需要再处理
 		for i := 0; i < numEscResults; i++ {
 			if x := esc.Result(i); x >= 0 {
 				tagKs = append(tagKs, ks[i].shift(x))
@@ -547,8 +538,10 @@ func (e *escape) tagHole(ks []hole, fn *ir.Name, param *types.Field) hole {
 	return e.teeHole(tagKs...)
 }
 
+// 创建一个新location, 将参数里的hole都流入新location,
+// 然后创建一个新hole,dst就是这个新location,并返回
 func (e *escape) teeHole(ks ...hole) hole {
-	// 创建一个临时location
+	// 创建一个新location
 	loc := e.newLoc(nil, true)
 	for _, k := range ks { // 遍历参数 hole 数组
 		// 为每一个hole创建到新location的边
@@ -559,6 +552,7 @@ func (e *escape) teeHole(ks ...hole) hole {
 ```
 
 ##### call 把函数调用当作一个整体 和左值 作escape分析
+参数ks是函数调用结果的流向目的, call是函数本身, where语句节点(比如defer和go语法的节点包含了函数信息,也包含了defer 和 go的信息)
 ```go
 func (e *escape) call(ks []hole, call, where ir.Node) {
 	topLevelDefer := where != nil && where.Op() == ir.ODEFER && e.loopDepth == 1 // 一个函数的顶层defer语句需要作特别标记
@@ -567,15 +561,15 @@ func (e *escape) call(ks []hole, call, where ir.Node) {
 		where.SetEsc(ir.EscNever)
 	}
 
-	// 对函数的入参的有向图处理(k为函数的入参的hole, arg)
+	// 对函数的入参的流向(arg为入参的原始节点),流向函数
 	argument := func(k hole, arg ir.Node) {
-		if topLevelDefer {
-			// 函数的defer处理,相当于新建了个虚拟location, 原来的k(hole) 所包裹的location流向这个新location #ref e.later
+		if topLevelDefer { // 函数的defer处理
+			// 相当于新建了个虚拟location, 新location流向 原来的入参k(hole) 所包裹的location #ref e.later
 			k = e.later(k) 
-		} else if where != nil {
-			k = e.heapHole() // 普通函数的参数, 直接使用heapHole创建flow
+		} else if where != nil { // 目前已知只有 go xxx() 或 defer xxx()的时候 这个where != nil
+			k = e.heapHole() // 直接新建一个dst为heapLoc的hole
 		}
-
+		// 递归执行 hole k 与 入参原始节点间的escpae分析,生成有向边
 		e.expr(k.note(call, "call parameter"), arg)
 	}
 
@@ -597,11 +591,12 @@ func (e *escape) call(ks []hole, call, where ir.Node) {
 
 		if ks != nil && fn != nil && e.inMutualBatch(fn) {
 			for i, result := range fn.Type().Results().FieldSlice() { // 取出函数的返回列表
-				e.expr(ks[i], ir.AsNode(result.Nname)) // 在这里,函数的返回 于 函数的调用方建立了有向边的联系
+				e.expr(ks[i], ir.AsNode(result.Nname)) // 在这里,解析`调用方接受函数结果的变量`与`函数的返回`的一一对应的有向边联系
 			}
 		}
 
 		if r := fntype.Recv(); r != nil { // 方法有一个receiver时,相当于把receiver本身作为函数的一个参数处理
+			// ks 是函数调用方用来接收函数调用结果的变量(们), fn是函数, r是节点 tagHole todo 
 			argument(e.tagHole(ks, fn, r), call.X.(*ir.SelectorExpr).X)
 		} else {
 			argument(e.discardHole(), call.X) 
@@ -633,7 +628,7 @@ func (e *escape) call(ks []hole, call, where ir.Node) {
 	}
 }
 
-// 用来处理顶层defer语句,相当于新建一个虚拟location,然后把原来的k(hole)所包裹的location流向这个新location
+// 用来处理顶层defer语句,相当于新建一个虚拟location,然后把这个新location流向 原来的k(hole)所包裹的location(建立有向边)
 func (e *escape) later(k hole) hole {
 	loc := e.newLoc(nil, false) // 生成一个节点为nil的location
 	e.flow(k, loc) // 用新location与参数k 生成有向边
@@ -667,16 +662,18 @@ func (e *escape) reassigned(ks []hole, where ir.Node) {
 #### flowClosure 解析闭包
 ```go
 func (b *batch) flowClosure(k hole, clo *ir.ClosureExpr) {
-	for _, cv := range clo.Func.ClosureVars { // 遍历闭包所有用到的外部变量
-		n := cv.Canonical()
-		loc := b.oldLoc(cv) //找到外部变量的原始location
-
-		// todo ??
+	for _, cv := range clo.Func.ClosureVars { // 遍历闭包所有用到的外部变量(闭包在使用外部变量时其实已经copy了一份,所以后面需要用n := cn.Cannoical来找到原始变量的一些属性)
+		n := cv.Canonical() // 原始变量节点
+		loc := b.oldLoc(cv) // 找到外部变量的原始location
+		n.SetByval(!loc.addrtaken && !loc.reassigned && n.Type().Size() <= 128) // 根据属性设置原始变量节点的 `byval`属性(传值)
+		if !n.Byval() {
+			n.SetAddrtaken(true) // 如果原始变量不是值(是个址),需要设置节点flag为`Addrtaken`
+		}
 		k := k
-		if !cv.Byval() {
+		if !cv.Byval() { // 如果闭包使用的是个地址,需要把闭包本身的hole作处理(derefs -1)
 			k = k.addr(cv, "reference")
 		}
-		// 建立一条由闭包内到闭包外的变量location的有向边
+		// 用闭包的hole, 建立一条由闭包到变量location的有向边
 		b.flow(k.note(cv, "captured by a closure"), loc)
 	}
 }
@@ -810,7 +807,8 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 ```
 
 ##### leakTo(sink, derefs) 
-当一个变量是一个函数的入参,且流向了另一个函数内的变量(sink)
+当一个变量是一个函数的入参,且流向了另一个函数内的变量(sink);
+这个泄漏不是指内存泄漏，而是指该传入参数的内容的生命期，超过函数调用期，也就是函数返回后，该参数的内容仍然存活 //todo 修正用词
 ```go
 func (l *location) leakTo(sink *location, derefs int) {
 	// sink还没有被标记为escapes, sink是函数的返回属性,sink与l在同一个函数内
