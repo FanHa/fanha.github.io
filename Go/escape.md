@@ -461,19 +461,22 @@ func (e *escape) exprSkipInit(k hole, n ir.Node) {
 		e.discard(n.Len)
 	case ir.OCALLPART: // 方法(非调用)
 		n := n.(*ir.SelectorExpr)
-		closureK := e.spill(k, n) // 先为右值创建一个新location, 在创建一条k(左值的hole)到新location的derefs值为-1的边,返回的是包裹了新location的hole
+		// e.spill(k,n)先为右值节点创建一个新location, 将左值的hole k的derefs值-1,新location流向hole, 
+		// 然后返回的是新建的一个包裹了新location的hole
+		// closureK 就是dst为右值节点location的 hole
+		closureK := e.spill(k, n) 
 		m := n.Selection
 
-		// 保守的为该方法所有的返回属性创建一个heapHole
+		// 保守的为该方法所有的出参创建一个heapHole
 		var ks []hole
 		for i := m.Type.NumResults(); i > 0; i-- {
 			ks = append(ks, e.heapHole())
 		}
 		name, _ := m.Nname.(*ir.Name) // Nname是该方法的节点结构
-		paramK := e.tagHole(ks, name, m.Type.Recv()) // 返回一个包裹新建的location的hole,前面生成的ks都流向这个新location
+		paramK := e.tagHole(ks, name, m.Type.Recv()) // 返回一个包裹新建的临时location的hole,这个临时location流向heapLoc,也流向函数的出参
 		// closureK 是调用的方法的hole
-		// teeHole返回一个包裹新建location得hole, 参数里的hole都流向这个新hole.
-		e.expr(e.teeHole(paramK, closureK), n.X) // 虽然右值是个方法,但建立flow关系时传入的是该方法的`载体`
+		// teeHole返回一个包裹新建location得hole, 这个location流向参数里的每一个hole(这里是paramK 和 colosureK)
+		e.expr(e.teeHole(paramK, closureK), n.X) // 解析右边节点的表达式得到derefs值, 调整左边的hole的derefs值,将右边节点的location流向左边调整derefs值的hole; 注:这里右边节点是 X.sel 的X, 不是X.sel本身
 
 	// ...
 	/****   ***************************** *****/
@@ -511,8 +514,9 @@ func (e *escape) spill(k hole, n ir.Node) hole {
 	return loc.asHole() // 返回的是一个包裹新location的hole(有的地方需要用到)
 }
 
-// ?? todo 
-// 当一个函数调用时,传入了外部参数,函数并不直接使用这些外部变量,而是使用ta们的复制
+// 当一个函数调用时,传入了外部参数,函数并不直接使用这些外部变量,而是使用ta们的复制,
+// 所以需要新建一个location,一个dst为这个location的hole,
+// 如果函数的入参会`leak`到函数的返回结果,还需要把这个hole流向函数对应的返回结构(即ks)
 // 参数ks是函数调用结果的流向(接受方变量), fn是调用的函数, param是函数的参数本身
 func (e *escape) tagHole(ks []hole, fn *ir.Name, param *types.Field) hole {
 
@@ -522,29 +526,41 @@ func (e *escape) tagHole(ks []hole, fn *ir.Name, param *types.Field) hole {
 
 	var tagKs []hole
 
-	esc := parseLeaks(param.Note)
-	if x := esc.Heap(); x >= 0 {
+	esc := parseLeaks(param.Note) // 根据参数的‘注解’初始化一个leaks结构,一般就是认为没有特殊注解
+	if x := esc.Heap(); x >= 0 { //没有注解的情况话,这个x=0
+		// e.heapHole() 创建一个dst为heapLoc的hole, push到tagKs中
 		tagKs = append(tagKs, e.heapHole().shift(x))
 	}
-
-	if ks != nil { // todo 所有leaks 值需要再处理
+	// 把函数的出参也push到tagks中
+	if ks != nil {
 		for i := 0; i < numEscResults; i++ {
 			if x := esc.Result(i); x >= 0 {
 				tagKs = append(tagKs, ks[i].shift(x))
 			}
 		}
 	}
-
+	// e.teeHole()创建一个新location, 流向tagKs里的每一个hole
 	return e.teeHole(tagKs...)
 }
 
-// 创建一个新location, 将参数里的hole都流入新location,
+// 根据参数的‘注解’初始化一个leaks结构
+func parseLeaks(s string) leaks {
+	var l leaks
+	if !strings.HasPrefix(s, "esc:") { // 一般的变量就是走这个逻辑,即没有特殊注解
+		l.AddHeap(0)
+		return l
+	}
+	copy(l[:], s[4:])
+	return l
+}
+
+// 创建一个新location, 将这个hole流入参数里的每一个hole,
 // 然后创建一个新hole,dst就是这个新location,并返回
 func (e *escape) teeHole(ks ...hole) hole {
 	// 创建一个新location
 	loc := e.newLoc(nil, true)
 	for _, k := range ks { // 遍历参数 hole 数组
-		// 为每一个hole创建到新location的边
+		// 将新location 流向每一个参数hole
 		e.flow(k, loc)
 	}
 	return loc.asHole()// 返回新建的包裹新location的hole
@@ -591,20 +607,23 @@ func (e *escape) call(ks []hole, call, where ir.Node) {
 
 		if ks != nil && fn != nil && e.inMutualBatch(fn) {
 			for i, result := range fn.Type().Results().FieldSlice() { // 取出函数的返回列表
-				e.expr(ks[i], ir.AsNode(result.Nname)) // 在这里,解析`调用方接受函数结果的变量`与`函数的返回`的一一对应的有向边联系
-			}
+				e.expr(ks[i], ir.AsNode(result.Nname)) // 在这里,‘解析函数的返回表达式’,流向`调用方接受函数结果的变量`
 		}
 
 		if r := fntype.Recv(); r != nil { // 方法有一个receiver时,相当于把receiver本身作为函数的一个参数处理
-			// ks 是函数调用方用来接收函数调用结果的变量(们), fn是函数, r是节点 tagHole todo 
+			//先调用e.tagHole新建一个包裹临时location得hole,将新建的hole流向heapLoc也流向函数的所有出参hole
+			// 其中‘ks’是函数调用方用来接收函数调用结果的变量(们),‘fn‘是函数,’r‘是receiver
+			// 然后调用argument 解析函数本身的表达式,流向新生成的hole
 			argument(e.tagHole(ks, fn, r), call.X.(*ir.SelectorExpr).X)
 		} else {
-			argument(e.discardHole(), call.X) 
+			argument(e.discardHole(), call.X) // e.discardHole()生成一个dst为blankLoc的hole,调用argument解析函数表达式,将函数表达式的location,流向新生成的hole
 		}
 
 		args := call.Args // 函数的参数与调用方的 有向边分析
-		for i, param := range fntype.Params().FieldSlice() { // 相当于为每一个传进来的参数src,新建一个虚拟变量dst = src
-			argument(e.tagHole(ks, fn, param), args[i]) // todo 这里可能包含go函数传值传址的原理解析!!
+		for i, param := range fntype.Params().FieldSlice() { 
+			// e.tagHole() 为函数的参数新建一个包裹临时location得hole,这个hole流向函数的所有出参,
+			// 然后将函数的入参所在的location流向新建的的hole
+			argument(e.tagHole(ks, fn, param), args[i])
 		}
 	/** 一些系统自带函数的输入输出的有向边解析**/
 	case ir.OAPPEND:
@@ -631,7 +650,7 @@ func (e *escape) call(ks []hole, call, where ir.Node) {
 // 用来处理顶层defer语句,相当于新建一个虚拟location,然后把这个新location流向 原来的k(hole)所包裹的location(建立有向边)
 func (e *escape) later(k hole) hole {
 	loc := e.newLoc(nil, false) // 生成一个节点为nil的location
-	e.flow(k, loc) // 用新location与参数k 生成有向边
+	e.flow(k, loc) // 新location流向参数hole k
 	return loc.asHole()
 }
 ```
@@ -738,7 +757,7 @@ func (b *batch) walkAll() {
 	}
 }
 
-// 以一个location为root,遍历该location的边,标记需要escape的location并通过enqueue将该location入队需要walk的节点列表中
+// 以一个location为root,遍历该location的边(以及边的src的边,以及...),标记需要escape的location并通过enqueue将该location入队需要walk的节点列表中
 func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location)) {
 
 	root.walkgen = walkgen
@@ -807,21 +826,21 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 ```
 
 ##### leakTo(sink, derefs) 
-当一个变量是一个函数的入参,且流向了另一个函数内的变量(sink);
-这个泄漏不是指内存泄漏，而是指该传入参数的内容的生命期，超过函数调用期，也就是函数返回后，该参数的内容仍然存活 //todo 修正用词
+只有一个函数的入参会调用这个leakTo
+(l *location)是一个函数的入参,且流向了另一个函数内的变量(sink);
+这个`leak`不是指内存泄漏，而是指该传入参数的内容的生命期，超过函数调用期，也就是函数返回后，该参数的内容仍然存活
 ```go
 func (l *location) leakTo(sink *location, derefs int) {
-	// sink还没有被标记为escapes, sink是函数的返回属性,sink与l在同一个函数内
-	if !sink.escapes && sink.isName(ir.PPARAMOUT) && sink.curfn == l.curfn {
+	if !sink.escapes && sink.isName(ir.PPARAMOUT) && sink.curfn == l.curfn { // sink还没有被标记为escapes, sink是函数的返回属性,sink与l在同一个函数内
 		ri := sink.resultIndex - 1
 		if ri < numEscResults {
-			// 增加result leak // leaks 的作用?? todo
+			// 设置入参location 的 paramEsc,表明这个入参会出参到函数的第几个返回值
 			l.paramEsc.AddResult(ri, derefs)
 			return
 		}
 	}
 
-	// 增加heapleak
+	// todo paramEsc 在哪里用到了
 	l.paramEsc.AddHeap(derefs)
 }
 ```
@@ -864,7 +883,14 @@ func (b *batch) outlives(l, other *location) bool {
 func (b *batch) finish(fns []*ir.Func) {
 	for _, fn := range fns {
 		fn.SetEsc(escFuncTagged) // 给函数设置escape阶段的状态
-		// ...
+
+		narg := 0
+		for _, fs := range &types.RecvsParams {
+			for _, f := range fs(fn.Type()).Fields().Slice() {
+				narg++
+				f.Note = b.paramTag(fn, narg, f) //todo
+			}
+		}
 	}
 
 	for _, loc := range b.allLocs {
