@@ -79,16 +79,7 @@ type escape struct {
 type hole struct {
 	dst    *location
 	derefs int // >= -1
-	notes  *note
-
-	// addrtaken indicates whether this context is taking the address of
-	// the expression, independent of whether the address will actually
-	// be stored into a variable.
-	addrtaken bool
-
-	// uintptrEscapesHack indicates this context is evaluating an
-	// argument for a //go:uintptrescapes function.
-	uintptrEscapesHack bool
+	// ...
 }
 
 // location 表示一个变量位置
@@ -118,8 +109,7 @@ type location struct {
 	// 如果变量的生命周期没有超过声明所在stack,则这个值为true
 	transient bool
 
-	// paramEsc records the represented parameter's leak set.
-	paramEsc leaks
+	// ...
 
 	captured   bool // 是否有一个闭包函数用到了这个变量
 	reassigned bool // has this variable been reassigned?
@@ -388,18 +378,63 @@ func (e *escape) dcl(n *ir.Name) hole {
 ##### assignList 解析赋值语句生成有向边
 ```go
 func (e *escape) assignList(dsts, srcs []ir.Node, why string, where ir.Node) {
-	ks := e.addrs(dsts)
+	ks := e.addrs(dsts) // 为每一个左值创建一个hole #ref addrs
 	for i, k := range ks { 
 		var src ir.Node
 		if i < len(srcs) {
 			src = srcs[i]
 		}
 
-		// 因为赋值后面src可能需要解析展开,这里封装一层,实际还是生成dst 到 src的有向边
+		// 因为赋值后面src可能需要解析展开,这里封装一层,实际还是生成dst 到 src的有向边 #ref expr
 		e.expr(k.note(where, why), src)
 	}
 
 	e.reassigned(ks, where) // 尝试给ks(包裹dst location的hole) 打上 reassigned 标记
+}
+
+func (e *escape) addrs(l ir.Nodes) []hole {
+	var ks []hole
+	for _, n := range l {
+		ks = append(ks, e.addr(n)) // #ref addr
+	}
+	return ks
+}
+// 为一个节点创建一个hole
+func (e *escape) addr(n ir.Node) hole {
+	// 默认: 创建一个hole, dst为heapLoc
+	k := e.heapHole()
+
+	switch n.Op() {
+	default:
+		base.Fatalf("unexpected addr: %v", n)
+	case ir.ONAME:
+		n := n.(*ir.Name)
+		if n.Class == ir.PEXTERN {
+			break
+		}
+		k = e.oldLoc(n).asHole() // 普通变量,hole的dst 直接取变量的location
+	case ir.OLINKSYMOFFSET:
+		break
+	case ir.ODOT: // 当节点是一个struct实例的其中一个属性时,实际上是为创建的hole的dst location 指向这个struct 实例
+		n := n.(*ir.SelectorExpr)
+		k = e.addr(n.X)
+	case ir.OINDEX: // 节点是数组中的一个元素时,hole的dst location也是取数组本身
+		n := n.(*ir.IndexExpr)
+		e.discard(n.Index)
+		if n.X.Type().IsArray() {
+			k = e.addr(n.X)
+		} else {
+			e.discard(n.X)
+		}
+	case ir.ODEREF, ir.ODOTPTR:
+		e.discard(n)
+	case ir.OINDEXMAP: // 节点时map中的一个元素时,调用assignHeap再深入解析元素的值
+		n := n.(*ir.IndexExpr)
+		e.discard(n.X)
+		e.assignHeap(n.Index, "key of map put", n)
+	}
+
+	return k
 }
 
 // 创建一个srcNode(n) 到 dstHole(k) 的有向边
@@ -422,7 +457,7 @@ func (e *escape) exprSkipInit(k hole, n ir.Node) {
 		n := n.(*ir.Name)
 		// ...
 		e.flow(k, e.oldLoc(n))
-
+	
 	// ... 
 	case ir.OADDR: 	// x:= &y src是地址引用的情况
 		n := n.(*ir.AddrExpr)
@@ -516,22 +551,13 @@ func (e *escape) spill(k hole, n ir.Node) hole {
 
 // 当一个函数调用时,传入了外部参数,函数并不直接使用这些外部变量,而是使用ta们的复制,
 // 所以需要新建一个location,一个dst为这个location的hole,
-// 如果函数的入参会`leak`到函数的返回结果,还需要把这个hole流向函数对应的返回结构(即ks)
+// 这个新建的location会流向传进来的每一个hole(ks)
 // 参数ks是函数调用结果的流向(接受方变量), fn是调用的函数, param是函数的参数本身
 func (e *escape) tagHole(ks []hole, fn *ir.Name, param *types.Field) hole {
-
-	if e.inMutualBatch(fn) { // todo ??
-		return e.addr(ir.AsNode(param.Nname))
-	}
-
+	// ...
 	var tagKs []hole
 
-	esc := parseLeaks(param.Note) // 根据参数的‘注解’初始化一个leaks结构,一般就是认为没有特殊注解
-	if x := esc.Heap(); x >= 0 { //没有注解的情况话,这个x=0
-		// e.heapHole() 创建一个dst为heapLoc的hole, push到tagKs中
-		tagKs = append(tagKs, e.heapHole().shift(x))
-	}
-	// 把函数的出参也push到tagks中
+	// 把函数的出参push到tagks中
 	if ks != nil {
 		for i := 0; i < numEscResults; i++ {
 			if x := esc.Result(i); x >= 0 {
@@ -543,16 +569,6 @@ func (e *escape) tagHole(ks []hole, fn *ir.Name, param *types.Field) hole {
 	return e.teeHole(tagKs...)
 }
 
-// 根据参数的‘注解’初始化一个leaks结构
-func parseLeaks(s string) leaks {
-	var l leaks
-	if !strings.HasPrefix(s, "esc:") { // 一般的变量就是走这个逻辑,即没有特殊注解
-		l.AddHeap(0)
-		return l
-	}
-	copy(l[:], s[4:])
-	return l
-}
 
 // 创建一个新location, 将这个hole流入参数里的每一个hole,
 // 然后创建一个新hole,dst就是这个新location,并返回
@@ -655,7 +671,7 @@ func (e *escape) later(k hole) hole {
 }
 ```
 
-##### assignHeap 相当于为要发送到chan 的变量创建一个临时变量,这个临时变量的位置放在堆上,再计算变量与临时变量的有向边数值
+##### assignHeap 新建了一个dst为heapLoc的hole, 把传入的src节点流向这个hole(并结算derefs值)
 ```go
 func (e *escape) assignHeap(src ir.Node, why string, where ir.Node) {
 	e.expr(e.heapHole().note(where, why), src)
@@ -792,11 +808,6 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 
 		// 判断root是否在l的生命周期外依然存在
 		if b.outlives(root, l) {
-			// l 是函数的入参的情形处理
-			if l.isName(ir.PPARAM) {
-				l.leakTo(root, derefs) // 判断是否需要leakTo #ref leakTo
-			}
-
 			// root的生命周期大于l,且root(dst)与l(src)的边小于0,则需要把l的escapes值置换true
 			if addressOf && !l.escapes {
 				l.escapes = true
@@ -822,26 +833,6 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 			}
 		}
 	}
-}
-```
-
-##### leakTo(sink, derefs) 
-只有一个函数的入参会调用这个leakTo
-(l *location)是一个函数的入参,且流向了另一个函数内的变量(sink);
-这个`leak`不是指内存泄漏，而是指该传入参数的内容的生命期，超过函数调用期，也就是函数返回后，该参数的内容仍然存活
-```go
-func (l *location) leakTo(sink *location, derefs int) {
-	if !sink.escapes && sink.isName(ir.PPARAMOUT) && sink.curfn == l.curfn { // sink还没有被标记为escapes, sink是函数的返回属性,sink与l在同一个函数内
-		ri := sink.resultIndex - 1
-		if ri < numEscResults {
-			// 设置入参location 的 paramEsc,表明这个入参会出参到函数的第几个返回值
-			l.paramEsc.AddResult(ri, derefs)
-			return
-		}
-	}
-
-	// todo paramEsc 在哪里用到了
-	l.paramEsc.AddHeap(derefs)
 }
 ```
 
@@ -881,17 +872,7 @@ func (b *batch) outlives(l, other *location) bool {
 ```go
 // src/cmd/compile/internal/escape/escape.go
 func (b *batch) finish(fns []*ir.Func) {
-	for _, fn := range fns {
-		fn.SetEsc(escFuncTagged) // 给函数设置escape阶段的状态
-
-		narg := 0
-		for _, fs := range &types.RecvsParams {
-			for _, f := range fs(fn.Type()).Fields().Slice() {
-				narg++
-				f.Note = b.paramTag(fn, narg, f) //todo
-			}
-		}
-	}
+	// ...
 
 	for _, loc := range b.allLocs {
 		n := loc.n
@@ -918,4 +899,4 @@ func (b *batch) finish(fns []*ir.Func) {
 		}
 	}
 }
-```
+
