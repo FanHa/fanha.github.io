@@ -428,7 +428,7 @@ func (e *escape) addr(n ir.Node) hole {
 		}
 	case ir.ODEREF, ir.ODOTPTR:
 		e.discard(n)
-	case ir.OINDEXMAP: // 节点时map中的一个元素时,调用assignHeap再深入解析元素的值
+	case ir.OINDEXMAP: // 节点时map中的一个元素时,调用assignHeap再深入解析元素的值(实际上是将这个元素流向heapLoc)
 		n := n.(*ir.IndexExpr)
 		e.discard(n.X)
 		e.assignHeap(n.Index, "key of map put", n)
