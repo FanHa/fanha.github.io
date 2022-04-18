@@ -9,7 +9,7 @@ flowchart TD
     Start --> Stop
 ```
 
-## 数据流向过程(反向)
+## 客户端获取数据的过程
 以endpoint举例
 ### Lister
 本地获取信息是通过Lister接口
@@ -30,8 +30,7 @@ type endpointsLister struct {
 }
 
 func (s *endpointsLister) List(selector labels.Selector) (ret []*v1.Endpoints, err error) {
-    // 从‘cache’遍历,找到满足selector条件的endpoint,加入到要返回的结果中
-    // s.indexer选取正确的 ‘子cache’,
+    // cache工具包从s.indexer里遍历,找到满足selector条件的endpoint,加入到要返回的结果中
 	err = cache.ListAll(s.indexer, selector, func(m interface{}) {
 		ret = append(ret, m.(*v1.Endpoints))
 	})
@@ -135,3 +134,174 @@ func (c *cache) List() []interface{} {
 }
 ```
 
+
+## 监听数据存到本地的过程
+### EndpointsInformer interface
+```go
+// informers/core/v1/endpoints.go
+type EndpointsInformer interface {
+	Informer() cache.SharedIndexInformer // 注入用于监听和更新数据的组建`Informer`
+	Lister() v1.EndpointsLister
+}
+
+type endpointsInformer struct {
+	factory          internalinterfaces.SharedInformerFactory
+	tweakListOptions internalinterfaces.TweakListOptionsFunc
+	namespace        string
+}
+
+// NewEndpointsInformer constructs a new informer for Endpoints type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewEndpointsInformer(client kubernetes.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers) cache.SharedIndexInformer {
+	return NewFilteredEndpointsInformer(client, namespace, resyncPeriod, indexers, nil)
+}
+
+func NewFilteredEndpointsInformer(client kubernetes.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
+	return cache.NewSharedIndexInformer(
+		&cache.ListWatch{
+			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&options)
+				}
+				return client.CoreV1().Endpoints(namespace).List(context.TODO(), options)
+			},
+			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&options)
+				}
+				return client.CoreV1().Endpoints(namespace).Watch(context.TODO(), options)
+			},
+		},
+		&corev1.Endpoints{},
+		resyncPeriod,
+		indexers,
+	)
+}
+```
+
+### SharedInformer interface
+SharedInformer 监听特定的资源的改变,将改动更新到本地(最终一致)
+```go
+// tools/cache/shared_informer.go
+type SharedInformer interface {
+	// AddEventHandler adds an event handler to the shared informer using the shared informer's resync
+	// period.  Events to a single handler are delivered sequentially, but there is no coordination
+	// between different handlers.
+	AddEventHandler(handler ResourceEventHandler)
+	// AddEventHandlerWithResyncPeriod adds an event handler to the
+	// shared informer with the requested resync period; zero means
+	// this handler does not care about resyncs.  The resync operation
+	// consists of delivering to the handler an update notification
+	// for every object in the informer's local cache; it does not add
+	// any interactions with the authoritative storage.  Some
+	// informers do no resyncs at all, not even for handlers added
+	// with a non-zero resyncPeriod.  For an informer that does
+	// resyncs, and for each handler that requests resyncs, that
+	// informer develops a nominal resync period that is no shorter
+	// than the requested period but may be longer.  The actual time
+	// between any two resyncs may be longer than the nominal period
+	// because the implementation takes time to do work and there may
+	// be competing load and scheduling noise.
+	AddEventHandlerWithResyncPeriod(handler ResourceEventHandler, resyncPeriod time.Duration)
+	
+    // 获取存放实际数据的Store
+	GetStore() Store
+
+	// 启动方法
+	Run(stopCh <-chan struct{})
+	// HasSynced returns true if the shared informer's store has been
+	// informed by at least one full LIST of the authoritative state
+	// of the informer's object collection.  This is unrelated to "resync".
+	HasSynced() bool
+	// LastSyncResourceVersion is the resource version observed when last synced with the underlying
+	// store. The value returned is not synchronized with access to the underlying store and is not
+	// thread-safe.
+	LastSyncResourceVersion() string
+
+	// The WatchErrorHandler is called whenever ListAndWatch drops the
+	// connection with an error. After calling this handler, the informer
+	// will backoff and retry.
+	//
+	// The default implementation looks at the error type and tries to log
+	// the error message at an appropriate level.
+	//
+	// There's only one handler, so if you call this multiple times, last one
+	// wins; calling after the informer has been started returns an error.
+	//
+	// The handler is intended for visibility, not to e.g. pause the consumers.
+	// The handler should return quickly - any expensive processing should be
+	// offloaded.
+	SetWatchErrorHandler(handler WatchErrorHandler) error
+}
+
+// SharedIndexInformer 包裹SharedInformer 并增加Indexers 特性
+type SharedIndexInformer interface {
+	SharedInformer
+	// AddIndexers add indexers to the informer before it starts.
+	AddIndexers(indexers Indexers) error
+	GetIndexer() Indexer
+}
+```
+
+### 初始化
+```go
+// tools/cache/shared_informer.go
+func NewSharedInformer(lw ListerWatcher, exampleObject runtime.Object, defaultEventHandlerResyncPeriod time.Duration) SharedInformer {
+	return NewSharedIndexInformer(lw, exampleObject, defaultEventHandlerResyncPeriod, Indexers{})
+}
+
+func NewSharedIndexInformer(lw ListerWatcher, exampleObject runtime.Object, defaultEventHandlerResyncPeriod time.Duration, indexers Indexers) SharedIndexInformer {
+	realClock := &clock.RealClock{}
+    // 实际创建的是一个 `sharedIndexInformer` 结构 #ref sharedIndexInformer
+	sharedIndexInformer := &sharedIndexInformer{
+		processor:                       &sharedProcessor{clock: realClock},
+		indexer:                         NewIndexer(DeletionHandlingMetaNamespaceKeyFunc, indexers),
+		listerWatcher:                   lw,
+		objectType:                      exampleObject,
+		resyncCheckPeriod:               defaultEventHandlerResyncPeriod,
+		defaultEventHandlerResyncPeriod: defaultEventHandlerResyncPeriod,
+		cacheMutationDetector:           NewCacheMutationDetector(fmt.Sprintf("%T", exampleObject)),
+		clock:                           realClock,
+	}
+	return sharedIndexInformer
+}
+
+type sharedIndexInformer struct {
+	indexer    Indexer
+	controller Controller
+
+	processor             *sharedProcessor
+	cacheMutationDetector MutationDetector
+
+	listerWatcher ListerWatcher // 用于和监听集群资源变动事件的核心组件,不同资源的informer对应了不同的listerWatcher参数设置
+
+	// objectType is an example object of the type this informer is
+	// expected to handle.  Only the type needs to be right, except
+	// that when that is `unstructured.Unstructured` the object's
+	// `"apiVersion"` and `"kind"` must also be right.
+	objectType runtime.Object
+
+	// resyncCheckPeriod is how often we want the reflector's resync timer to fire so it can call
+	// shouldResync to check if any of our listeners need a resync.
+	resyncCheckPeriod time.Duration
+	// defaultEventHandlerResyncPeriod is the default resync period for any handlers added via
+	// AddEventHandler (i.e. they don't specify one and just want to use the shared informer's default
+	// value).
+	defaultEventHandlerResyncPeriod time.Duration
+	// clock allows for testability
+	clock clock.Clock
+
+	started, stopped bool
+	startedLock      sync.Mutex
+
+	// blockDeltas gives a way to stop all event distribution so that a late event handler
+	// can safely join the shared informer.
+	blockDeltas sync.Mutex
+
+	// Called whenever the ListAndWatch drops the connection with an error.
+	watchErrorHandler WatchErrorHandler
+}
+
+
+```
