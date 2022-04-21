@@ -258,7 +258,8 @@ func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
     // 启动 controller
 	s.controller.Run(stopCh)
 }
-
+```
+```go
 // tools/cache/controller.go
 func (c *controller) Run(stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
@@ -274,16 +275,17 @@ func (c *controller) Run(stopCh <-chan struct{}) {
 		c.config.FullResyncPeriod,
 	)
 	// ...
-    // 启动reflector
+    // 启动reflector #ref r.Run
 	wg.StartWithChannel(stopCh, r.Run)
 
 	wait.Until(c.processLoop, time.Second, stopCh)
 	wg.Wait()
 }
-
+```
+```go
 // tools/cache/reflector.go
 func (r *Reflector) Run(stopCh <-chan struct{}) {
-	wait.BackoffUntil(func() {
+	wait.BackoffUntil(func() { // todo 这个backoff的作用
         // 调用listAndWatch 进入informer的核心流程
 		if err := r.ListAndWatch(stopCh); err != nil {
 			r.watchErrorHandler(r, err)
@@ -293,112 +295,31 @@ func (r *Reflector) Run(stopCh <-chan struct{}) {
 
 // informer的核心流程 listAndWatch
 func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
-	klog.V(3).Infof("Listing and watching %v from %s", r.expectedTypeName, r.name)
 	var resourceVersion string
 
 	options := metav1.ListOptions{ResourceVersion: r.relistResourceVersion()}
 
+    // list
 	if err := func() error {
-		initTrace := trace.New("Reflector ListAndWatch", trace.Field{"name", r.name})
-		defer initTrace.LogIfLong(10 * time.Second)
+		// ...
 		var list runtime.Object
 		var paginatedResult bool
 		var err error
 		listCh := make(chan struct{}, 1)
 		panicCh := make(chan interface{}, 1)
 		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					panicCh <- r
-				}
-			}()
-			// Attempt to gather list in chunks, if supported by listerWatcher, if not, the first
-			// list request will return the full response.
+			
+			// list接口也可能需要调用几次分页获取,再封装一层pager 将原listerWatcher包裹进去
 			pager := pager.New(pager.SimplePageFunc(func(opts metav1.ListOptions) (runtime.Object, error) {
 				return r.listerWatcher.List(opts)
 			}))
-			switch {
-			case r.WatchListPageSize != 0:
-				pager.PageSize = r.WatchListPageSize
-			case r.paginatedResult:
-				// We got a paginated result initially. Assume this resource and server honor
-				// paging requests (i.e. watch cache is probably disabled) and leave the default
-				// pager size set.
-			case options.ResourceVersion != "" && options.ResourceVersion != "0":
-				// User didn't explicitly request pagination.
-				//
-				// With ResourceVersion != "", we have a possibility to list from watch cache,
-				// but we do that (for ResourceVersion != "0") only if Limit is unset.
-				// To avoid thundering herd on etcd (e.g. on master upgrades), we explicitly
-				// switch off pagination to force listing from watch cache (if enabled).
-				// With the existing semantic of RV (result is at least as fresh as provided RV),
-				// this is correct and doesn't lead to going back in time.
-				//
-				// We also don't turn off pagination for ResourceVersion="0", since watch cache
-				// is ignoring Limit in that case anyway, and if watch cache is not enabled
-				// we don't introduce regression.
-				pager.PageSize = 0
-			}
-
+			// ...
+            // 调用pager.list获取所有数据结果存放在 ‘list’变量里
 			list, paginatedResult, err = pager.List(context.Background(), options)
-			if isExpiredError(err) || isTooLargeResourceVersionError(err) {
-				r.setIsLastSyncResourceVersionUnavailable(true)
-				// Retry immediately if the resource version used to list is unavailable.
-				// The pager already falls back to full list if paginated list calls fail due to an "Expired" error on
-				// continuation pages, but the pager might not be enabled, the full list might fail because the
-				// resource version it is listing at is expired or the cache may not yet be synced to the provided
-				// resource version. So we need to fallback to resourceVersion="" in all to recover and ensure
-				// the reflector makes forward progress.
-				list, paginatedResult, err = pager.List(context.Background(), metav1.ListOptions{ResourceVersion: r.relistResourceVersion()})
-			}
-			close(listCh)
+			// ...
 		}()
-		select {
-		case <-stopCh:
-			return nil
-		case r := <-panicCh:
-			panic(r)
-		case <-listCh:
-		}
-		initTrace.Step("Objects listed", trace.Field{"error", err})
-		if err != nil {
-			klog.Warningf("%s: failed to list %v: %v", r.name, r.expectedTypeName, err)
-			return fmt.Errorf("failed to list %v: %v", r.expectedTypeName, err)
-		}
+		// ...
 
-		// We check if the list was paginated and if so set the paginatedResult based on that.
-		// However, we want to do that only for the initial list (which is the only case
-		// when we set ResourceVersion="0"). The reasoning behind it is that later, in some
-		// situations we may force listing directly from etcd (by setting ResourceVersion="")
-		// which will return paginated result, even if watch cache is enabled. However, in
-		// that case, we still want to prefer sending requests to watch cache if possible.
-		//
-		// Paginated result returned for request with ResourceVersion="0" mean that watch
-		// cache is disabled and there are a lot of objects of a given type. In such case,
-		// there is no need to prefer listing from watch cache.
-		if options.ResourceVersion == "0" && paginatedResult {
-			r.paginatedResult = true
-		}
-
-		r.setIsLastSyncResourceVersionUnavailable(false) // list was successful
-		listMetaInterface, err := meta.ListAccessor(list)
-		if err != nil {
-			return fmt.Errorf("unable to understand list result %#v: %v", list, err)
-		}
-		resourceVersion = listMetaInterface.GetResourceVersion()
-		initTrace.Step("Resource version extracted")
-		items, err := meta.ExtractList(list)
-		if err != nil {
-			return fmt.Errorf("unable to understand list result %#v (%v)", list, err)
-		}
-		initTrace.Step("Objects extracted")
-		if err := r.syncWith(items, resourceVersion); err != nil {
-			return fmt.Errorf("unable to sync list result: %v", err)
-		}
-		initTrace.Step("SyncWith done")
-		r.setLastSyncResourceVersion(resourceVersion)
-		initTrace.Step("Resource version updated")
-		return nil
 	}(); err != nil {
 		return err
 	}
@@ -406,11 +327,8 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 	resyncerrc := make(chan error, 1)
 	cancelCh := make(chan struct{})
 	defer close(cancelCh)
-	go func() {
-		resyncCh, cleanup := r.resyncChan()
-		defer func() {
-			cleanup() // Call the last one written into cleanup
-		}()
+	go func() { // todo 这里的作用??
+		resyncCh, cleanup := r.resyncChan() // 启动informer时设置了一个间隔时间,时间到了需要强制重新全量获取数据(list)
 		for {
 			select {
 			case <-resyncCh:
@@ -419,74 +337,49 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 			case <-cancelCh:
 				return
 			}
-			if r.ShouldResync == nil || r.ShouldResync() {
-				klog.V(4).Infof("%s: forcing resync", r.name)
-				if err := r.store.Resync(); err != nil {
-					resyncerrc <- err
-					return
-				}
-			}
+
 			cleanup()
 			resyncCh, cleanup = r.resyncChan()
 		}
 	}()
 
-	for {
-		// give the stopCh a chance to stop the loop, even in case of continue statements further down on errors
-		select {
-		case <-stopCh:
-			return nil
-		default:
-		}
-
-		timeoutSeconds := int64(minWatchTimeout.Seconds() * (rand.Float64() + 1.0))
-		options = metav1.ListOptions{
-			ResourceVersion: resourceVersion,
-			// We want to avoid situations of hanging watchers. Stop any wachers that do not
-			// receive any events within the timeout window.
-			TimeoutSeconds: &timeoutSeconds,
-			// To reduce load on kube-apiserver on watch restarts, you may enable watch bookmarks.
-			// Reflector doesn't assume bookmarks are returned at all (if the server do not support
-			// watch bookmarks, it will ignore this field).
-			AllowWatchBookmarks: true,
-		}
-
-		// start the clock before sending the request, since some proxies won't flush headers until after the first watch event is sent
-		start := r.clock.Now()
-		w, err := r.listerWatcher.Watch(options)
-		if err != nil {
-			// If this is "connection refused" error, it means that most likely apiserver is not responsive.
-			// It doesn't make sense to re-list all objects because most likely we will be able to restart
-			// watch where we ended.
-			// If that's the case begin exponentially backing off and resend watch request.
-			// Do the same for "429" errors.
-			if utilnet.IsConnectionRefused(err) || apierrors.IsTooManyRequests(err) {
-				<-r.initConnBackoffManager.Backoff().C()
-				continue
-			}
-			return err
-		}
-
+	for {// 循环从Watch接口中获取资源更新
+        // ...
+		w, err := r.listerWatcher.Watch(options) // 启动Watch接口
+		//...
+        // 当Watch接口返回东西时调用Handler更新本地数据 #ref r.watchHandler
 		if err := r.watchHandler(start, w, &resourceVersion, resyncerrc, stopCh); err != nil {
-			if err != errorStopRequested {
-				switch {
-				case isExpiredError(err):
-					// Don't set LastSyncResourceVersionUnavailable - LIST call with ResourceVersion=RV already
-					// has a semantic that it returns data at least as fresh as provided RV.
-					// So first try to LIST with setting RV to resource version of last observed object.
-					klog.V(4).Infof("%s: watch of %v closed with: %v", r.name, r.expectedTypeName, err)
-				case apierrors.IsTooManyRequests(err):
-					klog.V(2).Infof("%s: watch of %v returned 429 - backing off", r.name, r.expectedTypeName)
-					<-r.initConnBackoffManager.Backoff().C()
-					continue
-				default:
-					klog.Warningf("%s: watch of %v ended with: %v", r.name, r.expectedTypeName, err)
-				}
-			}
-			return nil
+			// ...
 		}
 	}
 }
+
+func (r *Reflector) watchHandler(start time.Time, w watch.Interface, resourceVersion *string, errc chan error, stopCh <-chan struct{}) error {
+
+loop:
+	for {
+		select {
+		// ...
+		case event, ok := <-w.ResultChan():
+			// ...
+			switch event.Type { // 根据watch事件的不同调用store的不同方法,更新本地数据
+			case watch.Added:
+				err := r.store.Add(event.Object)
+			case watch.Modified:
+				err := r.store.Update(event.Object)
+			case watch.Deleted:
+				err := r.store.Delete(event.Object)
+			case watch.Bookmark:
+				// A `Bookmark` means watch has synced here, just update the resourceVersion
+			default:
+				utilruntime.HandleError(fmt.Errorf("%s: unable to understand watch event %#v", r.name, event))
+			}
+			// ...
+		}
+	}
+    // ...
+}
+
 ```
 ### SharedInformer interface
 SharedInformer 监听特定的资源的改变,将改动更新到本地(最终一致)
