@@ -267,7 +267,7 @@ func (c *controller) Run(stopCh <-chan struct{}) {
 		<-stopCh // 收到stopCh 信号时调用事件队列的Close方法收尾
 		c.config.Queue.Close()
 	}()
-    // 新建一个reflector结构,将那些监听不同资源的差异化参数传入该结构
+    // 新建一个reflector结构,将那些监听不同资源的差异化参数传入该结构 
 	r := NewReflector(
 		c.config.ListerWatcher,
 		c.config.ObjectType,
@@ -285,12 +285,14 @@ func (c *controller) Run(stopCh <-chan struct{}) {
 ```go
 // tools/cache/reflector.go
 func (r *Reflector) Run(stopCh <-chan struct{}) {
-	wait.BackoffUntil(func() { // todo 这个backoff的作用
+    // wait.BackoffUntil 传入的第二个参数 r.backoffManager每隔一段时间(既定的)会产生一个信号,收到这个信号就会调用一次第一个参数传入的函数,即listAndWatch流程
+    // r.backoffManager 是在前面 NewReflector 时生成的 
+	wait.BackoffUntil(func() { 
         // 调用listAndWatch 进入informer的核心流程
 		if err := r.ListAndWatch(stopCh); err != nil {
 			r.watchErrorHandler(r, err)
 		}
-	}, r.backoffManager, true, stopCh)
+	}, r.backoffManager, true, stopCh) 
 }
 
 // informer的核心流程 listAndWatch
@@ -381,6 +383,7 @@ loop:
 }
 
 ```
+
 ### SharedInformer interface
 SharedInformer 监听特定的资源的改变,将改动更新到本地(最终一致)
 ```go
