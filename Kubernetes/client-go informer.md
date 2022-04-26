@@ -147,19 +147,11 @@ type sharedIndexInformer struct {
 	processor             *sharedProcessor //todo
 	cacheMutationDetector MutationDetector // 已经缓存到本地的资源检测是否发生变动的Detector todo
 
-	listerWatcher ListerWatcher // 对应资源的list 和 watch
+	listerWatcher ListerWatcher // 对应资源的list 和 watch接口
 
 	objectType runtime.Object // 监听的资源的结构
 
-	resyncCheckPeriod time.Duration // 全量同步间隔时间
-
 	defaultEventHandlerResyncPeriod time.Duration // todo
-	clock clock.Clock // todo
-
-	started, stopped bool // 当前informer实例的状态
-	startedLock      sync.Mutex // todo
-
-	blockDeltas sync.Mutex // todo
 
 	// Called whenever the ListAndWatch drops the connection with an error.
 	watchErrorHandler WatchErrorHandler // todo
@@ -190,7 +182,7 @@ func NewFilteredEndpointsInformer(client kubernetes.Interface, namespace string,
 		},
 
 		&corev1.Endpoints{}, // 监听的资源的结构
-		resyncPeriod, // 全量同步间隔
+		resyncPeriod, // ??似乎已无用
 		indexers, // todo
 	)
 }
@@ -204,7 +196,7 @@ func NewSharedIndexInformer(lw ListerWatcher, exampleObject runtime.Object, defa
 		indexer:                         NewIndexer(DeletionHandlingMetaNamespaceKeyFunc, indexers),
 		listerWatcher:                   lw,    // 传入的list/watch 实现
 		objectType:                      exampleObject, // 传入的监听资源的结构
-		resyncCheckPeriod:               defaultEventHandlerResyncPeriod,   // 全量同步间隔时间
+		resyncCheckPeriod:               defaultEventHandlerResyncPeriod,   // ??似乎已无用
 		defaultEventHandlerResyncPeriod: defaultEventHandlerResyncPeriod,   // eventHandler 间隔时间 ?? todo 
 		cacheMutationDetector:           NewCacheMutationDetector(fmt.Sprintf("%T", exampleObject)),
 		clock:                           realClock,
@@ -236,8 +228,7 @@ func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
 		WatchErrorHandler: s.watchErrorHandler,
 	}
 
-    // 为内部创建一个controller,处理list/watch 的执行
-	func() {
+	func() {     // 为内部初始化一个controller,后面用来处理list/watch 的执行
 		s.startedLock.Lock()
 		defer s.startedLock.Unlock()
 
@@ -245,17 +236,14 @@ func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
 		s.controller.(*controller).clock = s.clock
 		s.started = true
 	}()
-
-	// Separate stop channel because Processor should be stopped strictly after controller
+    // ...
 	processorStopCh := make(chan struct{})
-	var wg wait.Group
-	defer wg.Wait()              // Wait for Processor to stop
-	defer close(processorStopCh) // Tell Processor to stop
-	wg.StartWithChannel(processorStopCh, s.cacheMutationDetector.Run)
-	wg.StartWithChannel(processorStopCh, s.processor.run)
+	// ...
+	wg.StartWithChannel(processorStopCh, s.cacheMutationDetector.Run) // todo 
+	wg.StartWithChannel(processorStopCh, s.processor.run) // todo
 
     // ...
-    // 启动 controller
+    // 启动 执行ListAndWatch的controller
 	s.controller.Run(stopCh)
 }
 ```
@@ -278,7 +266,7 @@ func (c *controller) Run(stopCh <-chan struct{}) {
     // 启动reflector #ref r.Run
 	wg.StartWithChannel(stopCh, r.Run)
 
-	wait.Until(c.processLoop, time.Second, stopCh)
+	wait.Until(c.processLoop, time.Second, stopCh) // todo
 	wg.Wait()
 }
 ```
@@ -326,24 +314,7 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 		return err
 	}
 
-	resyncerrc := make(chan error, 1)
-	cancelCh := make(chan struct{})
-	defer close(cancelCh)
-	go func() { // todo 这里的作用??
-		resyncCh, cleanup := r.resyncChan() // 启动informer时设置了一个间隔时间,时间到了需要强制重新全量获取数据(list)
-		for {
-			select {
-			case <-resyncCh:
-			case <-stopCh:
-				return
-			case <-cancelCh:
-				return
-			}
-
-			cleanup()
-			resyncCh, cleanup = r.resyncChan()
-		}
-	}()
+    // ...
 
 	for {// 循环从Watch接口中获取资源更新
         // ...
@@ -384,128 +355,32 @@ loop:
 
 ```
 
-### SharedInformer interface
-SharedInformer 监听特定的资源的改变,将改动更新到本地(最终一致)
+#### store 的 Add, Update, Delete方法
+本以为会在这里触发Add, Update, Delete的 hook回调,但实际代码并没有这方面的内容
 ```go
-// tools/cache/shared_informer.go
-type SharedInformer interface {
-	// AddEventHandler adds an event handler to the shared informer using the shared informer's resync
-	// period.  Events to a single handler are delivered sequentially, but there is no coordination
-	// between different handlers.
-	AddEventHandler(handler ResourceEventHandler)
-	// AddEventHandlerWithResyncPeriod adds an event handler to the
-	// shared informer with the requested resync period; zero means
-	// this handler does not care about resyncs.  The resync operation
-	// consists of delivering to the handler an update notification
-	// for every object in the informer's local cache; it does not add
-	// any interactions with the authoritative storage.  Some
-	// informers do no resyncs at all, not even for handlers added
-	// with a non-zero resyncPeriod.  For an informer that does
-	// resyncs, and for each handler that requests resyncs, that
-	// informer develops a nominal resync period that is no shorter
-	// than the requested period but may be longer.  The actual time
-	// between any two resyncs may be longer than the nominal period
-	// because the implementation takes time to do work and there may
-	// be competing load and scheduling noise.
-	AddEventHandlerWithResyncPeriod(handler ResourceEventHandler, resyncPeriod time.Duration)
-	
-    // 获取存放实际数据的Store
-	GetStore() Store
-
-	// 启动方法
-	Run(stopCh <-chan struct{})
-	// HasSynced returns true if the shared informer's store has been
-	// informed by at least one full LIST of the authoritative state
-	// of the informer's object collection.  This is unrelated to "resync".
-	HasSynced() bool
-	// LastSyncResourceVersion is the resource version observed when last synced with the underlying
-	// store. The value returned is not synchronized with access to the underlying store and is not
-	// thread-safe.
-	LastSyncResourceVersion() string
-
-	// The WatchErrorHandler is called whenever ListAndWatch drops the
-	// connection with an error. After calling this handler, the informer
-	// will backoff and retry.
-	//
-	// The default implementation looks at the error type and tries to log
-	// the error message at an appropriate level.
-	//
-	// There's only one handler, so if you call this multiple times, last one
-	// wins; calling after the informer has been started returns an error.
-	//
-	// The handler is intended for visibility, not to e.g. pause the consumers.
-	// The handler should return quickly - any expensive processing should be
-	// offloaded.
-	SetWatchErrorHandler(handler WatchErrorHandler) error
+// tools/cache/thread_safe_store.go
+func (c *threadSafeMap) Add(key string, obj interface{}) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	oldObject := c.items[key]
+	c.items[key] = obj
+	c.updateIndices(oldObject, obj, key)
 }
 
-// SharedIndexInformer 包裹SharedInformer 并增加Indexers 特性
-type SharedIndexInformer interface {
-	SharedInformer
-	// AddIndexers add indexers to the informer before it starts.
-	AddIndexers(indexers Indexers) error
-	GetIndexer() Indexer
-}
-```
-
-### 初始化
-```go
-// tools/cache/shared_informer.go
-func NewSharedInformer(lw ListerWatcher, exampleObject runtime.Object, defaultEventHandlerResyncPeriod time.Duration) SharedInformer {
-	return NewSharedIndexInformer(lw, exampleObject, defaultEventHandlerResyncPeriod, Indexers{})
+func (c *threadSafeMap) Update(key string, obj interface{}) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	oldObject := c.items[key]
+	c.items[key] = obj
+	c.updateIndices(oldObject, obj, key)
 }
 
-func NewSharedIndexInformer(lw ListerWatcher, exampleObject runtime.Object, defaultEventHandlerResyncPeriod time.Duration, indexers Indexers) SharedIndexInformer {
-	realClock := &clock.RealClock{}
-    // 实际创建的是一个 `sharedIndexInformer` 结构 #ref sharedIndexInformer
-	sharedIndexInformer := &sharedIndexInformer{
-		processor:                       &sharedProcessor{clock: realClock},
-		indexer:                         NewIndexer(DeletionHandlingMetaNamespaceKeyFunc, indexers),
-		listerWatcher:                   lw,
-		objectType:                      exampleObject,
-		resyncCheckPeriod:               defaultEventHandlerResyncPeriod,
-		defaultEventHandlerResyncPeriod: defaultEventHandlerResyncPeriod,
-		cacheMutationDetector:           NewCacheMutationDetector(fmt.Sprintf("%T", exampleObject)),
-		clock:                           realClock,
+func (c *threadSafeMap) Delete(key string) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	if obj, exists := c.items[key]; exists {
+		c.updateIndices(obj, nil, key)
+		delete(c.items, key)
 	}
-	return sharedIndexInformer
 }
-
-type sharedIndexInformer struct {
-	indexer    Indexer
-	controller Controller
-
-	processor             *sharedProcessor
-	cacheMutationDetector MutationDetector
-
-	listerWatcher ListerWatcher // 用于和监听集群资源变动事件的核心组件,不同资源的informer对应了不同的listerWatcher参数设置
-
-	// objectType is an example object of the type this informer is
-	// expected to handle.  Only the type needs to be right, except
-	// that when that is `unstructured.Unstructured` the object's
-	// `"apiVersion"` and `"kind"` must also be right.
-	objectType runtime.Object
-
-	// resyncCheckPeriod is how often we want the reflector's resync timer to fire so it can call
-	// shouldResync to check if any of our listeners need a resync.
-	resyncCheckPeriod time.Duration
-	// defaultEventHandlerResyncPeriod is the default resync period for any handlers added via
-	// AddEventHandler (i.e. they don't specify one and just want to use the shared informer's default
-	// value).
-	defaultEventHandlerResyncPeriod time.Duration
-	// clock allows for testability
-	clock clock.Clock
-
-	started, stopped bool
-	startedLock      sync.Mutex
-
-	// blockDeltas gives a way to stop all event distribution so that a late event handler
-	// can safely join the shared informer.
-	blockDeltas sync.Mutex
-
-	// Called whenever the ListAndWatch drops the connection with an error.
-	watchErrorHandler WatchErrorHandler
-}
-
-
 ```
