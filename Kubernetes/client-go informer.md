@@ -240,7 +240,7 @@ func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
 	processorStopCh := make(chan struct{})
 	// ...
 	wg.StartWithChannel(processorStopCh, s.cacheMutationDetector.Run) // todo 
-	wg.StartWithChannel(processorStopCh, s.processor.run) // todo
+	wg.StartWithChannel(processorStopCh, s.processor.run) // 处理资源发生变动触发自定义回调的processor
 
     // ...
     // 启动 执行ListAndWatch的controller
@@ -383,4 +383,84 @@ func (c *threadSafeMap) Delete(key string) {
 		delete(c.items, key)
 	}
 }
+```
+
+### EventHandler
+#### 新增EventHandler
+`informer`可以通过 `AddEventHandler`方法注册一系列如Add,Update,Delete事件的回调函数
+```go
+// tools/cache/shared_informer.go
+func (s *sharedIndexInformer) AddEventHandler(handler ResourceEventHandler) {
+	s.AddEventHandlerWithResyncPeriod(handler, s.defaultEventHandlerResyncPeriod)
+}
+func (s *sharedIndexInformer) AddEventHandlerWithResyncPeriod(handler ResourceEventHandler, resyncPeriod time.Duration) {
+	// ...
+    // 使用已有的handler 和 resyncPeriod 参数创建一个listener
+	listener := newProcessListener(handler, resyncPeriod, determineResyncPeriod(resyncPeriod, s.resyncCheckPeriod), s.clock.Now(), initialBufferSize)
+    // ...
+    // 调用 addListener 将listener加入processor中
+	s.processor.addListener(listener)
+    // ...
+}
+
+
+func (p *sharedProcessor) addListener(listener *processorListener) {
+	// ...
+	p.addListenerLocked(listener)
+    // ...
+}
+
+func (p *sharedProcessor) addListenerLocked(listener *processorListener) {
+	p.listeners = append(p.listeners, listener) // todo
+	p.syncingListeners = append(p.syncingListeners, listener) // todo
+}
+```
+#### EventHandler的触发时机
+sharedIndexInformer 的 Run 方法执行时会调用 processor的执行
+```go
+// tools/cache/shared_informer.go
+func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
+	// ...
+	wg.StartWithChannel(processorStopCh, s.processor.run) // 处理资源发生变动触发自定义回调的processor
+
+    // ...
+}
+
+func (p *sharedProcessor) run(stopCh <-chan struct{}) {
+	func() {
+		// ...
+		for _, listener := range p.listeners { // 遍历已注册的listener,执行listener的run 和 pop 方法启动
+			p.wg.Start(listener.run) // run 负责把存在本地的事件执行
+			p.wg.Start(listener.pop) // todo pop 负责把事件存在本地??
+		}
+		p.listenersStarted = true
+	}()
+	// ... 
+}
+
+func (p *processorListener) run() {
+	stopCh := make(chan struct{})
+    // 每隔 1 * time.Second 取出nextCh里的所有事件,触发相应的注册的Handler(add,update,delete)
+	wait.Until(func() {
+		for next := range p.nextCh {
+			switch notification := next.(type) {
+			case updateNotification:
+				p.handler.OnUpdate(notification.oldObj, notification.newObj)
+			case addNotification:
+				p.handler.OnAdd(notification.newObj)
+			case deleteNotification:
+				p.handler.OnDelete(notification.oldObj)
+			default:
+				utilruntime.HandleError(fmt.Errorf("unrecognized notification: %T", next))
+			}
+		}
+		// the only way to get here is if the p.nextCh is empty and closed
+		close(stopCh)
+	}, 1*time.Second, stopCh)
+}
+```
+
+#### processorListener 的 nextCh的事件来源
+```go
+
 ```
