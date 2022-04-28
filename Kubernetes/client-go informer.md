@@ -141,15 +141,14 @@ informer 通过kubernetes原生提供的 list 和 watch 接口来实现对资源
 ```go
 // tools/cache/shared_informer.go
 type sharedIndexInformer struct {
-	indexer    Indexer  // todo
+	indexer    Indexer  // 实际存储资源的结构,包裹了Store
 	controller Controller   // todo
 
 	processor             *sharedProcessor //todo
 	cacheMutationDetector MutationDetector // 已经缓存到本地的资源检测是否发生变动的Detector todo
 
 	listerWatcher ListerWatcher // 对应资源的list 和 watch接口
-
-	objectType runtime.Object // 监听的资源的结构
+	objectType runtime.Object // 监听的资源的结构,ListAndWatch接口得到的数据需要解析到这样的结构里
 
 	defaultEventHandlerResyncPeriod time.Duration // todo
 
@@ -183,7 +182,7 @@ func NewFilteredEndpointsInformer(client kubernetes.Interface, namespace string,
 
 		&corev1.Endpoints{}, // 监听的资源的结构
 		resyncPeriod, // ??似乎已无用
-		indexers, // todo
+		indexers, // 包裹了实际存储数据的Store
 	)
 }
 
@@ -210,16 +209,16 @@ func NewSharedIndexInformer(lw ListerWatcher, exampleObject runtime.Object, defa
 // tools/cache/shared_informer.go
 func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
 	// ...
-    // 创建一个先进先出的队列
+    // s.indexer包裹了本地数据存储结构, 这里再把这个结构包裹一层,用于拦截并数据变动事件
 	fifo := NewDeltaFIFOWithOptions(DeltaFIFOOptions{
 		KnownObjects:          s.indexer,
 		EmitDeltaTypeReplaced: true,
 	})
 
 	cfg := &Config{
-		Queue:            fifo,
-		ListerWatcher:    s.listerWatcher,
-		ObjectType:       s.objectType,
+		Queue:            fifo, // 数据本地存储结构现在包裹在这个Queue的深处了
+		ListerWatcher:    s.listerWatcher,  // ListAndWatch的实现接口
+		ObjectType:       s.objectType, // 监听资源的结构,用于将ListAndWatch获取的数据解析到这个机构里
 		FullResyncPeriod: s.resyncCheckPeriod,
 		RetryOnError:     false,
 		ShouldResync:     s.processor.shouldResync,
@@ -228,7 +227,7 @@ func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
 		WatchErrorHandler: s.watchErrorHandler,
 	}
 
-	func() {     // 为内部初始化一个controller,后面用来处理list/watch 的执行
+	func() {     // 为内部初始化一个controller,将Config注入到这个controller,后面用来处理list/watch 的执行数据更新
 		s.startedLock.Lock()
 		defer s.startedLock.Unlock()
 
@@ -247,8 +246,11 @@ func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
 	s.controller.Run(stopCh)
 }
 ```
+#### Controller
+Controller 把信息通过ListAndWatch从kubernetes api 取下来,然后 Push到本地一个队列里
 ```go
 // tools/cache/controller.go
+
 func (c *controller) Run(stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
 	go func() {
@@ -356,32 +358,61 @@ loop:
 ```
 
 #### store 的 Add, Update, Delete方法
-本以为会在这里触发Add, Update, Delete的 hook回调,但实际代码并没有这方面的内容
+store的实体是前面创建的DeltaFifo实体
 ```go
-// tools/cache/thread_safe_store.go
-func (c *threadSafeMap) Add(key string, obj interface{}) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	oldObject := c.items[key]
-	c.items[key] = obj
-	c.updateIndices(oldObject, obj, key)
+// tools/cache/delta_fifo.go
+// Add inserts an item, and puts it in the queue. The item is only enqueued
+// if it doesn't already exist in the set.
+func (f *DeltaFIFO) Add(obj interface{}) error {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	f.populated = true
+	return f.queueActionLocked(Added, obj)
 }
 
-func (c *threadSafeMap) Update(key string, obj interface{}) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	oldObject := c.items[key]
-	c.items[key] = obj
-	c.updateIndices(oldObject, obj, key)
+// Update is just like Add, but makes an Updated Delta.
+func (f *DeltaFIFO) Update(obj interface{}) error {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	f.populated = true
+	return f.queueActionLocked(Updated, obj)
 }
 
-func (c *threadSafeMap) Delete(key string) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	if obj, exists := c.items[key]; exists {
-		c.updateIndices(obj, nil, key)
-		delete(c.items, key)
+// Delete is just like Add, but makes a Deleted Delta. If the given
+// object does not already exist, it will be ignored. (It may have
+// already been deleted by a Replace (re-list), for example.)  In this
+// method `f.knownObjects`, if not nil, provides (via GetByKey)
+// _additional_ objects that are considered to already exist.
+func (f *DeltaFIFO) Delete(obj interface{}) error {
+	id, err := f.KeyOf(obj)
+	if err != nil {
+		return KeyError{obj, err}
 	}
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	f.populated = true
+	if f.knownObjects == nil {
+		if _, exists := f.items[id]; !exists {
+			// Presumably, this was deleted when a relist happened.
+			// Don't provide a second report of the same deletion.
+			return nil
+		}
+	} else {
+		// We only want to skip the "deletion" action if the object doesn't
+		// exist in knownObjects and it doesn't have corresponding item in items.
+		// Note that even if there is a "deletion" action in items, we can ignore it,
+		// because it will be deduped automatically in "queueActionLocked"
+		_, exists, err := f.knownObjects.GetByKey(id)
+		_, itemsExist := f.items[id]
+		if err == nil && !exists && !itemsExist {
+			// Presumably, this was deleted when a relist happened.
+			// Don't provide a second report of the same deletion.
+			return nil
+		}
+	}
+
+	// exist in items and/or KnownObjects
+	return f.queueActionLocked(Deleted, obj)
 }
 ```
 
