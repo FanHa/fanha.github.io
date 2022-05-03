@@ -534,7 +534,7 @@ func (p *sharedProcessor) run(stopCh <-chan struct{}) {
 		// ...
 		for _, listener := range p.listeners { // 遍历已注册的listener,执行listener的run 和 pop 方法启动
 			p.wg.Start(listener.run) // run 负责把存在本地的事件执行
-			p.wg.Start(listener.pop) // todo pop 负责把事件存在本地??
+			p.wg.Start(listener.pop) // pop 负责把addCh里的信号转发给nextCh(加着一层应该是为了限制频率和防止空转)
 		}
 		p.listenersStarted = true
 	}()
@@ -557,13 +557,34 @@ func (p *processorListener) run() {
 				utilruntime.HandleError(fmt.Errorf("unrecognized notification: %T", next))
 			}
 		}
-		// the only way to get here is if the p.nextCh is empty and closed
-		close(stopCh)
+		// ...
 	}, 1*time.Second, stopCh)
 }
-```
-
-#### processorListener 的 nextCh的事件来源
-```go
-
+func (p *processorListener) pop() {
+	// ...
+	var nextCh chan<- interface{}
+	var notification interface{}
+	for {
+		select {
+		case nextCh <- notification:
+			// 把notification(从下面的case逻辑里取出的)信号发送给nextCh
+			var ok bool
+			notification, ok = p.pendingNotifications.ReadOne() // 先把缓存里的信号取出来(下一个循环发送给nextCh)
+			if !ok { // Nothing to pop
+				nextCh = nil // Disable this select case
+			}
+		case notificationToAdd, ok := <-p.addCh: // 从addCh里取出事件
+			if !ok {
+				return
+			}
+			if notification == nil { 
+				// 当前没有等待发送到nextCh的信号,则直接把addCh的信号通过notification作为媒介发给nextCh
+				notification = notificationToAdd
+				nextCh = p.nextCh
+			} else { // 当前nextCh还有未处理完的信号,则把从addCh得到的信号写入pendingNotifications一个缓存里
+				p.pendingNotifications.WriteOne(notificationToAdd)
+			}
+		}
+	}
+}
 ```
