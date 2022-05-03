@@ -272,6 +272,8 @@ func (c *controller) Run(stopCh <-chan struct{}) {
 	wg.Wait()
 }
 ```
+#### Reflector Run
+Reflector Run 方法周期性的执行List And Watch
 ```go
 // tools/cache/reflector.go
 func (r *Reflector) Run(stopCh <-chan struct{}) {
@@ -356,65 +358,135 @@ loop:
 }
 
 ```
-
 #### store 的 Add, Update, Delete方法
-store的实体是前面创建的DeltaFifo实体
+store的实体是前面创建的DeltaFifo实体,将通过ListAndWatch取回的数据变动归类整理然后排队push到一个Queue里
 ```go
 // tools/cache/delta_fifo.go
-// Add inserts an item, and puts it in the queue. The item is only enqueued
-// if it doesn't already exist in the set.
+// 都是调用`f.queueActionLocked`
 func (f *DeltaFIFO) Add(obj interface{}) error {
-	f.lock.Lock()
-	defer f.lock.Unlock()
-	f.populated = true
+	// ...
 	return f.queueActionLocked(Added, obj)
 }
 
-// Update is just like Add, but makes an Updated Delta.
 func (f *DeltaFIFO) Update(obj interface{}) error {
-	f.lock.Lock()
-	defer f.lock.Unlock()
-	f.populated = true
+	// ...
 	return f.queueActionLocked(Updated, obj)
 }
 
-// Delete is just like Add, but makes a Deleted Delta. If the given
-// object does not already exist, it will be ignored. (It may have
-// already been deleted by a Replace (re-list), for example.)  In this
-// method `f.knownObjects`, if not nil, provides (via GetByKey)
-// _additional_ objects that are considered to already exist.
 func (f *DeltaFIFO) Delete(obj interface{}) error {
-	id, err := f.KeyOf(obj)
-	if err != nil {
-		return KeyError{obj, err}
-	}
-	f.lock.Lock()
-	defer f.lock.Unlock()
-	f.populated = true
-	if f.knownObjects == nil {
-		if _, exists := f.items[id]; !exists {
-			// Presumably, this was deleted when a relist happened.
-			// Don't provide a second report of the same deletion.
-			return nil
-		}
-	} else {
-		// We only want to skip the "deletion" action if the object doesn't
-		// exist in knownObjects and it doesn't have corresponding item in items.
-		// Note that even if there is a "deletion" action in items, we can ignore it,
-		// because it will be deduped automatically in "queueActionLocked"
-		_, exists, err := f.knownObjects.GetByKey(id)
-		_, itemsExist := f.items[id]
-		if err == nil && !exists && !itemsExist {
-			// Presumably, this was deleted when a relist happened.
-			// Don't provide a second report of the same deletion.
-			return nil
-		}
-	}
-
-	// exist in items and/or KnownObjects
+	// ...
 	return f.queueActionLocked(Deleted, obj)
 }
+
+func (f *DeltaFIFO) queueActionLocked(actionType DeltaType, obj interface{}) error {
+	// 每隔object都有一个key,在这里把不同object的改动分流到不同的队列里(便于合并操作)
+	id, err := f.KeyOf(obj)
+	// ...
+	oldDeltas := f.items[id]
+	newDeltas := append(oldDeltas, Delta{actionType, obj})
+	newDeltas = dedupDeltas(newDeltas)
+
+	if len(newDeltas) > 0 {
+		// 然后将整个代表一个object的改动作为一个整体append到queue队列里
+		if _, exists := f.items[id]; !exists {
+			f.queue = append(f.queue, id) // todo queue在哪里用到
+		}
+		f.items[id] = newDeltas
+		f.cond.Broadcast() // 调用cond.Broadcast方法,使所有等待这个cond同志的goroutine开始行动,用于queue队列为空时减少空循环
+	} 
+	// ...
+	return nil
+}
 ```
+
+#### Reflector ProcessLoop
+无限循环从Queue里pop出object变动事件并处理
+```go
+// tools/cache/controller.go
+func (c *controller) processLoop() {
+	for {
+		obj, err := c.config.Queue.Pop(PopProcessFunc(c.config.Process))
+		// ...
+	}
+}
+```
+```go
+// tools/cache/delta_fifo.go
+func (f *DeltaFIFO) Pop(process PopProcessFunc) (interface{}, error) {
+	for {
+		for len(f.queue) == 0 {
+			// 防止队列为空时不停的询问
+			f.cond.Wait()
+		}
+		// 如其名,这是个FIFO队列,把对头取出
+		id := f.queue[0]
+		f.queue = f.queue[1:]
+		depth := len(f.queue)
+		if f.initialPopulationCount > 0 {
+			f.initialPopulationCount--
+		}
+		// 取出objectId代表的所有变动
+		item, ok := f.items[id]
+
+		delete(f.items, id)
+		// ...
+		// 这个process是方法传入的参数,对所有当前objectId的变动进行处理(这里一层层倒推,得到传进来的是sharedIndexInformer的HandleDelta方法) #ref (s *sharedIndexInformer) HandleDeltas(obj interface{}) 
+		err := process(item)
+		// ...
+		return item, err
+	}
+}
+```
+```go
+// tools/cache/shared_informer.go
+func (s *sharedIndexInformer) HandleDeltas(obj interface{}) error {
+	// ...
+	// 依次执行当前object的变动
+	for _, d := range obj.(Deltas) {
+		switch d.Type {
+		case Sync, Replaced, Added, Updated:
+			s.cacheMutationDetector.AddObject(d.Object)
+			if old, exists, err := s.indexer.Get(d.Object); err == nil && exists {
+				if err := s.indexer.Update(d.Object); err != nil { // 变更本地内容
+					return err
+				}
+				// ...
+				// 将更新事件分发给所有监听的listener
+				s.processor.distribute(updateNotification{oldObj: old, newObj: d.Object}, isSync)
+			} else {
+				// ...
+				// 新增事件分发
+				s.processor.distribute(addNotification{newObj: d.Object}, false)
+			}
+		case Deleted:
+			// 删除事件分发
+			s.processor.distribute(deleteNotification{oldObj: d.Object}, false)
+		}
+	}
+	return nil
+}
+
+// 为每一个listener生成一个事件信号
+func (p *sharedProcessor) distribute(obj interface{}, sync bool) {
+	// ...
+	// 给每一个监听该事件的listener发送一个事件信号(自定帝的add,update,delete回调函数就是取这里得到的信号); todo sync事件具体指啥
+	if sync {
+		for _, listener := range p.syncingListeners {
+			listener.add(obj)
+		}
+	} else {
+		for _, listener := range p.listeners {
+			listener.add(obj)
+		}
+	}
+}
+// 给listener一个addCh信号
+func (p *processorListener) add(notification interface{}) {
+	p.addCh <- notification
+}
+```
+
+
 
 ### EventHandler
 #### 新增EventHandler
