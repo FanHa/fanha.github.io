@@ -2,12 +2,9 @@
 + Github:kubernetes/client-go
 + 分支: release-1.23
 
-## 数据流向 todo
- informer 相当于把响应客户端获取数据请求(Lister) 与 从集群拿数据(Informer)两部分分离
-```mermaid
-flowchart TD
-    Start --> Stop
-```
+## 数据流向
+informer 相当于把响应客户端获取数据请求(Lister) 与 从集群拿数据(Informer)两部分分离
+![avatar](client-go%20informer%E6%8B%86%E8%A7%A3.png)
 
 ## 客户端获取数据的过程
 以endpoint举例
@@ -19,7 +16,7 @@ type EndpointsLister interface {
 	// List 方法获取Endpoint列表
 	List(selector labels.Selector) (ret []*v1.Endpoints, err error)
 
-	// Endpoints 方法通过(namespace)缩小Lister检索数据的范围 todo
+	// Endpoints 方法通过(namespace)缩小Lister检索数据的范围
 	Endpoints(namespace string) EndpointsNamespaceLister
 	EndpointsListerExpansion //用于扩展
 }
@@ -142,18 +139,15 @@ informer 通过kubernetes原生提供的 list 和 watch 接口来实现对资源
 // tools/cache/shared_informer.go
 type sharedIndexInformer struct {
 	indexer    Indexer  // 实际存储资源的结构,包裹了Store
-	controller Controller   // todo
+	controller Controller   // Controller 把信息通过ListAndWatch从kubernetes api 取下来,然后信息发到本地一个队列里,然后调用process里提供的processLoop处理这些信息
 
-	processor             *sharedProcessor //todo
+	processor             *sharedProcessor // 处理资源变动信息
 	cacheMutationDetector MutationDetector // 已经缓存到本地的资源检测是否发生变动的Detector todo
 
 	listerWatcher ListerWatcher // 对应资源的list 和 watch接口
 	objectType runtime.Object // 监听的资源的结构,ListAndWatch接口得到的数据需要解析到这样的结构里
 
-	defaultEventHandlerResyncPeriod time.Duration // todo
-
-	// Called whenever the ListAndWatch drops the connection with an error.
-	watchErrorHandler WatchErrorHandler // todo
+	// ...
 }
 ```
 ### 实现EndpointsInformer 
@@ -196,7 +190,7 @@ func NewSharedIndexInformer(lw ListerWatcher, exampleObject runtime.Object, defa
 		listerWatcher:                   lw,    // 传入的list/watch 实现
 		objectType:                      exampleObject, // 传入的监听资源的结构
 		resyncCheckPeriod:               defaultEventHandlerResyncPeriod,   // ??似乎已无用
-		defaultEventHandlerResyncPeriod: defaultEventHandlerResyncPeriod,   // eventHandler 间隔时间 ?? todo 
+		defaultEventHandlerResyncPeriod: defaultEventHandlerResyncPeriod,   // ??似乎已无用
 		cacheMutationDetector:           NewCacheMutationDetector(fmt.Sprintf("%T", exampleObject)),
 		clock:                           realClock,
 	}
@@ -247,10 +241,11 @@ func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
 }
 ```
 #### Controller
-Controller 把信息通过ListAndWatch从kubernetes api 取下来,然后 Push到本地一个队列里
+Controller 把信息通过ListAndWatch从kubernetes api 取下来,然后信息发到本地一个队列里,然后调用processLoop处理这些信息
+![avatar](client-go%20informer%20Processor.png)
+
 ```go
 // tools/cache/controller.go
-
 func (c *controller) Run(stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
 	go func() {
@@ -265,10 +260,10 @@ func (c *controller) Run(stopCh <-chan struct{}) {
 		c.config.FullResyncPeriod,
 	)
 	// ...
-    // 启动reflector #ref r.Run
+    // 启动reflector #ref (r *Reflector) Run(stopCh <-chan struct{})
 	wg.StartWithChannel(stopCh, r.Run)
 
-	wait.Until(c.processLoop, time.Second, stopCh) // todo
+	wait.Until(c.processLoop, time.Second, stopCh) // 每隔一秒调用processLoop 处理资源变更信息
 	wg.Wait()
 }
 ```
@@ -389,7 +384,7 @@ func (f *DeltaFIFO) queueActionLocked(actionType DeltaType, obj interface{}) err
 	if len(newDeltas) > 0 {
 		// 然后将整个代表一个object的改动作为一个整体append到queue队列里
 		if _, exists := f.items[id]; !exists {
-			f.queue = append(f.queue, id) // todo queue在哪里用到
+			f.queue = append(f.queue, id)
 		}
 		f.items[id] = newDeltas
 		f.cond.Broadcast() // 调用cond.Broadcast方法,使所有等待这个cond同志的goroutine开始行动,用于queue队列为空时减少空循环
