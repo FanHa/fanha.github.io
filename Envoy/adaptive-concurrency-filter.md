@@ -7,7 +7,7 @@ adaptive-concurency-filter是envoy官方提供的自适应限流filter
 
 # 核心代码逻辑
 ## 初始化Controller
-初始化Controller时需要创建两个关键timer,一个`min_rtt_calc_timer_`用来周期性计算`理想RTT(min_rtt)`,一个`sample_reset_timer_`用来重制采样的数据
+初始化Controller时需要创建两个关键timer,一个`min_rtt_calc_timer_`用来周期性计算`理想RTT(min_rtt)`,一个`sample_reset_timer_`用来周期性采样真实请求的RTT数据
 ```cpp
 // source/extensions/filters/http/adaptive_concurrency/controller/gradient_controller.cc
 GradientController::GradientController(GradientControllerConfig config,
@@ -23,7 +23,7 @@ GradientController::GradientController(GradientControllerConfig config,
   min_rtt_calc_timer_ = dispatcher_.createTimer([this]() -> void { enterMinRTTSamplingWindow(); });
   // 根据真实请求数据的‘SampleRtt’ 与 ‘MinRtt’对比,设置新的 ‘ConcurrencyLimit’ 值
   sample_reset_timer_ = dispatcher_.createTimer([this]() -> void {
-    // 正在MinRTT采样周期内,则不采样(采到的数据会失真,反应不了当前服务的真实RTT)
+    // 正在MinRTT采样周期内,则不采样(即使采了也会失真,反应不了当前服务的真实RTT)
     if (inMinRTTSamplingWindow()) {
       return;
     }
@@ -33,13 +33,14 @@ GradientController::GradientController(GradientControllerConfig config,
       // 根据采样信息算出sampleRtt,再根据‘SampleRtt’与‘MinRtt’ 的对比决定是否要增大或减小‘ConcurrencyLimit’ #ref resetSampleWindow
       resetSampleWindow();
     }
-
+    // 设定下一次真实请求采样的时间
     sample_reset_timer_->enableTimer(config_.sampleRTTCalcInterval());
   });
 
+  // 初始化时先进入MinRTT取样
   enterMinRTTSamplingWindow();
+  // 设置下次触发真实请求取样的时间
   sample_reset_timer_->enableTimer(config_.sampleRTTCalcInterval());
-  stats_.concurrency_limit_.set(concurrency_limit_.load());
 }
 ```
 ### enterMinRTTSamplingWindow
@@ -162,7 +163,7 @@ void GradientController::recordLatencySample(MonotonicTime rq_send_time) {
   hist_insert(latency_sample_hist_.get(), rq_latency.count(), 1);
 
   // 更新用来做限流参考的MinRTT值,
-  // 注: 方法内部会根据现在是不是处在取样窗口阶段而走不走实际更新MinRtt值的逻辑
+  // 注: 方法内部会根据现在是不是处在MinRTT取样窗口阶段而走不走实际更新MinRtt值的逻辑
   updateMinRTT();
 }
 ```
@@ -170,13 +171,13 @@ void GradientController::recordLatencySample(MonotonicTime rq_send_time) {
 ### updateMinRTT 更新用来做限流参考的MinRTT值
 ```cpp
 void GradientController::updateMinRTT() {
-  // 只有在取样窗口周期 并且 已经超过设定的取样数时,才根据得到的取样rtt值们对minRTT做出更新
+  // 只有在MinRTT取样窗口周期 并且已经达到了设定的取样数时,才根据得到的取样rtt值们对minRTT做出更新
   if (!inMinRTTSamplingWindow() ||
       hist_sample_count(latency_sample_hist_.get()) < config_.minRTTAggregateRequestCount()) {
     return;
   }
 
-  // 根据取样值和设置的percentile值得到 将要更新的min_rtt值 ?? TODO 这个值似乎只用来统计?
+  // 根据取样值和设置的percentile值得到新的MinRtt值
   min_rtt_ = processLatencySamplesAndClear();
 
   // 采样结束,将限流值恢复为采样前的值‘deferred_limit_value_’ 
@@ -199,8 +200,6 @@ void GradientController::updateConcurrencyLimit(const uint32_t new_limit) {
   // ...
   // 根据参数设定limit值
   concurrency_limit_.store(new_limit);
-  // 更新统计值
-  stats_.concurrency_limit_.set(concurrency_limit_.load());
   // ...
 }
 ```
