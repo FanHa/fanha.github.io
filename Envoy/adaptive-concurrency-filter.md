@@ -1,15 +1,107 @@
-## 版本
+# 版本
 + github: envoyproxy/envoy
 + 分支:1.24.0-dev
 
-## 序
+# 序
 adaptive-concurency-filter是envoy官方提供的自适应限流filter
 
-## 核心代码逻辑
-### Filter入口
+# 核心代码逻辑
+## 初始化Controller
+初始化Controller时需要创建两个关键timer,一个`min_rtt_calc_timer_`用来周期性计算`理想RTT(min_rtt)`,一个`sample_reset_timer_`用来重制采样的数据
+```cpp
+// source/extensions/filters/http/adaptive_concurrency/controller/gradient_controller.cc
+GradientController::GradientController(GradientControllerConfig config,
+                                       Event::Dispatcher& dispatcher, Runtime::Loader&,
+                                       const std::string& stats_prefix, Stats::Scope& scope,
+                                       Random::RandomGenerator& random, TimeSource& time_source)
+    : config_(std::move(config)), dispatcher_(dispatcher), scope_(scope),
+      stats_(generateStats(scope_, stats_prefix)), random_(random), time_source_(time_source),
+      deferred_limit_value_(0), num_rq_outstanding_(0),
+      concurrency_limit_(config_.minConcurrency()),
+      latency_sample_hist_(hist_fast_alloc(), hist_free) {
+  // 触发min_rtt重新计算的timer,调用 ‘enterMinRTTSamplingWindow’ #ref enterMinRTTSamplingWindow
+  min_rtt_calc_timer_ = dispatcher_.createTimer([this]() -> void { enterMinRTTSamplingWindow(); });
+  // 根据真实请求数据的‘SampleRtt’ 与 ‘MinRtt’对比,设置新的 ‘ConcurrencyLimit’ 值
+  sample_reset_timer_ = dispatcher_.createTimer([this]() -> void {
+    // 正在MinRTT采样周期内,则不采样(采到的数据会失真,反应不了当前服务的真实RTT)
+    if (inMinRTTSamplingWindow()) {
+      return;
+    }
+
+    {
+      absl::MutexLock ml(&sample_mutation_mtx_);
+      // 根据采样信息算出sampleRtt,再根据‘SampleRtt’与‘MinRtt’ 的对比决定是否要增大或减小‘ConcurrencyLimit’ #ref resetSampleWindow
+      resetSampleWindow();
+    }
+
+    sample_reset_timer_->enableTimer(config_.sampleRTTCalcInterval());
+  });
+
+  enterMinRTTSamplingWindow();
+  sample_reset_timer_->enableTimer(config_.sampleRTTCalcInterval());
+  stats_.concurrency_limit_.set(concurrency_limit_.load());
+}
+```
+### enterMinRTTSamplingWindow
+进入抽样计算`理想RTT(minRtt)`的窗口阶段,这里只是打开一个开关,实际仍是在每个请求的filter实例逻辑里根据设置的采样值决定放不放行,根据样本信息来更新MinRTT值
+```cpp
+// source/extensions/filters/http/adaptive_concurrency/controller/gradient_controller.cc
+void GradientController::enterMinRTTSamplingWindow() {
+  // ...
+  absl::MutexLock ml(&sample_mutation_mtx_);
+
+  // 将当前限流值保存到 ‘deferred_limit_value_’,便于取样结束后恢复
+  deferred_limit_value_.store(GradientController::concurrencyLimit());
+  // 将限流值设置为最小限流值
+  updateConcurrencyLimit(config_.minConcurrency());
+
+  // 更新取样计算min_rtt的窗口版本(只有在这个时间后收到的请求才有资格进入取样环节)
+  min_rtt_epoch_ = time_source_.monotonicTime();
+}
+```
+
+### resetSampleWindow
+根据已有的真实请求`SampleRtt`与`MinRtt`之间的比较,设置新的`ConcurrencyLimit`值
+```cpp
+// source/extensions/filters/http/adaptive_concurrency/controller/gradient_controller.cc
+void GradientController::resetSampleWindow() {
+  // 得到真实请求的‘SampleRtt’
+  sample_rtt_ = processLatencySamplesAndClear();
+  // ...
+  // calculateNewLimit 根据‘SampleRtt’ 与 ‘MinRtt’ 使用算法算出新的‘ConcurrencyLimit’值,并设置 #ref calculateNewLimit
+  updateConcurrencyLimit(calculateNewLimit());
+}
+```
+
+### calculateNewLimit TODO
+```cpp
+uint32_t GradientController::calculateNewLimit() {
+  ASSERT(sample_rtt_.count() > 0);
+
+  // Calculate the gradient value, ensuring it's clamped between 0.5 and 2.0.
+  // This prevents extreme changes in the concurrency limit between each sample
+  // window.
+  const auto buffered_min_rtt = min_rtt_.count() + min_rtt_.count() * config_.minRTTBufferPercent();
+  const double raw_gradient = static_cast<double>(buffered_min_rtt) / sample_rtt_.count();
+  const double gradient = std::max<double>(0.5, std::min<double>(2.0, raw_gradient));
+  stats_.gradient_.set(gradient);
+
+  const double limit = concurrencyLimit() * gradient;
+  const double burst_headroom = sqrt(limit);
+  stats_.burst_queue_size_.set(burst_headroom);
+
+  // The final concurrency value factors in the burst headroom and must be clamped to keep the value
+  // in the range [configured_min, configured_max].
+  const uint32_t new_limit = limit + burst_headroom;
+  return std::max<uint32_t>(config_.minConcurrency(),
+                            std::min<uint32_t>(config_.maxConcurrencyLimit(), new_limit));
+}
+```
+
+## Filter逻辑
+这里是filter的入口,envoy收到了对服务的请求的处理, TODO 确认一个这样的filter实例是不是就代表一个请求
 ```cpp
 // source/extensions/filters/http/adaptive_concurrency/adaptive_concurrency_filter.cc
-// 这里是filter的入口,envoy收到了对服务的请求的处理, TODO 确认一个这样的filter实例是不是就代表一个请求
 Http::FilterHeadersStatus AdaptiveConcurrencyFilter::decodeHeaders(Http::RequestHeaderMap&, bool) {
   // 当filter开关配置没有开启  或 当前是一个流调用的健康检查请求时,直接放行
   if (!config_->filterEnabled() || decoder_callbacks_->streamInfo().healthCheck()) {
@@ -66,7 +158,7 @@ void GradientController::recordLatencySample(MonotonicTime rq_send_time) {
       std::chrono::duration_cast<std::chrono::microseconds>(time_source_.monotonicTime() -
                                                             rq_send_time);
 
-  // 记录本次请求的 RTT值,便于后面
+  // 记录本次请求的 RTT值
   hist_insert(latency_sample_hist_.get(), rq_latency.count(), 1);
 
   // 更新用来做限流参考的MinRTT值,
@@ -86,18 +178,16 @@ void GradientController::updateMinRTT() {
 
   // 根据取样值和设置的percentile值得到 将要更新的min_rtt值 ?? TODO 这个值似乎只用来统计?
   min_rtt_ = processLatencySamplesAndClear();
-  // 统计信息更新
-  stats_.min_rtt_msecs_.set(
-      std::chrono::duration_cast<std::chrono::milliseconds>(min_rtt_).count());
-  // !!更新限流值!! TODO deferred_limit_value_ 的来源
+
+  // 采样结束,将限流值恢复为采样前的值‘deferred_limit_value_’ 
   updateConcurrencyLimit(deferred_limit_value_.load());
   // 本次采样算rtt结束了, 重新将 deferred_limit_value_ 设置为0
   deferred_limit_value_.store(0);
-  stats_.min_rtt_calculation_active_.set(0);
 
-  // TODO
+  // 更新MinRTT值后需要根据配置设置‘min_rtt_calc_timer_’,过一阵子再次触发这个timer里的回调,执行取样逻辑
   min_rtt_calc_timer_->enableTimer(
       applyJitter(config_.minRTTCalcInterval(), config_.jitterPercent()));
+  // 设置下一次触发真实请求采样回调的时间,‘sampleRTTCalcInterval’是通过配置设置的值
   sample_reset_timer_->enableTimer(config_.sampleRTTCalcInterval());
 }
 ```
