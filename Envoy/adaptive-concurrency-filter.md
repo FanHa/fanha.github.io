@@ -7,7 +7,9 @@ adaptive-concurency-filter是envoy官方提供的自适应限流filter
 
 # 核心代码逻辑
 ## 初始化Controller
-初始化Controller时需要创建两个关键timer,一个`min_rtt_calc_timer_`用来周期性计算`理想RTT(min_rtt)`,一个`sample_reset_timer_`用来周期性采样真实请求的RTT数据
+初始化Controller时需要创建两个关键timer,
+- 一个`min_rtt_calc_timer_`用来周期性计算`理想RTT(min_rtt)`;
+- 一个`sample_reset_timer_`用来周期性计算真实请求的RTT数据,根据与min_rtt对比调整 限流值
 ```cpp
 // source/extensions/filters/http/adaptive_concurrency/controller/gradient_controller.cc
 GradientController::GradientController(GradientControllerConfig config,
@@ -182,7 +184,8 @@ void GradientController::updateMinRTT() {
 
   // 采样结束,将限流值恢复为采样前的值‘deferred_limit_value_’ 
   updateConcurrencyLimit(deferred_limit_value_.load());
-  // 本次采样算rtt结束了, 重新将 deferred_limit_value_ 设置为0
+  // 本次采样算rtt结束了, 重新将 deferred_limit_value_ 设置为0,
+  // 注:这个0没有特别意义,可以看作是没有在MinRTT采样周期内,下次进去MinRTT采样周期时这个值又会被设置(缓存)为当时的‘ConcurrencyLimit’值
   deferred_limit_value_.store(0);
 
   // 更新MinRTT值后需要根据配置设置‘min_rtt_calc_timer_’,过一阵子再次触发这个timer里的回调,执行取样逻辑
