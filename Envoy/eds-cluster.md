@@ -56,7 +56,58 @@ EdsClusterImpl::EdsClusterImpl(
 }
 ```
 
-## 更新 cluster里的host信息
+## host结构
+一个host结构大致分为 HostDescription 与 Host两部分:
+- HostDescription部分表示一个实际可连接的后端(比如一个IP:Port)
+- Host部分表示在cluster视角这个host的`健康状态`和`权重`
+```cpp
+// source/common/upstream/upstream_impl.h
+class HostImpl : public HostDescriptionImpl,
+                 public Host,
+                 public std::enable_shared_from_this<HostImpl> {
+public:
+  HostImpl(ClusterInfoConstSharedPtr cluster, const std::string& hostname,
+           Network::Address::InstanceConstSharedPtr address, MetadataConstSharedPtr metadata,
+           uint32_t initial_weight, const envoy::config::core::v3::Locality& locality,
+           const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig& health_check_config,
+           uint32_t priority, const envoy::config::core::v3::HealthStatus health_status,
+           TimeSource& time_source)
+        // 实际可连接的后端Host描述(比如一个具体的IP:port)
+      : HostDescriptionImpl(cluster, hostname, address, metadata, locality, health_check_config,
+                            priority, time_source),
+        used_(true) { 
+    setEdsHealthFlag(health_status); // 健康状态
+    HostImpl::weight(initial_weight); // 权重
+  }
+  // ...
+};
+```
+### HostDescriptionImpl
+HostDescriptionImpl 包裹了一个有具体地址的结构`Network::Address::InstanceConstSharedPtr`的变量address_,请求就是直接发到这个address_所代表的地址
+```cpp
+// source/common/upstream/upstream_impl.cc
+HostDescriptionImpl::HostDescriptionImpl(
+    ClusterInfoConstSharedPtr cluster, const std::string& hostname,
+    Network::Address::InstanceConstSharedPtr dest_address, MetadataConstSharedPtr metadata,
+    const envoy::config::core::v3::Locality& locality,
+    const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig& health_check_config,
+    uint32_t priority, TimeSource& time_source)
+    : cluster_(cluster), hostname_(hostname),
+      health_checks_hostname_(health_check_config.hostname()), address_(dest_address),
+      canary_(Config::Metadata::metadataValue(metadata.get(),
+                                              Config::MetadataFilters::get().ENVOY_LB,
+                                              Config::MetadataEnvoyLbKeys::get().CANARY)
+                  .bool_value()),
+      metadata_(metadata), locality_(locality),
+      locality_zone_stat_name_(locality.zone(), cluster->statsScope().symbolTable()),
+      priority_(priority),
+      socket_factory_(resolveTransportSocketFactory(dest_address, metadata_.get())),
+      creation_time_(time_source.monotonicTime()) {
+  // ...
+}
+```
+
+## 更新cluster里的host信息
 ```cpp
 // source/common/upstream/eds.cc
 bool EdsClusterImpl::updateHostsPerLocality(
