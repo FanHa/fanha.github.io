@@ -158,7 +158,7 @@ LocalRateLimiterImpl::LocalRateLimiterImpl(
         envoy::extensions::common::ratelimit::v3::LocalRateLimitDescriptor>& descriptors)
     : fill_timer_(fill_interval > std::chrono::milliseconds(0)
                       ? dispatcher.createTimer([this] { onFillTimer(); })
-                      : nullptr), // 设置fill_timer_ 的回调 onFillTimer todo #ref
+                      : nullptr), // 设置fill_timer_ 的回调 onFillTimer  #ref
       time_source_(dispatcher.timeSource()) {
   if (fill_timer_ && fill_interval < std::chrono::milliseconds(50)) {
     throw EnvoyException("local rate limit token bucket fill timer must be >= 50ms");
