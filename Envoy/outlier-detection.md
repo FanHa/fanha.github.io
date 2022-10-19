@@ -7,6 +7,8 @@ outlier_detection 用来配置envoy 的 cluster里的host的检测机制,配置�
 >> 注: istio 的 DestinationRule的Subset里的outlier配置,最终也是变成了envoy里的cluster outlier配置
 
 # 核心代码逻辑
+## route 向outlierDetector push结果的逻辑 todo
+
 ## detector 初始化
 ```cpp
 // source/common/upstream/outlier_detection_impl.cc
