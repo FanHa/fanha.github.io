@@ -93,7 +93,7 @@ HostDescriptionImpl::HostDescriptionImpl(
     const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig& health_check_config,
     uint32_t priority, TimeSource& time_source)
     : cluster_(cluster), hostname_(hostname),
-      health_checks_hostname_(health_check_config.hostname()), address_(dest_address),
+      health_checks_hostname_(health_check_config.hostname()), address_(dest_address), // 这个address_就是请求最终发送的目标ip端口地址
       canary_(Config::Metadata::metadataValue(metadata.get(),
                                               Config::MetadataFilters::get().ENVOY_LB,
                                               Config::MetadataEnvoyLbKeys::get().CANARY)
@@ -107,7 +107,42 @@ HostDescriptionImpl::HostDescriptionImpl(
 }
 ```
 
-## 更新cluster里的host信息
+## cluster熔断
+cluster可以配置 `circuit_breakers`熔断和`outlier_detection`熔断
+### cluster connection类型的熔断
+`cluster`设置了`connection`类型的熔断时,与目标`host`建立连接时需要调用`host`的`canCreateConnection`方法
+```cpp
+// source/common/conn_pool/conn_pool_base.cc
+ConnPoolImplBase::ConnectionResult
+ConnPoolImplBase::tryCreateNewConnection(float global_preconnect_ratio) {
+  // ...
+  const bool can_create_connection = host_->canCreateConnection(priority_);
+  // ...
+}
+
+```
+```cpp
+// source/common/upstream/upstream_impl.h
+class HostDescriptionImpl : virtual public HostDescription,
+                            protected Logger::Loggable<Logger::Id::upstream> {
+public:
+  // ...
+  bool canCreateConnection(Upstream::ResourcePriority priority) const override {
+    // 先判断当前host的active连接是否超出了 `maxConnectionPerhost`的值
+    if (stats().cx_active_.value() >= cluster().resourceManager(priority).maxConnectionsPerHost()) {
+      return false;
+    }
+    // 判断cluster层面的connection熔断是否触发
+    return cluster().resourceManager(priority).connections().canCreate();
+  }
+}
+```
+
+### outlier detection类型的熔断
+[outlier-detection](outlier-detection.md)
+
+## 更新cluster里的host信息 
+todo 谁在什么时候触发host的更新
 ```cpp
 // source/common/upstream/eds.cc
 bool EdsClusterImpl::updateHostsPerLocality(
@@ -158,7 +193,7 @@ bool BaseDynamicClusterImpl::updateDynamicHostList(
       current_priority_hosts.size());
   HostVector final_hosts;
   for (const HostSharedPtr& host : new_hosts) { // 遍历新host列表
-    // 寻找当前host是否存在新host
+    // 寻找当前host的地址是否已经存在
     auto existing_host = all_hosts.find(host->address()->asString());
     const bool existing_host_found = existing_host != all_hosts.end();
 
@@ -169,27 +204,8 @@ bool BaseDynamicClusterImpl::updateDynamicHostList(
       existing_host->second->healthFlagClear(Host::HealthFlag::PENDING_DYNAMIC_REMOVAL);
     }
 
-    // 一些需要忽略处理的情况,如host虽然可以找到,但是地址变了;
-    // TODO 这个Host 和 这个Address 的关系
-    const bool health_check_address_changed =
-        (health_checker_ != nullptr && existing_host_found &&
-         *existing_host->second->healthCheckAddress() != *host->healthCheckAddress());
-    bool locality_changed = false;
-    if (Runtime::runtimeFeatureEnabled(
-            "envoy.reloadable_features.support_locality_update_on_eds_cluster_endpoints")) {
-      locality_changed =
-          (existing_host_found &&
-           (!LocalityEqualTo()(host->locality(), existing_host->second->locality())));
-      if (locality_changed) {
-        hosts_with_updated_locality_for_current_priority.emplace(existing_host->first);
-      }
-    }
+    // ...
 
-    const bool skip_inplace_host_update = health_check_address_changed || locality_changed;
-
-    // When there is a match and we decided to do in-place update, we potentially update the
-    // host's health check flag and metadata. Afterwards, the host is pushed back into the
-    // final_hosts, i.e. hosts that should be preserved in the current priority.
     // 能在已有的host中找到,且不属于需要忽略的变动
     if (existing_host_found && !skip_inplace_host_update) {
       existing_hosts_for_current_priority.emplace(existing_host->first);
@@ -229,16 +245,14 @@ bool BaseDynamicClusterImpl::updateDynamicHostList(
         hosts_changed = true;
       }
 
-      // todo priority的作用
       if (host->priority() != existing_host->second->priority()) {
         // 更新原host的priority级别
         existing_host->second->priority(host->priority());
-        // todo
         // host的priotiry变动需要更新信息到'hosts_added_to_current_priority'队列中
         hosts_added_to_current_priority.emplace_back(existing_host->second);
       }
 
-      // 讲修改过信息的host push到最终的结果清单中
+      // 将修改过信息的host push到最终的结果清单中
       final_hosts.push_back(existing_host->second);
     } else {
       // 在原有的host列表里找不到的host需要新push到队列'new_hosts_for_current_priority'
