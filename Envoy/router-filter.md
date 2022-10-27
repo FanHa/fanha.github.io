@@ -20,6 +20,8 @@ public:
   Http::FilterDataStatus decodeData(Buffer::Instance& data, bool end_stream) override;
   Http::FilterTrailersStatus decodeTrailers(Http::RequestTrailerMap& trailers) override;
   Http::FilterMetadataStatus decodeMetadata(Http::MetadataMap& metadata_map) override;
+  void onRequestComplete();
+
 
   // 收到上游的回复时的处理
   void onUpstream1xxHeaders(Http::ResponseHeaderMapPtr&& headers,
@@ -300,4 +302,35 @@ Http::FilterDataStatus Filter::decodeData(Buffer::Instance& data, bool end_strea
   return Http::FilterDataStatus::StopIterationNoBuffer;
 }
 
+```
+
+### onRequestComplete
+下游的请求完全接收后,最终都是调用这个方法(前面的decodeXXX方法里的end_stream参数表计下游请求接收完了)
+```cpp
+// source/common/router/router.cc
+void Filter::onRequestComplete() {
+  // 标记
+  downstream_end_stream_ = true;
+  // todo ??
+  Event::Dispatcher& dispatcher = callbacks_->dispatcher();
+  downstream_request_complete_time_ = dispatcher.timeSource().monotonicTime();
+
+  // Possible that we got an immediate reset.
+  if (!upstream_requests_.empty()) {
+    // 如果配置了全局超时时间,设置超时回调 onResponseTimeout() todo
+    if (timeout_.global_timeout_.count() > 0) {
+      response_timeout_ = dispatcher.createTimer([this]() -> void { onResponseTimeout(); });
+      response_timeout_->enableTimer(timeout_.global_timeout_);
+    }
+
+    // 遍历所有要发送给上游的request
+    // 设置每个request的timeout
+    // todo 具体发送实在哪儿??
+    for (auto& upstream_request : upstream_requests_) {
+      if (upstream_request->createPerTryTimeoutOnRequestComplete()) {
+        upstream_request->setupPerTryTimeout();
+      }
+    }
+  }
+}
 ```
