@@ -224,8 +224,17 @@ Http::FilterHeadersStatus Filter::decodeHeaders(Http::RequestHeaderMap& headers,
                        route_stats_context_, config_.runtime_, config_.random_,
                        callbacks_->dispatcher(), config_.timeSource(), route_entry_->priority());
   // ...
+  // 根据“ *this” 信息创建一个心的UpstreamRequest实例
+  UpstreamRequestPtr upstream_request =
+      std::make_unique<UpstreamRequest>(*this, std::move(generic_conn_pool), can_send_early_data,
+                                        /*can_use_http3=*/true);
+  // todo?? 将新建的UpstreamRequest实例放到upstream_requests_的队列头
+  LinkedList::moveIntoList(std::move(upstream_request), upstream_requests_);
+  // 调用新建的 UpstreamRequest 的acceptHeadersFromRouter方法,这个方法会最终将请求发送给目的地
+  // 见下方 #ref upstream-request.md
+  upstream_requests_.front()->acceptHeadersFromRouter(end_stream);
   // 当已经到了请求的结束时,直接调用 onRequestComplete 完成请求
-  // todo onRequestComplete
+
   if (end_stream) {
     onRequestComplete();
   }
@@ -234,6 +243,9 @@ Http::FilterHeadersStatus Filter::decodeHeaders(Http::RequestHeaderMap& headers,
 }
 
 ```
+[UpstreamRequest](./upstream-request.md)
+
+
 
 ### decodeData
 ```cpp
@@ -325,7 +337,7 @@ void Filter::onRequestComplete() {
 
     // 遍历所有要发送给上游的request
     // 设置每个request的timeout
-    // todo 具体发送实在哪儿??
+    // todo 具体发送是在哪儿??
     for (auto& upstream_request : upstream_requests_) {
       if (upstream_request->createPerTryTimeoutOnRequestComplete()) {
         upstream_request->setupPerTryTimeout();
