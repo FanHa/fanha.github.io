@@ -224,7 +224,7 @@ Http::FilterHeadersStatus Filter::decodeHeaders(Http::RequestHeaderMap& headers,
                        route_stats_context_, config_.runtime_, config_.random_,
                        callbacks_->dispatcher(), config_.timeSource(), route_entry_->priority());
   // ...
-  // 根据“ *this” 信息创建一个心的UpstreamRequest实例
+  // 根据前面创建的连接池generic_conn_pool创建一个新的UpstreamRequest实例
   UpstreamRequestPtr upstream_request =
       std::make_unique<UpstreamRequest>(*this, std::move(generic_conn_pool), can_send_early_data,
                                         /*can_use_http3=*/true);
