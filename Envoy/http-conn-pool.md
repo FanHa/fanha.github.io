@@ -16,16 +16,15 @@ public:
                const Router::RouteEntry& route_entry,
                absl::optional<Envoy::Http::Protocol> downstream_protocol,
                Upstream::LoadBalancerContext* ctx) {
-    // 通过传进来的cluster实例的httpConnPool方法创建pool_data实例
+    // 再封装一层,通过传进来的thread_local_cluster实例的httpConnPool方法创建pool_data实例,数据最终留到这个pool_data里,上游回复也是从这个pool_data里通过回调传出来
     pool_data_ =
         thread_local_cluster.httpConnPool(route_entry.priority(), downstream_protocol, ctx);
   }
   ~HttpConnPool() override {
     // ...
   }
-  // 在连接池中创建一条新stream用来发送数据
+  // 创建一条新stream用来发送数据,传入UpstreamRequest实例,以便连接池做完了事后通知UpstreamReqeust
   void newStream(Router::GenericConnectionPoolCallbacks* callbacks) override;
-  bool cancelAnyPendingStream() override;
 
   // Http::ConnectionPool::Callbacks
   void onPoolFailure(ConnectionPool::PoolFailureReason reason,
@@ -48,6 +47,50 @@ protected:
   Router::GenericConnectionPoolCallbacks* callbacks_{};
 };
 ```
+
+
+# 逻辑
+## conn_pool_->newStream(this)
+举例假设upstream-request是http类型的
+```cpp
+// source/extensions/upstreams/http/http/upstream_request.cc
+void HttpConnPool::newStream(GenericConnectionPoolCallbacks* callbacks) {
+  // 这个callbacks暂时可以认为是UpstreamReqeust实例 #ref UpstreamRequest
+  // 连接池产生了一些事件后,通过这个callbacks调用UpstreamReqeust的回调方法(如,onPoolReady, upstreamToDownstream)
+  callbacks_ = callbacks;
+  // 调用poolData 的 newStream方法, 并且
+  // 1.把自己(*this)当成参数传进去,这样stream 在ready时会调用this的 onPoolReady
+  // 2.把callbacks->upstreamToDownstream回调传进去,收到上游回复数据时,通过这个回调将数据交由UpstreamReqeust实例处理
+  Envoy::Http::ConnectionPool::Cancellable* handle =
+      pool_data_.value().newStream(callbacks->upstreamToDownstream(), *this,
+                                   callbacks->upstreamToDownstream().upstreamStreamOptions());
+  if (handle) {
+    conn_pool_stream_handle_ = handle;
+  }
+}
+```
+[UpstreamRequest](./upstream-request.md)
+
+## onPoolReady
+本地pool_data实例在连接就绪时会调用这个回调
+```cpp
+// source/extensions/upstreams/http/http/upstream_request.cc
+void HttpConnPool::onPoolReady(Envoy::Http::RequestEncoder& request_encoder,
+                               Upstream::HostDescriptionConstSharedPtr host,
+                               StreamInfo::StreamInfo& info,
+                               absl::optional<Envoy::Http::Protocol> protocol) {
+  conn_pool_stream_handle_ = nullptr;
+  // 生成一个HttpUpstream实例,作为参数,回调‘UpstreamReqeust’实例的‘onPoolReady’方法,这样‘UpstreamRequest’实例就可以保留这个‘HttpUpstream’实例,调用‘HttpUpStream’实例的‘encodeXXXX’方法把下游传过来的数据发送出去
+  // #ref UpstreamRequest
+  auto upstream =
+      std::make_unique<HttpUpstream>(callbacks_->upstreamToDownstream(), &request_encoder);
+  callbacks_->onPoolReady(std::move(upstream), host,
+                          request_encoder.getStream().connectionLocalAddress(), info, protocol);
+}
+```
+[UpstreamRequest](./upstream-request.md)
+
+
 
 ## HttpPoolData
 ```cpp
@@ -88,35 +131,6 @@ private:
 };
 
 ```
-
-# 逻辑
-## newStream
-```cpp
-```
-
-
-# 代码
-## 
-```cpp
-// source/extensions/upstreams/http/http/upstream_request.h
-```
-### conn_pool_->newStream(this)
-举例假设upstream-request是http类型的
-```cpp
-// source/extensions/upstreams/http/http/upstream_request.cc
-void HttpConnPool::newStream(GenericConnectionPoolCallbacks* callbacks) {
-  callbacks_ = callbacks;
-  // 调用poolData 的 newStream方法创建一个handle,后续对这个新stream的处理都交由这个handle
-  Envoy::Http::ConnectionPool::Cancellable* handle =
-      // upstreamToDownstream变成了pool_data实例的response_decoder,后续收到了请求的回复会交由这个decoder处理
-      pool_data_.value().newStream(callbacks->upstreamToDownstream(), *this,
-                                   callbacks->upstreamToDownstream().upstreamStreamOptions());
-  if (handle) {
-    conn_pool_stream_handle_ = handle;
-  }
-}
-```
-
 ### HttpPoolData.newStream方法
 以HttpPoolData类型举例阐释newStream方法
 ```cpp
