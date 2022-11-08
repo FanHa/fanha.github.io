@@ -63,6 +63,7 @@ private:
 ## 创建UpstreamRequest
 ```cpp
 // source/common/router/upstream_request.cc
+// 创建UpstreamRequest时需要把routerFilter信息与conn_pool作为参数穿进实例
 UpstreamRequest::UpstreamRequest(RouterFilterInterface& parent,
                                  std::unique_ptr<GenericConnPool>&& conn_pool,
                                  bool can_send_early_data, bool can_use_http3)
