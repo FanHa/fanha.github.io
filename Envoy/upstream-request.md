@@ -116,9 +116,6 @@ void UpstreamRequest::acceptHeadersFromRouter(bool end_stream) {
 
   // 在与上游的连接池中根据‘this‘信息调用newStream方法创建新stream
   conn_pool_->newStream(this);
-  if (!allow_upstream_filters_) { // 实验功能点,暂时认为没有开启
-    return;
-  }
   // ...
 }
 ```
