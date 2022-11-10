@@ -218,7 +218,7 @@ Http::FilterHeadersStatus Filter::decodeHeaders(Http::RequestHeaderMap& headers,
   FilterUtility::setUpstreamScheme(
       headers, callbacks_->streamInfo().downstreamAddressProvider().sslConnection() != nullptr);
 
-  // 根据已有信息设置retry_state 状态信息
+  // 根据已有信息创建`retry_state`实例,后续用来做重试决定
   retry_state_ =
       createRetryState(route_entry_->retryPolicy(), headers, *cluster_, request_vcluster_,
                        route_stats_context_, config_.runtime_, config_.random_,
