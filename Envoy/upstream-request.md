@@ -25,6 +25,9 @@ public:
   void acceptTrailersFromRouter(Http::RequestTrailerMap& trailers);
   void acceptMetadataFromRouter(Http::MetadataMapPtr&& metadata_map_ptr);
   // ...
+  // 重置请求,可以用来在routerfilter判断需要retry时,调用这个 todo
+  void resetStream();
+
 
   // Http::StreamDecoder
   void decodeData(Buffer::Instance& data, bool end_stream) override;
