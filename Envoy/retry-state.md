@@ -131,6 +131,141 @@ private:
 ```
 
 # 实现
+## create 
+// source/common/router/retry_state_impl.cc
+```cpp
+std::unique_ptr<RetryStateImpl>
+RetryStateImpl::create(const RetryPolicy& route_policy, Http::RequestHeaderMap& request_headers,
+                       const Upstream::ClusterInfo& cluster, const VirtualCluster* vcluster,
+                       RouteStatsContextOptRef route_stats_context, Runtime::Loader& runtime,
+                       Random::RandomGenerator& random, Event::Dispatcher& dispatcher,
+                       TimeSource& time_source, Upstream::ResourcePriority priority) {
+  std::unique_ptr<RetryStateImpl> ret;
+
+  const bool conn_pool_new_stream_with_early_data_and_http3 =
+      Runtime::runtimeFeatureEnabled(Runtime::conn_pool_new_stream_with_early_data_and_http3);
+  // 只有在下游请求header中带有retry相关的信息或本地配置的route信息中有retry信息时才创建‘RetryStateImpl’实例
+  if (request_headers.EnvoyRetryOn() || request_headers.EnvoyRetryGrpcOn() ||
+      route_policy.retryOn()) {
+    ret.reset(new RetryStateImpl(route_policy, request_headers, cluster, vcluster,
+                                 route_stats_context, runtime, random, dispatcher, time_source,
+                                 priority, false, conn_pool_new_stream_with_early_data_and_http3));
+  }
+  // ...
+
+  // 移除掉下游请求头中的retry相关,不要把这些头继续发给上游了
+  request_headers.removeEnvoyRetryOn();
+  request_headers.removeEnvoyRetryGrpcOn();
+  request_headers.removeEnvoyMaxRetries();
+  request_headers.removeEnvoyHedgeOnPerTryTimeout();
+  request_headers.removeEnvoyRetriableHeaderNames();
+  request_headers.removeEnvoyRetriableStatusCodes();
+  request_headers.removeEnvoyUpstreamRequestPerTryTimeoutMs();
+
+  return ret;
+}
+
+```
+
+### RetryStateImpl
+```cpp
+RetryStateImpl::RetryStateImpl(const RetryPolicy& route_policy,
+                               Http::RequestHeaderMap& request_headers,
+                               const Upstream::ClusterInfo& cluster, const VirtualCluster* vcluster,
+                               RouteStatsContextOptRef route_stats_context,
+                               Runtime::Loader& runtime, Random::RandomGenerator& random,
+                               Event::Dispatcher& dispatcher, TimeSource& time_source,
+                               Upstream::ResourcePriority priority, bool auto_configured_for_http3,
+                               bool conn_pool_new_stream_with_early_data_and_http3)
+    : cluster_(cluster), vcluster_(vcluster), route_stats_context_(route_stats_context),
+      runtime_(runtime), random_(random), dispatcher_(dispatcher), time_source_(time_source),
+      retry_on_(route_policy.retryOn()), retries_remaining_(route_policy.numRetries()),
+      priority_(priority), retry_host_predicates_(route_policy.retryHostPredicates()),
+      retry_priority_(route_policy.retryPriority()),
+      retriable_status_codes_(route_policy.retriableStatusCodes()),
+      retriable_headers_(route_policy.retriableHeaders()),
+      reset_headers_(route_policy.resetHeaders()),
+      reset_max_interval_(route_policy.resetMaxInterval()),
+      auto_configured_for_http3_(auto_configured_for_http3),
+      conn_pool_new_stream_with_early_data_and_http3_(
+          conn_pool_new_stream_with_early_data_and_http3) {
+  // ...
+  // 设置retry的基础间隔时间(base_interval)
+  std::chrono::milliseconds base_interval(
+      runtime_.snapshot().getInteger("upstream.base_retry_backoff_ms", 25));
+  if (route_policy.baseInterval()) {
+    base_interval = *route_policy.baseInterval();
+  }
+
+  // 设置retry的最大间隔时间(max_interval)
+  std::chrono::milliseconds max_interval = base_interval * 10;
+  if (route_policy.maxInterval()) {
+    max_interval = *route_policy.maxInterval();
+  }
+
+  // retry 间隔时间生成器
+  backoff_strategy_ = std::make_unique<JitteredExponentialBackOffStrategy>(
+      base_interval.count(), max_interval.count(), random_);
+  // 一个host最多尝试多少次(host_selection_retry_max_attempts)
+  host_selection_max_attempts_ = route_policy.hostSelectionMaxAttempts();
+
+  // 合并配置的retryOn 与 通过下游头得到的retryOn
+  if (request_headers.EnvoyRetryOn()) {
+    retry_on_ |= parseRetryOn(request_headers.getEnvoyRetryOnValue()).first;
+  }
+  if (request_headers.EnvoyRetryGrpcOn()) {
+    retry_on_ |= parseRetryGrpcOn(request_headers.getEnvoyRetryGrpcOnValue()).first;
+  }
+
+  // route 策略里设置 retriable_request_headers 时,只有在下游请求头中带了这些header之一才会设置retry_on,不然就把所有retry_on设置清0
+  const auto& retriable_request_headers = route_policy.retriableRequestHeaders();
+  if (!retriable_request_headers.empty()) {
+    // If this route limits retries by request headers, make sure there is a match.
+    bool request_header_match = false;
+    for (const auto& retriable_header : retriable_request_headers) {
+      if (retriable_header->matchesHeaders(request_headers)) {
+        request_header_match = true;
+        break;
+      }
+    }
+
+    if (!request_header_match) {
+      retry_on_ = 0;
+    }
+  }
+  // 下游请求头带有envoy-max-retries头时,用这个值覆盖原本的本地设置
+  if (retry_on_ != 0 && request_headers.EnvoyMaxRetries()) {
+    uint64_t temp;
+    if (absl::SimpleAtoi(request_headers.getEnvoyMaxRetriesValue(), &temp)) {
+      // The max retries header takes precedence if set.
+      retries_remaining_ = temp;
+    }
+  }
+
+  // 下游请求头带有envoy-retriable-status-codes时,将这些值合并进本地的设置里
+  if (request_headers.EnvoyRetriableStatusCodes()) {
+    for (const auto& code :
+         StringUtil::splitToken(request_headers.getEnvoyRetriableStatusCodesValue(), ",")) {
+      unsigned int out;
+      if (absl::SimpleAtoi(code, &out)) {
+        retriable_status_codes_.emplace_back(out);
+      }
+    }
+  }
+
+  // 下游请求头带有 ‘x-envoy-retriable-header-names’ 时,将这些头合并入本地配置的 ‘retriable_headers_’
+  if (request_headers.EnvoyRetriableHeaderNames()) {
+    for (const auto& header_name : StringUtil::splitToken(
+             request_headers.EnvoyRetriableHeaderNames()->value().getStringView(), ",")) {
+      envoy::config::route::v3::HeaderMatcher header_matcher;
+      header_matcher.set_name(std::string(absl::StripAsciiWhitespace(header_name)));
+      retriable_headers_.emplace_back(
+          std::make_shared<Http::HeaderUtility::HeaderData>(header_matcher));
+    }
+  }
+}
+```
+
 ## shouldRetryHeaders
 通过上游`header`和下游`header`判断是否需要`retry`
 ```cpp
@@ -138,9 +273,7 @@ private:
 RetryStatus RetryStateImpl::shouldRetryHeaders(const Http::ResponseHeaderMap& response_headers,
                                                const Http::RequestHeaderMap& original_request,
                                                DoRetryHeaderCallback callback) {
-  // This may be overridden in wouldRetryFromHeaders().
-  bool disable_early_data = !conn_pool_new_stream_with_early_data_and_http3_;
-
+                                                // ...
   // 先判断从请求和返回头来看是否需要retry #ref wouldRetryFromHeaders
   const RetryDecision retry_decision =
       wouldRetryFromHeaders(response_headers, original_request, disable_early_data);
@@ -203,13 +336,7 @@ RetryStateImpl::wouldRetryFromHeaders(const Http::ResponseHeaderMap& response_he
             static_cast<Http::Code>(code) != Http::Code::TooEarly) {
           return RetryDecision::RetryWithBackoff;
         }
-        if (original_request.get(Http::Headers::get().EarlyData).empty()) {
-          // Retry if the downstream request wasn't received as early data. Otherwise, regardless if
-          // the request was sent as early data in upstream or not, don't retry. Instead, forward
-          // the response to downstream.
-          disable_early_data = true;
-          return RetryDecision::RetryImmediately;
-        }
+      // ...
       }
     }
   }
@@ -271,32 +398,21 @@ RetryStatus RetryStateImpl::shouldRetry(RetryDecision would_retry, DoRetryCallba
     return RetryStatus::No;
   }
 
-  // The request has exhausted the number of retries allotted to it by the retry policy configured
-  // (or the x-envoy-max-retries header).
+  // 判断设置的retry数是否已经到了
   if (retries_remaining_ == 0) {
-    cluster_.stats().upstream_rq_retry_limit_exceeded_.inc();
-    if (vcluster_) {
-      vcluster_->stats().upstream_rq_retry_limit_exceeded_.inc();
-    }
-    if (route_stats_context_.has_value()) {
-      route_stats_context_->stats().upstream_rq_retry_limit_exceeded_.inc();
-    }
+    // ...
     return RetryStatus::NoRetryLimitExceeded;
   }
 
   retries_remaining_--;
 
+  // 判断cluster的资源管理器是否允许再重试了
   if (!cluster_.resourceManager(priority_).retries().canCreate()) {
-    cluster_.stats().upstream_rq_retry_overflow_.inc();
-    if (vcluster_) {
-      vcluster_->stats().upstream_rq_retry_overflow_.inc();
-    }
-    if (route_stats_context_.has_value()) {
-      route_stats_context_->stats().upstream_rq_retry_overflow_.inc();
-    }
+    // ...
     return RetryStatus::NoOverflow;
   }
 
+  // ?? todo
   if (!runtime_.snapshot().featureEnabled("upstream.use_retry", 100)) {
     return RetryStatus::No;
   }
