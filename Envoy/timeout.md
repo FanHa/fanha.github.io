@@ -5,6 +5,44 @@
 # 序
 router filter 的decodeHeaders 在请求发送前会调用 FilterUtility:finalTimeout 方法计算一个timeout_值
 
+# 总结
+## 全局超时
+### 作用时间
+在envoy收到完整的下游请求时开始算(onRequestComplete),并设置回调(onResponseTimeout),超时就返回(其他正在进行中的上游请求都要clear,不再继续处理)
+### 相关设置
+- 初始化`timeout global`(为0)
+  - 如果`route`设置里没有`max_stream_duration`
+    - 如果是`grpc`请求 且 `route` 设置了`max_grpc_timeout`
+      - 如果请求头中有`grpc-timeout`
+        - `使用`(并根据offset和max值做调整)
+      - 如果没有`grpc-timeout`
+        - `使用`(并根据offset和max值做调整)
+    - 如果不是`grpc`请求 或者 `route`没有设置`max_grpc_timeout`
+      - `使用``route`设置的`timeout` 或 默认 15s
+  - 如果route设置里设置了`max_stream_duration`
+    - `使用` 0
+- 如果`route-filter`设置了`respect_expected_rq_timeout`
+  - 如果下游请求头设置了`x-envoy-expected-rq-timeout-ms`并且有效
+    - `使用`
+  - else 如果 下游请求头设置了`x-envoy-upstream-rq-timeout-ms`
+    - `使用` 并且remove掉这个头
+- else (即`route-filter`没有设置`respect_expected_rq_timeout`)
+  - `使用``x-envoy-upstream-rq-timeout-ms`的值并且remove掉这个头
+
+设置发给上游的头
+- `router filter`没有明确设置(suppress_envoy_headers)时,会在请求头里设置`x-envoy-expected-rq-timeout-ms`,值为`global_timeout-elapse_time`
+- 如果是grpc请求,且route没有设置max_stream_duration属性,且route设置了max_grpc_timeout,则设置一个`grpc-timeout`头,值为`global_timeout-elapse_time`
+
+
+
+todo grpc-timeout 会不会传递给上游
+
+
+## 发给上游的单个stream超时
+在onPoolReady, 请求开始发发向上游前开始计时(注:这是可能请求并没有完全从下游收完整)
+## perTry超时
+在onPoolReady后,且下游的请求已经全部接受完毕后才开始计时第一次
+
 # RouterFilter 中与timeout相关的代码
 ```cpp
 // source/common/router/router.cc
@@ -25,6 +63,7 @@ router filter 的decodeHeaders 在请求发送前会调用 FilterUtility:finalTi
     headers.removeEnvoyUpstreamStreamDurationMs();
   }
 
+  // timeout_response_code_(本来默认504)
   // 如果收到了下游传来的‘x-envoy-upstream-rq-timeout-alt-response‘,将timeout_response_code_ 设为204
   // todo 哪里用到了
   if (headers.EnvoyUpstreamRequestTimeoutAltResponse()) {
@@ -59,7 +98,7 @@ FilterUtility::finalTimeout(const RouteEntry& route, Http::RequestHeaderMap& req
                             bool per_try_timeout_hedging_enabled,
                             bool respect_expected_rq_timeout) {
   TimeoutData timeout;
-  if (!route.usingNewTimeouts()) { // 判断是否设置了route的 max_stream_timeout{} 系列参数,没有设置才会走下面的逻辑
+  if (!route.usingNewTimeouts()) { // 判断是否设置了route的 max_stream_duration 系列参数,没有设置才会走下面的逻辑
     if (grpc_request && route.maxGrpcTimeout()) { // 如果请求是grpc 且 route设置了max_grpc_timeout值
       const std::chrono::milliseconds max_grpc_timeout = route.maxGrpcTimeout().value();
       // 从下游请求头中取出 grpc-timeout值
@@ -109,8 +148,8 @@ FilterUtility::finalTimeout(const RouteEntry& route, Http::RequestHeaderMap& req
         request_headers.removeEnvoyUpstreamRequestTimeoutMs();
       }
     }
-  } else {
-    // router filter 没有设置‘respect_expected_rq_timeout’时,取‘x-envoy-expected-rq-timeout-ms’头的值设置全局timeout,并remove该头不再传递给下一跳
+  } else { // router filter 没有设置‘respect_expected_rq_timeout’时
+    // 取‘x-envoy-expected-rq-timeout-ms’头的值设置全局timeout,并remove该头不再传递给下一跳
     const Http::HeaderEntry* header_timeout_entry = request_headers.EnvoyUpstreamRequestTimeoutMs();
 
     if (header_timeout_entry) {
@@ -175,12 +214,12 @@ void FilterUtility::setTimeoutHeaders(uint64_t elapsed_time,
         expected_timeout = std::min(expected_timeout, global_timeout - elapsed_time);
       }
     }
-    // router filter没有明确设置不要传x-envoy-xxxx头时,会在请求头里设置x-envoy-expected-rq-timeout-ms
+    // router filter没有明确设置(suppress_envoy_headers)不要传x-envoy-xxxx头时,会在请求头里设置x-envoy-expected-rq-timeout-ms
     if (insert_envoy_expected_request_timeout_ms) {
       request_headers.setEnvoyExpectedRequestTimeoutMs(expected_timeout);
     }
 
-    // 如果是grpc请求,且route没有设置新的max_stream_timeout属性,则将exptected_timeout值也设置到头grpc-timeout里
+    // 如果是grpc请求,且route没有设置max_stream_duration属性,则将exptected_timeout值也设置到头grpc-timeout里
     if (grpc_request && !route.usingNewTimeouts() && route.maxGrpcTimeout()) {
       Grpc::Common::toGrpcTimeout(std::chrono::milliseconds(expected_timeout), request_headers);
     }
@@ -245,11 +284,144 @@ void Filter::onRequestComplete() {
       response_timeout_->enableTimer(timeout_.global_timeout_);
     }
 
+    // 这里给每个请求加上perTryTimeout以及回调
     for (auto& upstream_request : upstream_requests_) {
       if (upstream_request->createPerTryTimeoutOnRequestComplete()) {
         upstream_request->setupPerTryTimeout();
       }
     }
   }
+}
+```
+
+## onXxxxxxTimeout 回调
+### onResponseTimeout
+在下游请求已经全部收到时开始计时
+```cpp
+// source/common/router/router.cc
+void Filter::onResponseTimeout() {
+
+  // 遍历所有还没有结果的upstream请求
+  while (!upstream_requests_.empty()) {
+    // 从list中移除
+    UpstreamRequestPtr upstream_request =
+        upstream_requests_.back()->removeFromList(upstream_requests_);
+    // reset请求
+    upstream_request->resetStream();
+  }
+  // #ref onUpstreamTimeoutAbort
+  onUpstreamTimeoutAbort(StreamInfo::ResponseFlag::UpstreamRequestTimeout,
+                         StreamInfo::ResponseCodeDetails::get().ResponseTimeout);
+}
+```
+#### onUpstreamTimeoutAbort
+```cpp
+// source/common/router/router.cc
+void Filter::onUpstreamTimeoutAbort(StreamInfo::ResponseFlag response_flags,
+                                    absl::string_view details) {
+  // ...
+  const absl::string_view body =
+      timeout_response_code_ == Http::Code::GatewayTimeout ? "upstream request timeout" : "";
+  onUpstreamAbort(timeout_response_code_, response_flags, body, false, details);
+}
+
+void Filter::onUpstreamAbort(Http::Code code, StreamInfo::ResponseFlag response_flags,
+                             absl::string_view body, bool dropped, absl::string_view details) {
+  // If we have not yet sent anything downstream, send a response with an appropriate status code.
+  // Otherwise just reset the ongoing response.
+  callbacks_->streamInfo().setResponseFlag(response_flags);
+  // 清除‘retry’设置 todo
+  cleanup();
+  // 返回给下游
+  callbacks_->sendLocalReply(
+      code, body,
+      [dropped, this](Http::ResponseHeaderMap& headers) {
+        if (dropped && !config_.suppress_envoy_headers_) {
+          headers.addReference(Http::Headers::get().EnvoyOverloaded,
+                               Http::Headers::get().EnvoyOverloadedValues.True);
+        }
+        modify_headers_(headers);
+      },
+      absl::nullopt, details);
+}
+```
+
+### onStreamMaxDurationReached
+// 从一个发给上游的请求开始发送给上游前设置的到期
+```cpp
+// source/common/router/router.cc
+void Filter::onStreamMaxDurationReached(UpstreamRequest& upstream_request) {
+  // 重置upstreamRequest
+  upstream_request.resetStream();
+
+  // 查看‘retry’规则,
+  // 如果还能retry则 todo
+  // 如果不能retry,则需要把结果返回给下游了
+  if (maybeRetryReset(Http::StreamResetReason::LocalReset, upstream_request)) {
+    return;
+  }
+
+  // 清除当条upstream_request 以及与ta相关的retry设置
+  upstream_request.removeFromList(upstream_requests_);
+  cleanup();
+
+  callbacks_->streamInfo().setResponseFlag(
+      StreamInfo::ResponseFlag::UpstreamMaxStreamDurationReached);
+  // Grab the const ref to call the const method of StreamInfo.
+  const auto& stream_info = callbacks_->streamInfo();
+  const bool downstream_decode_complete =
+      stream_info.downstreamTiming().has_value() &&
+      stream_info.downstreamTiming().value().get().lastDownstreamRxByteReceived().has_value();
+
+  // 返回给下游
+  callbacks_->sendLocalReply(
+      Http::Utility::maybeRequestTimeoutCode(downstream_decode_complete),
+      "upstream max stream duration reached", modify_headers_, absl::nullopt,
+      StreamInfo::ResponseCodeDetails::get().UpstreamMaxStreamDurationReached);
+}
+
+```
+
+### onPerTryTimeout
+```cpp
+// source/common/router/upstream_request.cc
+void UpstreamRequest::onPerTryTimeout() {
+  if (!parent_.downstreamResponseStarted()) {
+    // 如果router还没开始给下游返回信息,则调用router(也就是parent_)的‘onPerTryTimeout’方法
+
+    stream_info_.setResponseFlag(StreamInfo::ResponseFlag::UpstreamRequestTimeout);
+    parent_.onPerTryTimeout(*this);
+  } else {   // 如果router已经开始给下游发返回信息了,则不需要做什么了
+
+    ENVOY_STREAM_LOG(debug,
+                     "ignored upstream per try timeout due to already started downstream response",
+                     *parent_.callbacks());
+  }
+}
+// ...
+void Filter::onPerTryTimeout(UpstreamRequest& upstream_request) {
+  onPerTryTimeoutCommon(upstream_request, cluster_->stats().upstream_rq_per_try_timeout_,
+                        StreamInfo::ResponseCodeDetails::get().UpstreamPerTryTimeout);
+}
+
+// ...
+void Filter::onPerTryTimeoutCommon(UpstreamRequest& upstream_request, Stats::Counter& error_counter,
+                                   const std::string& response_code_details) {
+  // 清理该请求的信息
+  upstream_request.resetStream();
+  // 更新OutlierDetection todo 引用
+  updateOutlierDetection(Upstream::Outlier::Result::LocalOriginTimeout, upstream_request,
+                         absl::optional<uint64_t>(enumToInt(timeout_response_code_)));
+
+  // 判断是否还能retry,能则return #ref retry-state todo
+  if (maybeRetryReset(Http::StreamResetReason::LocalReset, upstream_request)) {
+    return;
+  }
+  // 不能retry了则需要做些统计并告知下游
+  chargeUpstreamAbort(timeout_response_code_, false, upstream_request);
+
+  // 清除upstream_request信息,调用回调返回超时结果给下游
+  upstream_request.removeFromList(upstream_requests_);
+  onUpstreamTimeoutAbort(StreamInfo::ResponseFlag::UpstreamRequestTimeout, response_code_details);
 }
 ```
