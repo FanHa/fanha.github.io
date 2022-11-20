@@ -34,10 +34,6 @@ router filter 的decodeHeaders 在请求发送前会调用 FilterUtility:finalTi
 - 如果是grpc请求,且route没有设置max_stream_duration属性,且route设置了max_grpc_timeout,则设置一个`grpc-timeout`头,值为`global_timeout-elapse_time`
 
 
-
-todo grpc-timeout 会不会传递给上游
-
-
 ## 发给上游的单个stream超时 todo
 在onPoolReady, 请求开始发发向上游前开始计时(注:这是可能请求并没有完全从下游收完整)
 ## perTry超时 todo
