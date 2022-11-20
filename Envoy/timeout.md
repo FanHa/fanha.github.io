@@ -38,9 +38,9 @@ router filter 的decodeHeaders 在请求发送前会调用 FilterUtility:finalTi
 todo grpc-timeout 会不会传递给上游
 
 
-## 发给上游的单个stream超时
+## 发给上游的单个stream超时 todo
 在onPoolReady, 请求开始发发向上游前开始计时(注:这是可能请求并没有完全从下游收完整)
-## perTry超时
+## perTry超时 todo
 在onPoolReady后,且下游的请求已经全部接受完毕后才开始计时第一次
 
 # RouterFilter 中与timeout相关的代码
