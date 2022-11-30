@@ -33,7 +33,7 @@ func (c *backupController) processBackup(key string) error {
 	// 做些检测工作,判断’backup‘资源的各个参数是否正确
 	request := c.prepareBackupRequest(original)
 
-    // 更具错误情况更新 Phase,这里的更新的是本地副本中的状态,还没patch到k8s服务上
+    // 根据错误情况更新 Phase,这里的更新的是本地副本中的状态,还没patch到k8s服务上
 	if len(request.Status.ValidationErrors) > 0 {
         // 更新
 		request.Status.Phase = velerov1api.BackupPhaseFailedValidation
@@ -64,20 +64,13 @@ func (c *backupController) processBackup(key string) error {
 	c.backupTracker.Add(request.Namespace, request.Name)
 	defer c.backupTracker.Delete(request.Namespace, request.Name)
 
-	log.Debug("Running backup")
 
 	backupScheduleName := request.GetLabels()[velerov1api.ScheduleNameLabel]
 	c.metrics.RegisterBackupAttempt(backupScheduleName)
 
 	// 开始运行 #ref runBackup
 	if err := c.runBackup(request); err != nil {
-		// even though runBackup sets the backup's phase prior
-		// to uploading artifacts to object storage, we have to
-		// check for an error again here and update the phase if
-		// one is found, because there could've been an error
-		// while uploading artifacts to object storage, which would
-		// result in the backup being Failed.
-		log.WithError(err).Error("backup failed")
+		// ...
 		request.Status.Phase = velerov1api.BackupPhaseFailed
 		request.Status.FailureReason = err.Error()
 	}
@@ -122,17 +115,15 @@ func (c *backupController) runBackup(backup *pkgbackup.Request) error {
 
 	backupLog := logger.WithField(Backup, kubeutil.NamespaceAndName(backup))
 
-	backupLog.Info("Setting up backup temp file")
     // 创建备份文件
 	backupFile, err := ioutil.TempFile("", "")
 	// ...
 
-	backupLog.Info("Setting up plugin manager")
 	pluginManager := c.newPluginManager(backupLog)
 	defer pluginManager.CleanupClients()
 
-	backupLog.Info("Getting backup item actions")
-	actions, err := pluginManager.GetBackupItemActions()
+    // todo 用什么方法获取所有k8s资源到本地并存好
+    actions, err := pluginManager.GetBackupItemActions()
 	if err != nil {
 		return err
 	}
@@ -176,7 +167,10 @@ func (c *backupController) runBackup(backup *pkgbackup.Request) error {
 ```
 
 #### BackupWithResolvers
-从集群
+从集群中获取备份资源,并格式化保存到本地文件
+- 入参
+    - backupRequest 备份的过滤条件
+    - backupFile  资源解析后需要通过这个io.Writer写到对应的文件中
 ```go
 // pkg/backup/backup.go
 func (kb *kubernetesBackupper) BackupWithResolvers(log logrus.FieldLogger,
@@ -192,12 +186,7 @@ func (kb *kubernetesBackupper) BackupWithResolvers(log logrus.FieldLogger,
 	tw := tar.NewWriter(gzippedData)
 	defer tw.Close()
 
-	log.Info("Writing backup version file")
-	if err := kb.writeBackupVersion(tw); err != nil {
-		return errors.WithStack(err)
-	}
-
-    
+	// ...
 	backupRequest.NamespaceIncludesExcludes = getNamespaceIncludesExcludes(backupRequest.Backup)
 
 	backupRequest.ResourceIncludesExcludes = collections.GetResourceIncludesExcludes(kb.discoveryHelper, backupRequest.Spec.IncludedResources, backupRequest.Spec.ExcludedResources)
@@ -222,7 +211,7 @@ func (kb *kubernetesBackupper) BackupWithResolvers(log logrus.FieldLogger,
 		dir:                   tempDir,
 		pageSize:              kb.clientPageSize,
 	}
-    // 获取所有要备份的资源
+    // 从k8s集群获取所有要备份的资源,按照资源类型整理好
 	items := collector.getAllItems()
     // ...
     // 更新本地Backup实例中的 totalItem信息
@@ -284,7 +273,7 @@ func (kb *kubernetesBackupper) BackupWithResolvers(log logrus.FieldLogger,
 	totalItems := len(items)
 
 	for i, item := range items {
-        // 把从临时文件获取的item信息格式化存储到要发给远端存储的文件中
+        // 把从临时文件获取的item信息格式化存储到本地临时文件中,每个item就是一个资源类型
 		func() {
 			var unstructured unstructured.Unstructured
 
