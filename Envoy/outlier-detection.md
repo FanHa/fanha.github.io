@@ -5,7 +5,7 @@
 	* 3.1. [`putHttpResponseCode` 用于收到http(或grpc)回复header时](#putHttpResponseCodehttpgrpcheader)
 		* 3.1.1. [`onUpstreamHeaders` 收到上游回复header时触发](#onUpstreamHeadersheader)
 	* 3.2. [`putResult`用于本地事件产生时](#putResult)
-		* 3.2.1. [`UpstreamRequest::onPoolReady`连接初始化好时](#UpstreamRequest::onPoolReady)
+		* 3.2.1. [`UpstreamRequest onPoolReady`连接初始化好时](#UpstreamRequestonPoolReady)
 		* 3.2.2. [`router filter`在各种本地报错时触发`putResult`方法](#routerfilterputResult)
 		* 3.2.3. [其他extension 如`dubbo_proxy`,`redis_proxy`等也会触发`putResult`方法更新统计信息,暂不深入](#extensiondubbo_proxyredis_proxyputResult)
 	* 3.3. [`putResponseTime` 用于上游回复完成时](#putResponseTime)
@@ -81,7 +81,7 @@ void Filter::onUpstreamHeaders(uint64_t response_code, Http::ResponseHeaderMapPt
                                }
 ```
 ###  3.2. <a name='putResult'></a>`putResult`用于本地事件产生时
-####  3.2.1. <a name='UpstreamRequest::onPoolReady'></a>`UpstreamRequest::onPoolReady`连接初始化好时
+####  3.2.1. <a name='UpstreamRequestonPoolReady'></a>`UpstreamRequest onPoolReady`连接初始化好时
 ```cpp
 // source/common/router/upstream_request.cc
 void UpstreamRequest::onPoolReady(
