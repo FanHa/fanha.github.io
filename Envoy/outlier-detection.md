@@ -1,22 +1,22 @@
 <!-- vscode-markdown-toc -->
 * 1. [版本](#)
 * 2. [序](#-1)
-* 3. [接口](#-1)
-	* 3.1. [putHttpResponseCode 触发的地方](#putHttpResponseCode)
-		* 3.1.1. [onUpstreamHeaders 收到上游回复header时触发](#onUpstreamHeadersheader)
-	* 3.2. [putResult 触发的地方](#putResult)
-		* 3.2.1. [UpstreamRequest 连接初始化好时](#UpstreamRequest)
-		* 3.2.2. [router filter在各种本地报错时触发putResult方法](#routerfilterputResult)
+* 3. [触发统计信息的接口(Interface)](#Interface)
+	* 3.1. [`putHttpResponseCode` 用于收到http(或grpc)回复header时](#putHttpResponseCodehttpgrpcheader)
+		* 3.1.1. [`onUpstreamHeaders` 收到上游回复header时触发](#onUpstreamHeadersheader)
+	* 3.2. [`putResult`用于本地事件产生时](#putResult)
+		* 3.2.1. [`UpstreamRequest::onPoolReady`连接初始化好时](#UpstreamRequest::onPoolReady)
+		* 3.2.2. [`router filter`在各种本地报错时触发`putResult`方法](#routerfilterputResult)
 		* 3.2.3. [其他extension 如`dubbo_proxy`,`redis_proxy`等也会触发`putResult`方法更新统计信息,暂不深入](#extensiondubbo_proxyredis_proxyputResult)
-	* 3.3. [putResponseTime 使用的地方](#putResponseTime)
-		* 3.3.1. [在完整收到上游回复时触发](#-1)
-* 4. [核心代码逻辑](#-1)
-	* 4.1. [HostMonitor](#HostMonitor)
-		* 4.1.1. [putHttpResponseCode](#putHttpResponseCode-1)
-		* 4.1.2. [putResult](#putResult-1)
-	* 4.2. [detector](#detector)
-		* 4.2.1. [create创建一个detector](#createdetector)
-		* 4.2.2. [onConsecutive5xx 触发一个host的‘连续5xx’异常报告](#onConsecutive5xxhost5xx)
+	* 3.3. [`putResponseTime` 用于上游回复完成时](#putResponseTime)
+		* 3.3.1. [`onUpstreamComplete`在完整收到上游回复时触发](#onUpstreamComplete)
+* 4. [核心代码逻辑(Implement)](#Implement)
+	* 4.1. [`DetectorHostMonitorImpl`](#DetectorHostMonitorImpl)
+		* 4.1.1. [`putHttpResponseCode`](#putHttpResponseCode)
+		* 4.1.2. [`putResult`](#putResult-1)
+	* 4.2. [DetectorImpl](#DetectorImpl)
+		* 4.2.1. [`create`方法创建一个detector](#createdetector)
+		* 4.2.2. [`onConsecutive5xx` 触发一个host的‘连续5xx’异常报告](#onConsecutive5xxhost5xx)
 
 <!-- vscode-markdown-toc-config
 	numbering=true
@@ -32,7 +32,7 @@ outlier_detection 用来配置envoy 的 cluster里的host的检测机制,配置�
 >> 注: istio 的 DestinationRule的Subset里的outlier配置,最终也是变成了envoy里的cluster outlier配置
 
 
-##  3. <a name='-1'></a>接口
+##  3. <a name='Interface'></a>触发统计信息的接口(Interface)
 被监控的上游cluster立的host都有一个对应的`DetectorHostMonitorImpl`实例
 ```cpp
 // source/common/upstream/outlier_detection_impl.h
@@ -47,8 +47,8 @@ public:
 }
 ```
 
-###  3.1. <a name='putHttpResponseCode'></a>putHttpResponseCode 触发的地方
-####  3.1.1. <a name='onUpstreamHeadersheader'></a>onUpstreamHeaders 收到上游回复header时触发
+###  3.1. <a name='putHttpResponseCodehttpgrpcheader'></a>`putHttpResponseCode` 用于收到http(或grpc)回复header时
+####  3.1.1. <a name='onUpstreamHeadersheader'></a>`onUpstreamHeaders` 收到上游回复header时触发
 ```cpp
 // source/common/router/router.cc
 void Filter::onUpstreamHeaders(uint64_t response_code, Http::ResponseHeaderMapPtr&& headers,
@@ -80,8 +80,8 @@ void Filter::onUpstreamHeaders(uint64_t response_code, Http::ResponseHeaderMapPt
   // ...
                                }
 ```
-###  3.2. <a name='putResult'></a>putResult 触发的地方
-####  3.2.1. <a name='UpstreamRequest'></a>UpstreamRequest 连接初始化好时
+###  3.2. <a name='putResult'></a>`putResult`用于本地事件产生时
+####  3.2.1. <a name='UpstreamRequest::onPoolReady'></a>`UpstreamRequest::onPoolReady`连接初始化好时
 ```cpp
 // source/common/router/upstream_request.cc
 void UpstreamRequest::onPoolReady(
@@ -94,7 +94,7 @@ void UpstreamRequest::onPoolReady(
 }
 ```
 
-####  3.2.2. <a name='routerfilterputResult'></a>router filter在各种本地报错时触发putResult方法
+####  3.2.2. <a name='routerfilterputResult'></a>`router filter`在各种本地报错时触发`putResult`方法
 #####  2.2.1. <a name=''></a>封装
 `router filter` 对`putResult`的封装,只是验证了一下host是否存在,因为有些错误与host无关
 ```cpp
@@ -107,8 +107,7 @@ void Filter::updateOutlierDetection(Upstream::Outlier::Result result,
   }
 }
 ```
-#####  2.2.2. <a name='onResponseTimeout'></a>onResponseTimeout
-在发往上游的请求超时时触发
+#####  2.2.2. <a name='onResponseTimeout'></a>`onResponseTimeout`在发往上游的请求超时时触发
 ```cpp
 // source/common/router/router.cc
 void Filter::onResponseTimeout() {
@@ -131,8 +130,7 @@ void Filter::onResponseTimeout() {
 }
 ```
 
-#####  2.2.3. <a name='onPerTryTimeoutCommon'></a>onPerTryTimeoutCommon
-在单次发往上游的请求失败时触发
+#####  2.2.3. <a name='onPerTryTimeoutCommon'></a>`onPerTryTimeoutCommon`在单次发往上游的请求失败时触发
 ```cpp
 // source/common/router/router.cc
 void Filter::onPerTryTimeoutCommon(UpstreamRequest& upstream_request, Stats::Counter& error_counter,
@@ -145,8 +143,7 @@ void Filter::onPerTryTimeoutCommon(UpstreamRequest& upstream_request, Stats::Cou
   // ...
 }
 ```
-#####  2.2.4. <a name='onUpstreamReset'></a>onUpstreamReset
-当连接因为各种原因被重置时触发
+#####  2.2.4. <a name='onUpstreamReset'></a>`onUpstreamReset`当连接因为各种原因被重置时触发
 ```cpp
 // source/common/router/router.cc
 void Filter::onUpstreamReset(Http::StreamResetReason reset_reason,
@@ -163,8 +160,8 @@ void Filter::onUpstreamReset(Http::StreamResetReason reset_reason,
 
 ####  3.2.3. <a name='extensiondubbo_proxyredis_proxyputResult'></a>其他extension 如`dubbo_proxy`,`redis_proxy`等也会触发`putResult`方法更新统计信息,暂不深入
 
-###  3.3. <a name='putResponseTime'></a>putResponseTime 使用的地方
-####  3.3.1. <a name='-1'></a>在完整收到上游回复时触发
+###  3.3. <a name='putResponseTime'></a>`putResponseTime` 用于上游回复完成时
+####  3.3.1. <a name='onUpstreamComplete'></a>`onUpstreamComplete`在完整收到上游回复时触发
 ```cpp
 void Filter::onUpstreamComplete(UpstreamRequest& upstream_request) {
   // ...
@@ -178,9 +175,9 @@ void Filter::onUpstreamComplete(UpstreamRequest& upstream_request) {
 
 ```
 
-##  4. <a name='-1'></a>核心代码逻辑
-###  4.1. <a name='HostMonitor'></a>HostMonitor
-####  4.1.1. <a name='putHttpResponseCode-1'></a>putHttpResponseCode
+##  4. <a name='Implement'></a>核心代码逻辑(Implement)
+###  4.1. <a name='DetectorHostMonitorImpl'></a>`DetectorHostMonitorImpl`
+####  4.1.1. <a name='putHttpResponseCode'></a>`putHttpResponseCode`
 ```cpp
 // source/common/upstream/outlier_detection_impl.cc
 void DetectorHostMonitorImpl::putHttpResponseCode(uint64_t response_code) {
@@ -210,7 +207,7 @@ void DetectorHostMonitorImpl::putHttpResponseCode(uint64_t response_code) {
   }
 }
 ```
-####  4.1.2. <a name='putResult-1'></a>putResult
+####  4.1.2. <a name='putResult-1'></a>`putResult`
 ```cpp
 // source/common/upstream/outlier_detection_impl.cc
 void DetectorHostMonitorImpl::putResult(Result result, absl::optional<uint64_t> code) {
@@ -218,7 +215,7 @@ void DetectorHostMonitorImpl::putResult(Result result, absl::optional<uint64_t> 
   put_result_func_(this, result, code);
 }
 ```
-#####  4.2.1. <a name='putResultWithLocalExternalSplit'></a>putResultWithLocalExternalSplit
+#####  4.2.1. <a name='putResultWithLocalExternalSplit'></a>`putResultWithLocalExternalSplit`
 设置了本地事件与上游回复处理分离时
 ```cpp
 // source/common/upstream/outlier_detection_impl.cc
@@ -245,7 +242,7 @@ void DetectorHostMonitorImpl::putResultWithLocalExternalSplit(Result result,
   }
 }
 ```
-#####  4.2.2. <a name='putResultNoLocalExternalSplit'></a>putResultNoLocalExternalSplit
+#####  4.2.2. <a name='putResultNoLocalExternalSplit'></a>`putResultNoLocalExternalSplit`
 设置了本地事件与上游回复处理不分离时
 ```cpp
 // source/common/upstream/outlier_detection_impl.cc
@@ -266,8 +263,8 @@ void DetectorHostMonitorImpl::putResultNoLocalExternalSplit(Result result,
 }
 ```
 
-###  4.2. <a name='detector'></a>detector
-####  4.2.1. <a name='createdetector'></a>create创建一个detector
+###  4.2. <a name='DetectorImpl'></a>DetectorImpl
+####  4.2.1. <a name='createdetector'></a>`create`方法创建一个detector
 - 输入
   - cluster 目标集群
   - config 配置
@@ -318,7 +315,7 @@ void DetectorImpl::initialize(const Cluster& cluster) {
 }
 ```
 
-####  4.2.2. <a name='onConsecutive5xxhost5xx'></a>onConsecutive5xx 触发一个host的‘连续5xx’异常报告
+####  4.2.2. <a name='onConsecutive5xxhost5xx'></a>`onConsecutive5xx` 触发一个host的‘连续5xx’异常报告
 ```cpp
 // source/common/upstream/outlier_detection_impl.cc
 void DetectorImpl::onConsecutive5xx(HostSharedPtr host) {
