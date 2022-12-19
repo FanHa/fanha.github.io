@@ -20,6 +20,7 @@ ZoneAwareLoadBalancer 使envoy可以把流量优先转发到同region同zone的�
 - RandomLoadBalancer
 - RoundRobinLoadBalancerBase
 - LeastRequestLoadBalancer
+
 ![Image](resource/ZoneAwareLoadBalancerBase.drawio.svg)
 
 # 源码逻辑
