@@ -47,7 +47,7 @@ public:
 }
 ```
 
-###  3.1. <a name='putHttpResponseCodehttpgrpcheader'></a>`putHttpResponseCode` 用于收到http(或grpc)回复header时
+###  3.1. <a name='putHttpResponseCodehttpgrpcheader'></a>`putHttpResponseCode` 统计收到的上游http回复状态码
 ####  3.1.1. <a name='onUpstreamHeadersheader'></a>`onUpstreamHeaders` 收到上游回复header时触发
 ```cpp
 // source/common/router/router.cc
@@ -80,7 +80,7 @@ void Filter::onUpstreamHeaders(uint64_t response_code, Http::ResponseHeaderMapPt
   // ...
                                }
 ```
-###  3.2. <a name='putResult'></a>`putResult`用于本地事件产生时
+###  3.2. <a name='putResult'></a>`putResult`统计本地事件
 ####  3.2.1. <a name='UpstreamRequestonPoolReady'></a>`UpstreamRequest onPoolReady`连接初始化好时
 ```cpp
 // source/common/router/upstream_request.cc
@@ -95,7 +95,7 @@ void UpstreamRequest::onPoolReady(
 ```
 
 ####  3.2.2. <a name='routerfilterputResult'></a>`router filter`在各种本地报错时触发`putResult`方法
-#####  2.2.1. <a name=''></a>封装
+#####  2.2.1. <a name=''></a>`updateOutlierDetection`封装`putResult`
 `router filter` 对`putResult`的封装,只是验证了一下host是否存在,因为有些错误与host无关
 ```cpp
 // source/common/router/router.cc
