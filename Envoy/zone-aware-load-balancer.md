@@ -1,11 +1,18 @@
+
 - [版本](#版本)
 - [序](#序)
-- [与`ZoneAwareLoadBalancerBase`有关的的lb](#与zoneawareloadbalancerbase有关的的lb)
+  - [与`ZoneAwareLoadBalancerBase`有关的的lb关系](#与zoneawareloadbalancerbase有关的的lb关系)
+  - [host保存结构](#host保存结构)
+    - [PrioritySet todo](#priorityset-todo)
+    - [HostSet todo](#hostset-todo)
+    - [HostsPerlocality todo](#hostsperlocality-todo)
+    - [HostVector todo](#hostvector-todo)
 - [源码逻辑](#源码逻辑)
   - [接口](#接口)
   - [实现](#实现)
     - [RoundRobinLoadBalancer 创建](#roundrobinloadbalancer-创建)
-    - [ChooseHost todo](#choosehost-todo)
+    - [ChooseHost](#choosehost)
+      - [hostSourceToUse](#hostsourcetouse)
     - [host\_set的更新 todo](#host_set的更新-todo)
 
 
@@ -16,12 +23,30 @@
 # 序
 ZoneAwareLoadBalancer 使envoy可以把流量优先转发到同region同zone的服务,减少网络损耗
 
-# 与`ZoneAwareLoadBalancerBase`有关的的lb
+## 与`ZoneAwareLoadBalancerBase`有关的的lb关系
 - RandomLoadBalancer
 - RoundRobinLoadBalancerBase
 - LeastRequestLoadBalancer
 
-![Image](resource/ZoneAwareLoadBalancerBase.drawio.svg)
+![ZoneAwareLoadBalancerBase](resource/ZoneAwareLoadBalancerBase.drawio.svg)
+
+## host保存结构
+- 一个cluster拥有了一个`PrioriySet`
+- 一个`PrioritySet`拥有若干个优先级不同的`HostSet`
+- 一个`HostSet`拥有不同种类的`HostVector`或`HostsPerLocality`
+  - SourceType::AllHosts
+  - SourceType::HealthyHosts
+  - SourceType::DegradedHosts
+  - SourceType::LocalityHealthyHosts(`HostsPerLocality`)
+  - SourceType::LocalityDegradedHosts(`HostsPerLocality`)
+- `HostsPerLocality`中有若干个优先级不同的`HostVector`
+- `HostVector`可以认为是一个host数组
+
+![PriorityHost](resource/PriorityHost.drawio.svg)
+### PrioritySet todo
+### HostSet todo
+### HostsPerlocality todo
+### HostVector todo
 
 # 源码逻辑
 以 `RoundRobinLoadBalancerBase`为例子
@@ -174,5 +199,102 @@ void refreshHostSource(const HostsSource& source) override {
   }
 
 ```
-### ChooseHost todo
+### ChooseHost
+lb通过`chooseHost`方法根据`context`挑选出目标`host`
+```cpp
+// source/common/upstream/load_balancer_impl.cc
+HostConstSharedPtr ZoneAwareLoadBalancerBase::chooseHost(LoadBalancerContext* context) {
+  // todo
+  HostConstSharedPtr host = LoadBalancerContextBase::selectOverrideHost(
+      cross_priority_host_map_.get(), override_host_status_, context);
+  if (host != nullptr) {
+    return host;
+  }
+
+  const size_t max_attempts = context ? context->hostSelectionRetryCount() + 1 : 1;
+  for (size_t i = 0; i < max_attempts; ++i) {
+    // #ref chooseHostOnce
+    host = chooseHostOnce(context);
+
+    // If host selection failed or the host is accepted by the filter, return.
+    // Otherwise, try again.
+    // Note: in the future we might want to allow retrying when chooseHostOnce returns nullptr.
+    if (!host || !context || !context->shouldSelectAnotherHost(*host)) {
+      return host;
+    }
+  }
+
+  // If we didn't find anything, return the last host.
+  return host;
+}
+
+HostConstSharedPtr EdfLoadBalancerBase::chooseHostOnce(LoadBalancerContext* context) {
+  // 调用hostSourceToUse方法根据context得到一个‘HostSource’结构实例,后面需要根据这个结构实例的信息确认从哪个具体HostVector里获取host
+  // #ref hostSourceToUse todo
+  const absl::optional<HostsSource> hosts_source = hostSourceToUse(context, random(false));
+  // ...
+  // 根据‘hosts_source’信息从’schedule_‘找到相应‘scheduler’ todo
+  auto scheduler_it = scheduler_.find(*hosts_source);
+  auto& scheduler = scheduler_it->second;
+
+  if (scheduler.edf_ != nullptr) {
+    // 配置了加权
+    auto host = scheduler.edf_->pickAndAdd([this](const Host& host) { return hostWeight(host); });
+    return host;
+  } else { // 没有配置加权时
+    // 根据‘hosts_source’信息,找到最终要使用的‘HostVector’ todo
+    const HostVector& hosts_to_use = hostSourceToHosts(*hosts_source);
+    if (hosts_to_use.empty()) {
+      return nullptr;
+    }
+    // 从‘HostVector’中取出一个最终的host todo
+    return unweightedHostPick(hosts_to_use, *hosts_source);
+  }
+}
+```
+#### hostSourceToUse
+```cpp
+// source/common/upstream/load_balancer_impl.cc
+absl::optional<ZoneAwareLoadBalancerBase::HostsSource>
+ZoneAwareLoadBalancerBase::hostSourceToUse(LoadBalancerContext* context, uint64_t hash) const {
+  // 按优先级选出prioritySet里的HostSet,以及set的健康状态
+  auto host_set_and_source = chooseHostSet(context, hash);
+
+  // The second argument tells us which availability we should target from the selected host set.
+  const auto host_availability = host_set_and_source.second;
+  auto& host_set = host_set_and_source.first;
+
+  // 构造要返回的‘HostSource’实例
+  HostsSource hosts_source;
+  hosts_source.priority_ = host_set.priority(); // 填入priority信息
+
+  // ...
+
+  // 判断是否存在locality相关的设置
+  // 最终返回locality是 'HostsPerLocality'的优先级index
+  absl::optional<uint32_t> locality;
+  if (host_availability == HostAvailability::Degraded) {
+    locality = host_set.chooseDegradedLocality();
+  } else {
+    locality = host_set.chooseHealthyLocality();
+  }
+  // 如果存在locality设置,需要对hosts_source做些调整
+  if (locality.has_value()) {
+    // 转换SourceType类型
+    // HostAvailability::Healthy ==》 HostsSource::SourceType::LocalityHealthyHosts
+    // HostAvailability::Degraded ==》 HostsSource::SourceType::LocalityDegradedHosts
+    auto source_type = localitySourceType(host_availability);
+    if (!source_type) {
+      return absl::nullopt;
+    }
+    // 设定source_type_ 和 locality_index_ 属性并返回
+    hosts_source.source_type_ = source_type.value();
+    hosts_source.locality_index_ = locality.value();
+    return hosts_source;
+  }
+  // 其他非locality的情况
+  // ...
+}
+```
+
 ### host_set的更新 todo
