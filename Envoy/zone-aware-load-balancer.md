@@ -16,11 +16,8 @@
       - [父类`EdfLoadBalancerBase`](#父类edfloadbalancerbase)
       - [EdfLoadBalancerBase::initialize()](#edfloadbalancerbaseinitialize)
       - [refresh(uint32\_t priority)](#refreshuint32_t-priority)
-    - [ChooseHost](#choosehost)
+    - [ZoneAwareLoadBalancerBase::ChooseHost 从lb里挑出一个Host](#zoneawareloadbalancerbasechoosehost-从lb里挑出一个host)
       - [hostSourceToUse](#hostsourcetouse)
-      - [hostSourceToHosts](#hostsourcetohosts)
-      - [unweightedHostPick](#unweightedhostpick)
-    - [host\_set的更新 todo](#host_set的更新-todo)
 
 
 # 版本
@@ -190,6 +187,7 @@ public:
 }
 ```
 #### HostSetImpl::updateHosts
+更新一个`HostSet`的host信息,所有要更新的各种类别的host都已经通过参数传进来了,只需要`std::move`复制到本地
 ```cpp
 // source/common/upstream/upstream_impl.cc
 void HostSetImpl::updateHosts(PrioritySet::UpdateHostsParams&& update_hosts_params,
@@ -200,6 +198,7 @@ void HostSetImpl::updateHosts(PrioritySet::UpdateHostsParams&& update_hosts_para
     ASSERT(overprovisioning_factor.value() > 0);
     overprovisioning_factor_ = overprovisioning_factor.value();
   }
+  // 将参数传进来的不同类型的host信息复制到相应本地变量中
   hosts_ = std::move(update_hosts_params.hosts);
   healthy_hosts_ = std::move(update_hosts_params.healthy_hosts);
   degraded_hosts_ = std::move(update_hosts_params.degraded_hosts);
@@ -210,6 +209,7 @@ void HostSetImpl::updateHosts(PrioritySet::UpdateHostsParams&& update_hosts_para
   excluded_hosts_per_locality_ = std::move(update_hosts_params.excluded_hosts_per_locality);
   locality_weights_ = std::move(locality_weights);
 
+  // 重建scheduler
   rebuildLocalityScheduler(healthy_locality_scheduler_, healthy_locality_entries_,
                            *healthy_hosts_per_locality_, healthy_hosts_->get(), hosts_per_locality_,
                            excluded_hosts_per_locality_, locality_weights_,
@@ -219,6 +219,7 @@ void HostSetImpl::updateHosts(PrioritySet::UpdateHostsParams&& update_hosts_para
                            hosts_per_locality_, excluded_hosts_per_locality_, locality_weights_,
                            overprovisioning_factor_);
 
+  // todo
   runUpdateCallbacks(hosts_added, hosts_removed);
 }
 ```
@@ -256,36 +257,7 @@ private:
     rr_indexes_.insert({source, seed_});
     peekahead_index_ = 0;
   }
-  double hostWeight(const Host& host) override {
-    if (!noHostsAreInSlowStart()) {
-      return applySlowStartFactor(host.weight(), host);
-    }
-    return host.weight();
-  }
-
-  HostConstSharedPtr unweightedHostPeek(const HostVector& hosts_to_use,
-                                        const HostsSource& source) override {
-    auto i = rr_indexes_.find(source);
-    if (i == rr_indexes_.end()) {
-      return nullptr;
-    }
-    return hosts_to_use[(i->second + (peekahead_index_)++) % hosts_to_use.size()];
-  }
-
-  HostConstSharedPtr unweightedHostPick(const HostVector& hosts_to_use,
-                                        const HostsSource& source) override {
-    if (peekahead_index_ > 0) {
-      --peekahead_index_;
-    }
-    // To avoid storing the RR index in the base class, we end up using a second map here with
-    // host source as the key. This means that each LB decision will require two map lookups in
-    // the unweighted case. We might consider trying to optimize this in the future.
-    ASSERT(rr_indexes_.find(source) != rr_indexes_.end());
-    return hosts_to_use[rr_indexes_[source]++ % hosts_to_use.size()];
-  }
-
-  uint64_t peekahead_index_{};
-  absl::node_hash_map<HostsSource, uint64_t, HostsSourceHash> rr_indexes_;
+  // ...
 };
 ```
 ## 实现
@@ -451,7 +423,7 @@ void refreshHostSource(const HostsSource& source) override {
   }
 
 ```
-### ChooseHost
+### ZoneAwareLoadBalancerBase::ChooseHost 从lb里挑出一个Host
 lb通过`chooseHost`方法根据`context`挑选出目标`host`
 ```cpp
 // source/common/upstream/load_balancer_impl.cc
@@ -490,18 +462,16 @@ HostConstSharedPtr EdfLoadBalancerBase::chooseHostOnce(LoadBalancerContext* cont
   auto& scheduler = scheduler_it->second;
 
   if (scheduler.edf_ != nullptr) {
-    // 配置了加权
+    // 配置了edf的情况, 从edf算法里选出一个host,然后重新调用‘hostWeight’方法重新给这个host一个加权熟再加到edf里
     auto host = scheduler.edf_->pickAndAdd([this](const Host& host) { return hostWeight(host); });
     return host;
-  } else { // 没有配置加权时
-    // 根据‘hosts_source’信息,找到最终要使用的‘HostVector’ todo
-    // #ref hostSourceToHosts
+  } else { // 没有配置加权时,这个逻辑主要是一些简化的情况(比如总共就一个host)快速挑选host用的
+    // 根据‘hosts_source’信息,找到最终要使用的‘HostVector’
     const HostVector& hosts_to_use = hostSourceToHosts(*hosts_source);
     if (hosts_to_use.empty()) {
       return nullptr;
     }
     // 从‘HostVector’中取出一个最终的host
-    // #ref unweightedHostPick
     return unweightedHostPick(hosts_to_use, *hosts_source);
   }
 }
@@ -550,54 +520,3 @@ ZoneAwareLoadBalancerBase::hostSourceToUse(LoadBalancerContext* context, uint64_
   // ...
 }
 ```
-#### hostSourceToHosts
-入参`HostsSource`,根据`HostsSource`信息从host_set里找到并返回对应的`HostVector`
-```cpp
-// source/common/upstream/load_balancer_impl.cc
-const HostVector& ZoneAwareLoadBalancerBase::hostSourceToHosts(HostsSource hosts_source) const {
-  const HostSet& host_set = *priority_set_.hostSetsPerPriority()[hosts_source.priority_];
-  switch (hosts_source.source_type_) {
-  case HostsSource::SourceType::AllHosts:
-    return host_set.hosts();
-  case HostsSource::SourceType::HealthyHosts:
-    return host_set.healthyHosts();
-  case HostsSource::SourceType::DegradedHosts:
-    return host_set.degradedHosts();
-  case HostsSource::SourceType::LocalityHealthyHosts:
-    return host_set.healthyHostsPerLocality().get()[hosts_source.locality_index_];
-  case HostsSource::SourceType::LocalityDegradedHosts:
-    return host_set.degradedHostsPerLocality().get()[hosts_source.locality_index_];
-  }
-  PANIC_DUE_TO_CORRUPT_ENUM;
-}
-```
-#### unweightedHostPick
-入参 `HostVector`, 随机返回一个host
-```cpp
-// source/common/upstream/load_balancer_impl.cc
-HostConstSharedPtr LeastRequestLoadBalancer::unweightedHostPick(const HostVector& hosts_to_use,
-                                                                const HostsSource&) {
-  HostSharedPtr candidate_host = nullptr;
-  // 随机挑一个host
-  for (uint32_t choice_idx = 0; choice_idx < choice_count_; ++choice_idx) {
-    const int rand_idx = random_.random() % hosts_to_use.size();
-    HostSharedPtr sampled_host = hosts_to_use[rand_idx];
-
-    if (candidate_host == nullptr) {
-
-      // Make a first choice to start the comparisons.
-      candidate_host = sampled_host;
-      continue;
-    }
-
-    const auto candidate_active_rq = candidate_host->stats().rq_active_.value();
-    const auto sampled_active_rq = sampled_host->stats().rq_active_.value();
-    if (sampled_active_rq < candidate_active_rq) {
-      candidate_host = sampled_host;
-    }
-  }
-
-  return candidate_host;
-}
-```
-### host_set的更新 todo
