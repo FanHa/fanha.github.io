@@ -1,3 +1,17 @@
+- [版本](#版本)
+- [序](#序)
+  - [组成](#组成)
+  - [当前遇到的疑问](#当前遇到的疑问)
+- [envoy filter](#envoy-filter)
+  - [流程图](#流程图)
+- [token server](#token-server)
+  - [envoyproxy/ratelimit](#envoyproxyratelimit)
+    - [流程图](#流程图-1)
+    - [shouldRateLimitWorker 方法接受request的参数,返回这个request是否应该限流](#shouldratelimitworker-方法接受request的参数返回这个request是否应该限流)
+      - [cache dolimit (redis)](#cache-dolimit-redis)
+        - [GetResponseDescriptorStatus](#getresponsedescriptorstatus)
+  - [sentinel rls TODO](#sentinel-rls-todo)
+
 # 版本
 + github: envoyproxy/ratelimit
 
@@ -18,9 +32,12 @@ envoy的全局限流主要有两部分
 - tokenserver(sentinel) TODO
 
 # envoy filter
+## 流程图
 ![EnvoyFilterRateLimitTopo](resource/EnvoyFilterRatelimitTopo.drawio.svg)
 
 # token server
+envoy原生ratelimit token server: https://github.com/envoyproxy/ratelimit
+sentinel rls: https://github.com/alibaba/Sentinel/tree/master/sentinel-cluster/sentinel-cluster-server-envoy-rls
 ## envoyproxy/ratelimit
 ### 流程图
 ![EnvoyRateLimitTokenServer](resource/EnvoyRatelimitTokenServer.drawio.svg)
@@ -44,51 +61,7 @@ func (this *service) shouldRateLimitWorker(
 	response.Statuses = make([]*pb.RateLimitResponse_DescriptorStatus, len(request.Descriptors))
 	finalCode := pb.RateLimitResponse_OK
 
-	// Keep track of the descriptor which is closest to hit the ratelimit
-	minLimitRemaining := MaxUint32
-	var minimumDescriptor *pb.RateLimitResponse_DescriptorStatus = nil
-
-	for i, descriptorStatus := range responseDescriptorStatuses {
-		// Keep track of the descriptor closest to hit the ratelimit
-		if this.customHeadersEnabled &&
-			descriptorStatus.CurrentLimit != nil &&
-			descriptorStatus.LimitRemaining < minLimitRemaining {
-			minimumDescriptor = descriptorStatus
-			minLimitRemaining = descriptorStatus.LimitRemaining
-		}
-
-		if isUnlimited[i] {
-			response.Statuses[i] = &pb.RateLimitResponse_DescriptorStatus{
-				Code:           pb.RateLimitResponse_OK,
-				LimitRemaining: math.MaxUint32,
-			}
-		} else {
-			response.Statuses[i] = descriptorStatus
-			if descriptorStatus.Code == pb.RateLimitResponse_OVER_LIMIT {
-				finalCode = descriptorStatus.Code
-
-				minimumDescriptor = descriptorStatus
-				minLimitRemaining = 0
-			}
-		}
-	}
-
-	// Add Headers if requested
-	if this.customHeadersEnabled && minimumDescriptor != nil {
-		response.ResponseHeadersToAdd = []*core.HeaderValue{
-			this.rateLimitLimitHeader(minimumDescriptor),
-			this.rateLimitRemainingHeader(minimumDescriptor),
-			this.rateLimitResetHeader(minimumDescriptor),
-		}
-	}
-
-	// If there is a global shadow_mode, it should always return OK
-	if finalCode == pb.RateLimitResponse_OVER_LIMIT && globalShadowMode {
-		finalCode = pb.RateLimitResponse_OK
-		this.stats.GlobalShadowMode.Inc()
-	}
-
-	response.OverallCode = finalCode
+	// ...
 	return response
 }
 ```
