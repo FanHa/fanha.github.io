@@ -94,7 +94,7 @@ func buildssa(fn *ir.Func, worker int) *ssa.Func {
 	var s state // 初始化一个 state结构,记录当前Func的build情况 #ref state 
 
 	s.hasdefer = fn.HasDefer() // 根据ast的信息,设置当前func是否有defer语句
-
+	// 根据情况选择是否需要激活openDefer(一种优化的defer实现方式,减少调用开销)
 	s.hasOpenDefers = base.Flag.N == 0 && s.hasdefer && !s.curfn.OpenCodedDeferDisallowed()
 	switch {
 	case base.Debug.NoOpenDefer != 0:
@@ -109,11 +109,13 @@ func buildssa(fn *ir.Func, worker int) *ssa.Func {
 		// Skip doing open defers if there is any extra exit code (likely
 		// race detection), since we will not generate that code in the
 		// case of the extra deferreturn/ret segment.
+		// todo
 		s.hasOpenDefers = false
 	}
 	if s.hasOpenDefers {
 		// Similarly, skip if there are any heap-allocated result
 		// parameters that need to be copied back to their stack slots.
+		// todo
 		for _, f := range s.curfn.Type().Results().FieldSlice() {
 			if !f.Nname.(*ir.Name).OnStack() {
 				s.hasOpenDefers = false
@@ -128,14 +130,10 @@ func buildssa(fn *ir.Func, worker int) *ssa.Func {
 		// too many returns (especially if there are multiple defers).
 		// Open-coded defers are most important for improving performance
 		// for smaller functions (which don't have many returns).
+		// todo
 		s.hasOpenDefers = false
 	}
 
-	s.sp = s.entryNewValue0(ssa.OpSP, types.Types[types.TUINTPTR]) // TODO: use generic pointer type (unsafe.Pointer?) instead
-	s.sb = s.entryNewValue0(ssa.OpSB, types.Types[types.TUINTPTR])
-
-	s.startBlock(s.f.Entry)
-	s.vars[memVar] = s.startmem
 	if s.hasOpenDefers {
 		// Create the deferBits variable and stack slot.  deferBits is a
 		// bitmask showing which of the open-coded defers in this function

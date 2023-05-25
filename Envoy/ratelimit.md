@@ -36,8 +36,8 @@ envoy的全局限流主要有两部分
 ![EnvoyFilterRateLimitTopo](resource/EnvoyFilterRatelimitTopo.drawio.svg)
 
 # token server
-envoy原生ratelimit token server: https://github.com/envoyproxy/ratelimit
-sentinel rls: https://github.com/alibaba/Sentinel/tree/master/sentinel-cluster/sentinel-cluster-server-envoy-rls
+- envoy原生ratelimit token server: https://github.com/envoyproxy/ratelimit
+- sentinel rls: https://github.com/alibaba/Sentinel/tree/master/sentinel-cluster/sentinel-cluster-server-envoy-rls
 ## envoyproxy/ratelimit
 ### 流程图
 ![EnvoyRateLimitTokenServer](resource/EnvoyRatelimitTokenServer.drawio.svg)
