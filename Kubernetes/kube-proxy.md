@@ -381,7 +381,7 @@ func (proxier *Proxier) syncProxyRules() {
 	serviceNoLocalEndpointsTotalInternal := 0
 	serviceNoLocalEndpointsTotalExternal := 0
 
-	// Build rules for each service-port.
+	// 遍历已知的服务列表
 	for svcName, svc := range proxier.svcPortMap {
 		svcInfo, ok := svc.(*servicePortInfo)
 		if !ok {
@@ -391,11 +391,9 @@ func (proxier *Proxier) syncProxyRules() {
 		protocol := strings.ToLower(string(svcInfo.Protocol()))
 		svcPortNameString := svcInfo.nameString
 
-		// Figure out the endpoints for Cluster and Local traffic policy.
-		// allLocallyReachableEndpoints is the set of all endpoints that can be routed to
-		// from this node, given the service's traffic policies. hasEndpoints is true
-		// if the service has any usable endpoints on any node, not just this one.
+		// 通过服务名找到该服务对应的endpointslice
 		allEndpoints := proxier.endpointsMap[svcName]
+        // 给所有endpoint分类
 		clusterEndpoints, localEndpoints, allLocallyReachableEndpoints, hasEndpoints := proxy.CategorizeEndpoints(allEndpoints, svcInfo, proxier.nodeLabels)
 
 		// Note the endpoint chains that will be used
@@ -504,7 +502,7 @@ func (proxier *Proxier) syncProxyRules() {
 			}
 		}
 
-		// Capture the clusterIP.
+		// 找到cluster endpoint时,在 kubeServicesChain 中匹配了目标clusterip+端口时跳转到该服务特有的chain中处理
 		if hasInternalEndpoints {
 			proxier.natRules.Write(
 				"-A", string(kubeServicesChain),
@@ -514,7 +512,7 @@ func (proxier *Proxier) syncProxyRules() {
 				"--dport", strconv.Itoa(svcInfo.Port()),
 				"-j", string(internalTrafficChain))
 		} else {
-			// No endpoints.
+			// cluster endpoint 为空时 跳转到 internalTrafficFilterTarget (REJECT)
 			proxier.filterRules.Write(
 				"-A", string(kubeServicesChain),
 				"-m", "comment", "--comment", internalTrafficFilterComment,
@@ -525,11 +523,9 @@ func (proxier *Proxier) syncProxyRules() {
 			)
 		}
 
-		// Capture externalIPs.
+		// 同上,服务的外部ip也需要在 kubeServicesChain 中加上跳转处理,跳转到这个服务的专用chain
 		for _, externalIP := range svcInfo.ExternalIPStrings() {
 			if hasEndpoints {
-				// Send traffic bound for external IPs to the "external
-				// destinations" chain.
 				proxier.natRules.Write(
 					"-A", string(kubeServicesChain),
 					"-m", "comment", "--comment", fmt.Sprintf(`"%s external IP"`, svcPortNameString),
@@ -539,9 +535,7 @@ func (proxier *Proxier) syncProxyRules() {
 					"-j", string(externalTrafficChain))
 			}
 			if !hasExternalEndpoints {
-				// Either no endpoints at all (REJECT) or no endpoints for
-				// external traffic (DROP anything that didn't get
-				// short-circuited by the EXT chain.)
+				// endpoint 为空时在kubeExternalServicesChain中也需要跳转到一个 externalTrafficFilterTarget 动作(REJECT)
 				proxier.filterRules.Write(
 					"-A", string(kubeExternalServicesChain),
 					"-m", "comment", "--comment", externalTrafficFilterComment,
@@ -553,7 +547,7 @@ func (proxier *Proxier) syncProxyRules() {
 			}
 		}
 
-		// Capture load-balancer ingress.
+		// LB设置
 		for _, lbip := range svcInfo.LoadBalancerIPStrings() {
 			if hasEndpoints {
 				proxier.natRules.Write(
