@@ -503,6 +503,7 @@ func (proxier *Proxier) syncProxyRules() {
 		}
 
 		// 找到cluster endpoint时,在 kubeServicesChain 中匹配了目标clusterip+端口时跳转到该服务特有的chain中处理
+		// todo internalTrafficChain
 		if hasInternalEndpoints {
 			proxier.natRules.Write(
 				"-A", string(kubeServicesChain),
@@ -534,22 +535,14 @@ func (proxier *Proxier) syncProxyRules() {
 					"--dport", strconv.Itoa(svcInfo.Port()),
 					"-j", string(externalTrafficChain))
 			}
-			if !hasExternalEndpoints {
-				// endpoint 为空时在kubeExternalServicesChain中也需要跳转到一个 externalTrafficFilterTarget 动作(REJECT)
-				proxier.filterRules.Write(
-					"-A", string(kubeExternalServicesChain),
-					"-m", "comment", "--comment", externalTrafficFilterComment,
-					"-m", protocol, "-p", protocol,
-					"-d", externalIP,
-					"--dport", strconv.Itoa(svcInfo.Port()),
-					"-j", externalTrafficFilterTarget,
-				)
-			}
+			// ...
 		}
 
-		// LB设置
+		// 当一个服务是个LoadBalancer服务(即依赖外部负载均衡工具来把请求转发到具体的ip上)
 		for _, lbip := range svcInfo.LoadBalancerIPStrings() {
 			if hasEndpoints {
+				// 为每一个ip创建一条规则,把请求跳转到 loadBalancerTrafficChain 处理
+				// todo loadBalancerTrafficChain
 				proxier.natRules.Write(
 					"-A", string(kubeServicesChain),
 					"-m", "comment", "--comment", fmt.Sprintf(`"%s loadbalancer IP"`, svcPortNameString),
@@ -559,38 +552,14 @@ func (proxier *Proxier) syncProxyRules() {
 					"-j", string(loadBalancerTrafficChain))
 
 			}
-			if usesFWChain {
-				proxier.filterRules.Write(
-					"-A", string(kubeProxyFirewallChain),
-					"-m", "comment", "--comment", fmt.Sprintf(`"%s traffic not accepted by %s"`, svcPortNameString, svcInfo.firewallChainName),
-					"-m", protocol, "-p", protocol,
-					"-d", lbip,
-					"--dport", strconv.Itoa(svcInfo.Port()),
-					"-j", "DROP")
-			}
-		}
-		if !hasExternalEndpoints {
-			// Either no endpoints at all (REJECT) or no endpoints for
-			// external traffic (DROP anything that didn't get short-circuited
-			// by the EXT chain.)
-			for _, lbip := range svcInfo.LoadBalancerIPStrings() {
-				proxier.filterRules.Write(
-					"-A", string(kubeExternalServicesChain),
-					"-m", "comment", "--comment", externalTrafficFilterComment,
-					"-m", protocol, "-p", protocol,
-					"-d", lbip,
-					"--dport", strconv.Itoa(svcInfo.Port()),
-					"-j", externalTrafficFilterTarget,
-				)
-			}
+			// ...
 		}
 
-		// Capture nodeports.
+		// node port 服务
 		if svcInfo.NodePort() != 0 {
 			if hasEndpoints {
-				// Jump to the external destination chain.  For better or for
-				// worse, nodeports are not subect to loadBalancerSourceRanges,
-				// and we can't change that.
+				// 将 kubeNodePortsChain 赚到服务特有chain 处理
+				// todo 谁在哪里跳转到了 kubeNodePortsChain 
 				proxier.natRules.Write(
 					"-A", string(kubeNodePortsChain),
 					"-m", "comment", "--comment", svcPortNameString,
@@ -598,25 +567,11 @@ func (proxier *Proxier) syncProxyRules() {
 					"--dport", strconv.Itoa(svcInfo.NodePort()),
 					"-j", string(externalTrafficChain))
 			}
-			if !hasExternalEndpoints {
-				// Either no endpoints at all (REJECT) or no endpoints for
-				// external traffic (DROP anything that didn't get
-				// short-circuited by the EXT chain.)
-				proxier.filterRules.Write(
-					"-A", string(kubeExternalServicesChain),
-					"-m", "comment", "--comment", externalTrafficFilterComment,
-					"-m", "addrtype", "--dst-type", "LOCAL",
-					"-m", protocol, "-p", protocol,
-					"--dport", strconv.Itoa(svcInfo.NodePort()),
-					"-j", externalTrafficFilterTarget,
-				)
-			}
 		}
 
-		// Capture healthCheckNodePorts.
+		// 服务的健康检查 port处理
 		if svcInfo.HealthCheckNodePort() != 0 {
-			// no matter if node has local endpoints, healthCheckNodePorts
-			// need to add a rule to accept the incoming connection
+			// 健康检测的包直接放行
 			proxier.filterRules.Write(
 				"-A", string(kubeNodePortsChain),
 				"-m", "comment", "--comment", fmt.Sprintf(`"%s health check node port"`, svcPortNameString),
@@ -626,14 +581,9 @@ func (proxier *Proxier) syncProxyRules() {
 			)
 		}
 
-		// If the SVC/SVL/EXT/FW/SEP chains have not changed since the last sync
-		// then we can omit them from the restore input. (We have already marked
-		// them in activeNATChains, so they won't get deleted.)
-		if tryPartialSync && !serviceChanged.Has(svcName.NamespacedName.String()) && !endpointsChanged.Has(svcName.NamespacedName.String()) {
-			continue
-		}
+		// ...
 
-		// Set up internal traffic handling.
+		// todo 这里为什么要跳转??到kubeMarkMasqChain
 		if hasInternalEndpoints {
 			args = append(args[:0],
 				"-m", "comment", "--comment", fmt.Sprintf(`"%s cluster IP"`, svcPortNameString),
@@ -646,123 +596,10 @@ func (proxier *Proxier) syncProxyRules() {
 					"-A", string(internalTrafficChain),
 					args,
 					"-j", string(kubeMarkMasqChain))
-			} else if proxier.localDetector.IsImplemented() {
-				// This masquerades off-cluster traffic to a service VIP. The
-				// idea is that you can establish a static route for your
-				// Service range, routing to any node, and that node will
-				// bridge into the Service for you. Since that might bounce
-				// off-node, we masquerade here.
-				proxier.natRules.Write(
-					"-A", string(internalTrafficChain),
-					args,
-					proxier.localDetector.IfNotLocal(),
-					"-j", string(kubeMarkMasqChain))
 			}
+			// ...
 		}
 
-		// Set up external traffic handling (if any "external" destinations are
-		// enabled). All captured traffic for all external destinations should
-		// jump to externalTrafficChain, which will handle some special cases and
-		// then jump to externalPolicyChain.
-		if usesExternalTrafficChain {
-			proxier.natChains.Write(utiliptables.MakeChainLine(externalTrafficChain))
-
-			if !svcInfo.ExternalPolicyLocal() {
-				// If we are using non-local endpoints we need to masquerade,
-				// in case we cross nodes.
-				proxier.natRules.Write(
-					"-A", string(externalTrafficChain),
-					"-m", "comment", "--comment", fmt.Sprintf(`"masquerade traffic for %s external destinations"`, svcPortNameString),
-					"-j", string(kubeMarkMasqChain))
-			} else {
-				// If we are only using same-node endpoints, we can retain the
-				// source IP in most cases.
-
-				if proxier.localDetector.IsImplemented() {
-					// Treat all locally-originated pod -> external destination
-					// traffic as a special-case.  It is subject to neither
-					// form of traffic policy, which simulates going up-and-out
-					// to an external load-balancer and coming back in.
-					proxier.natRules.Write(
-						"-A", string(externalTrafficChain),
-						"-m", "comment", "--comment", fmt.Sprintf(`"pod traffic for %s external destinations"`, svcPortNameString),
-						proxier.localDetector.IfLocal(),
-						"-j", string(clusterPolicyChain))
-				}
-
-				// Locally originated traffic (not a pod, but the host node)
-				// still needs masquerade because the LBIP itself is a local
-				// address, so that will be the chosen source IP.
-				proxier.natRules.Write(
-					"-A", string(externalTrafficChain),
-					"-m", "comment", "--comment", fmt.Sprintf(`"masquerade LOCAL traffic for %s external destinations"`, svcPortNameString),
-					"-m", "addrtype", "--src-type", "LOCAL",
-					"-j", string(kubeMarkMasqChain))
-
-				// Redirect all src-type=LOCAL -> external destination to the
-				// policy=cluster chain. This allows traffic originating
-				// from the host to be redirected to the service correctly.
-				proxier.natRules.Write(
-					"-A", string(externalTrafficChain),
-					"-m", "comment", "--comment", fmt.Sprintf(`"route LOCAL traffic for %s external destinations"`, svcPortNameString),
-					"-m", "addrtype", "--src-type", "LOCAL",
-					"-j", string(clusterPolicyChain))
-			}
-
-			// Anything else falls thru to the appropriate policy chain.
-			if hasExternalEndpoints {
-				proxier.natRules.Write(
-					"-A", string(externalTrafficChain),
-					"-j", string(externalPolicyChain))
-			}
-		}
-
-		// Set up firewall chain, if needed
-		if usesFWChain {
-			proxier.natChains.Write(utiliptables.MakeChainLine(fwChain))
-
-			// The service firewall rules are created based on the
-			// loadBalancerSourceRanges field. This only works for VIP-like
-			// loadbalancers that preserve source IPs. For loadbalancers which
-			// direct traffic to service NodePort, the firewall rules will not
-			// apply.
-			args = append(args[:0],
-				"-A", string(fwChain),
-				"-m", "comment", "--comment", fmt.Sprintf(`"%s loadbalancer IP"`, svcPortNameString),
-			)
-
-			// firewall filter based on each source range
-			allowFromNode := false
-			for _, src := range svcInfo.LoadBalancerSourceRanges() {
-				proxier.natRules.Write(args, "-s", src, "-j", string(externalTrafficChain))
-				_, cidr, err := netutils.ParseCIDRSloppy(src)
-				if err != nil {
-					klog.ErrorS(err, "Error parsing CIDR in LoadBalancerSourceRanges, dropping it", "cidr", cidr)
-				} else if cidr.Contains(proxier.nodeIP) {
-					allowFromNode = true
-				}
-			}
-			// For VIP-like LBs, the VIP is often added as a local
-			// address (via an IP route rule).  In that case, a request
-			// from a node to the VIP will not hit the loadbalancer but
-			// will loop back with the source IP set to the VIP.  We
-			// need the following rules to allow requests from this node.
-			if allowFromNode {
-				for _, lbip := range svcInfo.LoadBalancerIPStrings() {
-					proxier.natRules.Write(
-						args,
-						"-s", lbip,
-						"-j", string(externalTrafficChain))
-				}
-			}
-			// If the packet was able to reach the end of firewall chain,
-			// then it did not get DNATed, so it will match the
-			// corresponding KUBE-PROXY-FIREWALL rule.
-			proxier.natRules.Write(
-				"-A", string(fwChain),
-				"-m", "comment", "--comment", fmt.Sprintf(`"other traffic to %s will be dropped by KUBE-PROXY-FIREWALL"`, svcPortNameString),
-			)
-		}
 
 		// If Cluster policy is in use, create the chain and create rules jumping
 		// from clusterPolicyChain to the clusterEndpoints
