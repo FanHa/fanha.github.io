@@ -473,37 +473,27 @@ func (proxier *Proxier) syncProxyRules() {
 		var internalTrafficFilterTarget, internalTrafficFilterComment string
 		var externalTrafficFilterTarget, externalTrafficFilterComment string
 		if !hasEndpoints {
-			// The service has no endpoints at all; hasInternalEndpoints and
-			// hasExternalEndpoints will also be false, and we will not
-			// generate any chains in the "nat" table for the service; only
-			// rules in the "filter" table rejecting incoming packets for
-			// the service's IPs.
+			// 一个服务没有endpoint 直接将目标置换为 REJECT(无论是internal 还是 external)
 			internalTrafficFilterTarget = "REJECT"
-			internalTrafficFilterComment = fmt.Sprintf(`"%s has no endpoints"`, svcPortNameString)
+			// ...
 			externalTrafficFilterTarget = "REJECT"
-			externalTrafficFilterComment = internalTrafficFilterComment
-		} else {
+			// ...
+		} else { // 服务存在endpoint 的情况
 			if !hasInternalEndpoints {
-				// The internalTrafficPolicy is "Local" but there are no local
-				// endpoints. Traffic to the clusterIP will be dropped, but
-				// external traffic may still be accepted.
+				// 服务在本机群上没有endpoint,将internalTarget 设置为drop
 				internalTrafficFilterTarget = "DROP"
-				internalTrafficFilterComment = fmt.Sprintf(`"%s has no local endpoints"`, svcPortNameString)
-				serviceNoLocalEndpointsTotalInternal++
+				// ...
 			}
 			if !hasExternalEndpoints {
-				// The externalTrafficPolicy is "Local" but there are no
-				// local endpoints. Traffic to "external" IPs from outside
-				// the cluster will be dropped, but traffic from inside
-				// the cluster may still be accepted.
+				// 当服务没有外部endpoint时,将externalTarget 设置为drop
 				externalTrafficFilterTarget = "DROP"
-				externalTrafficFilterComment = fmt.Sprintf(`"%s has no local endpoints"`, svcPortNameString)
-				serviceNoLocalEndpointsTotalExternal++
+				// ...
 			}
 		}
 
 		// 找到cluster endpoint时,在 kubeServicesChain 中匹配了目标clusterip+端口时跳转到该服务特有的chain中处理
-		// todo internalTrafficChain
+		// 在没有开启本地流量优先时 internalTrafficChain = clusterPolicyChain
+		// 开启了本地流量优先时 internalTrafficChain = localPolicyChain
 		if hasInternalEndpoints {
 			proxier.natRules.Write(
 				"-A", string(kubeServicesChain),
@@ -524,7 +514,7 @@ func (proxier *Proxier) syncProxyRules() {
 			)
 		}
 
-		// 同上,服务的外部ip也需要在 kubeServicesChain 中加上跳转处理,跳转到这个服务的专用chain
+		// 同上,服务的externalIP也需要在 kubeServicesChain 中加上跳转处理,将每一个目标ip跳转到externalTrafficChain(svcInfo.externalChainName)
 		for _, externalIP := range svcInfo.ExternalIPStrings() {
 			if hasEndpoints {
 				proxier.natRules.Write(
@@ -541,7 +531,7 @@ func (proxier *Proxier) syncProxyRules() {
 		// 当一个服务是个LoadBalancer服务(即依赖外部负载均衡工具来把请求转发到具体的ip上)
 		for _, lbip := range svcInfo.LoadBalancerIPStrings() {
 			if hasEndpoints {
-				// 为每一个ip创建一条规则,把请求跳转到 loadBalancerTrafficChain 处理
+				// 为每一个ip创建一条规则,把每一个ip请求跳转到 loadBalancerTrafficChain 处理 (在没有开启FWChain 时, loadBalancerTrafficChain=externalTrafficChain)
 				// todo loadBalancerTrafficChain
 				proxier.natRules.Write(
 					"-A", string(kubeServicesChain),
@@ -558,8 +548,7 @@ func (proxier *Proxier) syncProxyRules() {
 		// node port 服务
 		if svcInfo.NodePort() != 0 {
 			if hasEndpoints {
-				// 将 kubeNodePortsChain 赚到服务特有chain 处理
-				// todo 谁在哪里跳转到了 kubeNodePortsChain 
+				// 将 kubeNodePortsChain 转到externalTrafficChain处理
 				proxier.natRules.Write(
 					"-A", string(kubeNodePortsChain),
 					"-m", "comment", "--comment", svcPortNameString,
