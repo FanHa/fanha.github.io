@@ -251,45 +251,7 @@ k8s使用了iptables的filter表和nat表。filter表用于处理入站和出站
 func (proxier *Proxier) syncProxyRules() {
 	proxier.mu.Lock()
 	defer proxier.mu.Unlock()
-
-	// proxier 初始化好以前不需要同步任何规则
-	if !proxier.isInitialized() {
-		klog.V(2).InfoS("Not syncing iptables until Services and Endpoints have been received from master")
-		return
-	}
-
-
-	tryPartialSync := !proxier.needFullSync && utilfeature.DefaultFeatureGate.Enabled(features.MinimizeIPTablesRestore)
-	var serviceChanged, endpointsChanged sets.String
-	if tryPartialSync {
-		serviceChanged = proxier.serviceChanges.PendingChanges()
-		endpointsChanged = proxier.endpointsChanges.PendingChanges()
-	}
-	serviceUpdateResult := proxier.svcPortMap.Update(proxier.serviceChanges)
-	endpointUpdateResult := proxier.endpointsMap.Update(proxier.endpointsChanges)
-
-	// We need to detect stale connections to UDP Services so we
-	// can clean dangling conntrack entries that can blackhole traffic.
-	conntrackCleanupServiceIPs := serviceUpdateResult.DeletedUDPClusterIPs
-	conntrackCleanupServiceNodePorts := sets.NewInt()
-	// merge stale services gathered from updateEndpointsMap
-	// an UDP service that changes from 0 to non-0 endpoints is considered stale.
-	for _, svcPortName := range endpointUpdateResult.NewlyActiveUDPServices {
-		if svcInfo, ok := proxier.svcPortMap[svcPortName]; ok {
-			klog.V(4).InfoS("Newly-active UDP service may have stale conntrack entries", "servicePortName", svcPortName)
-			conntrackCleanupServiceIPs.Insert(svcInfo.ClusterIP().String())
-			for _, extIP := range svcInfo.ExternalIPStrings() {
-				conntrackCleanupServiceIPs.Insert(extIP)
-			}
-			for _, lbIP := range svcInfo.LoadBalancerIPStrings() {
-				conntrackCleanupServiceIPs.Insert(lbIP)
-			}
-			nodePort := svcInfo.NodePort()
-			if svcInfo.Protocol() == v1.ProtocolUDP && nodePort != 0 {
-				conntrackCleanupServiceNodePorts.Insert(nodePort)
-			}
-		}
-	}
+	// ...
 
 
 	success := false
@@ -532,7 +494,6 @@ func (proxier *Proxier) syncProxyRules() {
 		for _, lbip := range svcInfo.LoadBalancerIPStrings() {
 			if hasEndpoints {
 				// 为每一个ip创建一条规则,把每一个ip请求跳转到 loadBalancerTrafficChain 处理 (在没有开启FWChain 时, loadBalancerTrafficChain=externalTrafficChain)
-				// todo loadBalancerTrafficChain
 				proxier.natRules.Write(
 					"-A", string(kubeServicesChain),
 					"-m", "comment", "--comment", fmt.Sprintf(`"%s loadbalancer IP"`, svcPortNameString),
@@ -540,7 +501,6 @@ func (proxier *Proxier) syncProxyRules() {
 					"-d", lbip,
 					"--dport", strconv.Itoa(svcInfo.Port()),
 					"-j", string(loadBalancerTrafficChain))
-
 			}
 			// ...
 		}
@@ -572,7 +532,7 @@ func (proxier *Proxier) syncProxyRules() {
 
 		// ...
 
-		// todo 这里为什么要跳转??到kubeMarkMasqChain
+		// 将 internalTrafficChain 目的ip 为集群ip的包跳转到 internalTrafficChain处理
 		if hasInternalEndpoints {
 			args = append(args[:0],
 				"-m", "comment", "--comment", fmt.Sprintf(`"%s cluster IP"`, svcPortNameString),
@@ -589,6 +549,19 @@ func (proxier *Proxier) syncProxyRules() {
 			// ...
 		}
 
+		// usesExternalTrafficChain 为true(存在 nodePort, lb, externalIp)
+		if usesExternalTrafficChain {
+			proxier.natChains.Write(utiliptables.MakeChainLine(externalTrafficChain))
+
+			// ...
+			// 最终将请求包跳转到 externalPolicyChain(clusterPolicyChain) 处理
+			if hasExternalEndpoints {
+				proxier.natRules.Write(
+					"-A", string(externalTrafficChain),
+					"-j", string(externalPolicyChain))
+			}
+		}
+
 
 		// clusterPolicy,流量转发到cluster上,不管这个cluster上的endpoint是不是在本机上
 		if usesClusterPolicyChain {
@@ -596,6 +569,7 @@ func (proxier *Proxier) syncProxyRules() {
 			proxier.natChains.Write(utiliptables.MakeChainLine(clusterPolicyChain))
 			// 创建clusterPolicyChain 到 clusterEndpoints 里的endpoint 的跳转规则(clusterPolicyChain 按 endpoints数随机分配等比例的跳转几率到 每个endpoint所在的rule中)
 			// #ref writeServiceToEndpointRules
+			// todo
 			proxier.writeServiceToEndpointRules(svcPortNameString, svcInfo, clusterPolicyChain, clusterEndpoints, args)
 		}
 
@@ -606,7 +580,7 @@ func (proxier *Proxier) syncProxyRules() {
 			proxier.writeServiceToEndpointRules(svcPortNameString, svcInfo, localPolicyChain, localEndpoints, args)
 		}
 
-		// 为所有当前node能达到的endpoint创建一条单独的chain
+		// 为所有当前node能达到的endpoint创建的chain 转发到 endpoint 的具体地址
 		for _, ep := range allLocallyReachableEndpoints {
 			epInfo, ok := ep.(*endpointsInfo)
 			if !ok {
@@ -635,22 +609,9 @@ func (proxier *Proxier) syncProxyRules() {
 		}
 	}
 
-
-	// Finally, tail-call to the nodePorts chain.  This needs to be after all
-	// other service portal rules.
+	// 获取node所有本地地址
 	nodeAddresses, err := proxier.nodePortAddresses.GetNodeAddresses(proxier.networkInterfacer)
-	if err != nil {
-		klog.ErrorS(err, "Failed to get node ip address matching nodeport cidrs, services with nodeport may not work as intended", "CIDRs", proxier.nodePortAddresses)
-	}
-	// nodeAddresses may contain dual-stack zero-CIDRs if proxier.nodePortAddresses is empty.
-	// Ensure nodeAddresses only contains the addresses for this proxier's IP family.
-	for addr := range nodeAddresses {
-		if utilproxy.IsZeroCIDR(addr) && isIPv6 == netutils.IsIPv6CIDRString(addr) {
-			// if any of the addresses is zero cidr of this IP family, non-zero IPs can be excluded.
-			nodeAddresses = sets.NewString(addr)
-			break
-		}
-	}
+	// ...
 
 	for address := range nodeAddresses {
 		// ...
