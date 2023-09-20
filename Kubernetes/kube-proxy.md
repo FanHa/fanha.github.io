@@ -252,11 +252,7 @@ func (proxier *Proxier) syncProxyRules() {
 	proxier.mu.Lock()
 	defer proxier.mu.Unlock()
 	// ...
-
-
 	success := false
-
-
 	if !tryPartialSync {
         // 创建基本的chain 和跳转关系, iptablesJumpChains 和 iptablesKubeletJumpChains 见chain 跳转图
 		for _, jump := range append(iptablesJumpChains, iptablesKubeletJumpChains...) {
