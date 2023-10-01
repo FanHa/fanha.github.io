@@ -317,13 +317,9 @@ func (proxier *Proxier) syncProxyRules() {
 	)
 
 
-	// Accumulate NAT chains to keep.
+	// 不是每一个chain最终都有实际内容,没有实际内容的在这里就不会置位true
 	activeNATChains := map[utiliptables.Chain]bool{} // use a map as a set
 
-	// To avoid growing this slice, we arbitrarily set its size to 64,
-	// there is never more than that many arguments for a single line.
-	// Note that even if we go over 64, it will still be correct - it
-	// is just for efficiency, not correctness.
 	args := make([]string, 64)
 
 	// Compute total number of endpoint chains across all services
@@ -334,56 +330,46 @@ func (proxier *Proxier) syncProxyRules() {
 	}
 	proxier.largeClusterMode = (totalEndpoints > largeClusterEndpointsThreshold)
 
-	// These two variables are used to publish the sync_proxy_rules_no_endpoints_total
-	// metric.
-	serviceNoLocalEndpointsTotalInternal := 0
-	serviceNoLocalEndpointsTotalExternal := 0
-
 	// 遍历已知的服务列表
 	for svcName, svc := range proxier.svcPortMap {
 		svcInfo, ok := svc.(*servicePortInfo)
-		if !ok {
-			klog.ErrorS(nil, "Failed to cast serviceInfo", "serviceName", svcName)
-			continue
-		}
+		// ...
 		protocol := strings.ToLower(string(svcInfo.Protocol()))
 		svcPortNameString := svcInfo.nameString
 
 		// 通过服务名找到该服务对应的endpointslice
 		allEndpoints := proxier.endpointsMap[svcName]
         // 给所有endpoint分类
+		// clusterEndpoint 是集群endpoint
+		// localEndpoint 是本地(共享一个kube-proxy)的endpoint
 		clusterEndpoints, localEndpoints, allLocallyReachableEndpoints, hasEndpoints := proxy.CategorizeEndpoints(allEndpoints, svcInfo, proxier.nodeLabels)
 
-		// Note the endpoint chains that will be used
+		// 每个endpoint 都是一个独立的chain,在 activeNATChains 表中设置为 true
 		for _, ep := range allLocallyReachableEndpoints {
 			if epInfo, ok := ep.(*endpointsInfo); ok {
 				activeNATChains[epInfo.ChainName] = true
 			}
 		}
 
-		// clusterPolicyChain contains the endpoints used with "Cluster" traffic policy
+		// 给集群访问服务创建一条 clusterPolicyChain
 		clusterPolicyChain := svcInfo.clusterPolicyChainName
 		usesClusterPolicyChain := len(clusterEndpoints) > 0 && svcInfo.UsesClusterEndpoints()
 		if usesClusterPolicyChain {
 			activeNATChains[clusterPolicyChain] = true
 		}
 
-		// localPolicyChain contains the endpoints used with "Local" traffic policy
+		// 给当前node访问服务创建一条 localPolicyChain
 		localPolicyChain := svcInfo.localPolicyChainName
 		usesLocalPolicyChain := len(localEndpoints) > 0 && svcInfo.UsesLocalEndpoints()
 		if usesLocalPolicyChain {
 			activeNATChains[localPolicyChain] = true
 		}
 
-		// internalPolicyChain is the chain containing the endpoints for
-		// "internal" (ClusterIP) traffic. internalTrafficChain is the chain that
-		// internal traffic is routed to (which is always the same as
-		// internalPolicyChain). hasInternalEndpoints is true if we should
-		// generate rules pointing to internalTrafficChain, or false if there are
-		// no available internal endpoints.
+		// 创建集群内访问(ClusterIP)的 internalPolicyChain
 		internalPolicyChain := clusterPolicyChain
 		hasInternalEndpoints := hasEndpoints
 		if svcInfo.InternalPolicyLocal() {
+			// 当开启了InternalPolicyLocal时, internalPolicyChain 指向 localPolicyChain
 			internalPolicyChain = localPolicyChain
 			if len(localEndpoints) == 0 {
 				hasInternalEndpoints = false
@@ -391,14 +377,9 @@ func (proxier *Proxier) syncProxyRules() {
 		}
 		internalTrafficChain := internalPolicyChain
 
-		// Similarly, externalPolicyChain is the chain containing the endpoints
-		// for "external" (NodePort, LoadBalancer, and ExternalIP) traffic.
-		// externalTrafficChain is the chain that external traffic is routed to
-		// (which is always the service's "EXT" chain). hasExternalEndpoints is
-		// true if there are endpoints that will be reached by external traffic.
-		// (But we may still have to generate externalTrafficChain even if there
-		// are no external endpoints, to ensure that the short-circuit rules for
-		// local traffic are set up.)
+		// 创建通过集群外部方式访问((NodePort, LoadBalancer, and ExternalIP)的 externalPolicyChain
+		// 注: 这个内部,外部访问并不是指访问服务的源调用方,仅仅是请求服务的方式
+		// 同样如果开启了ExternalPolicyLocal时, externalPolicyChain 指向 localPolicyChain
 		externalPolicyChain := clusterPolicyChain
 		hasExternalEndpoints := hasEndpoints
 		if svcInfo.ExternalPolicyLocal() {
@@ -409,24 +390,6 @@ func (proxier *Proxier) syncProxyRules() {
 		}
 		externalTrafficChain := svcInfo.externalChainName // eventually jumps to externalPolicyChain
 
-		// usesExternalTrafficChain is based on hasEndpoints, not hasExternalEndpoints,
-		// because we need the local-traffic-short-circuiting rules even when there
-		// are no externally-usable endpoints.
-		usesExternalTrafficChain := hasEndpoints && svcInfo.ExternallyAccessible()
-		if usesExternalTrafficChain {
-			activeNATChains[externalTrafficChain] = true
-		}
-
-		// Traffic to LoadBalancer IPs can go directly to externalTrafficChain
-		// unless LoadBalancerSourceRanges is in use in which case we will
-		// create a firewall chain.
-		loadBalancerTrafficChain := externalTrafficChain
-		fwChain := svcInfo.firewallChainName
-		usesFWChain := hasEndpoints && len(svcInfo.LoadBalancerIPStrings()) > 0 && len(svcInfo.LoadBalancerSourceRanges()) > 0
-		if usesFWChain {
-			activeNATChains[fwChain] = true
-			loadBalancerTrafficChain = fwChain
-		}
 
 		var internalTrafficFilterTarget, internalTrafficFilterComment string
 		var externalTrafficFilterTarget, externalTrafficFilterComment string
@@ -516,7 +479,7 @@ func (proxier *Proxier) syncProxyRules() {
 
 		// 服务的健康检查 port处理
 		if svcInfo.HealthCheckNodePort() != 0 {
-			// 健康检测的包直接放行
+			// 健康检测的包直接放行(kubeNodePortsChain从 filter input chain跳转而来)
 			proxier.filterRules.Write(
 				"-A", string(kubeNodePortsChain),
 				"-m", "comment", "--comment", fmt.Sprintf(`"%s health check node port"`, svcPortNameString),
