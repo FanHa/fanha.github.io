@@ -2,7 +2,8 @@
 release-1.27 
 
 # 序
-kubeproxy 作用
+kubeproxy在每个node上都有运行一个, kubeproxy用于跟进kubernetes控制面的 service  和 endpoint信息,更新本地iptable,使得进出当前node的流量能转发到正确的目的地;
+> 例如: 当前node一个pod发送一个请求到一个服务的cluster ip, kubeproxy需要制定规则把这个cluster ip 转发到具体的pod ip上;
 
 # 源码
 ## Run
