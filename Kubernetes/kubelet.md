@@ -3,6 +3,10 @@ release-1.27
 
 # 序
 kubelet
+# 示意图
+## pod 更新信息流转
+通过一个updates 的chan 把各个来源的pod更新信息汇集发给kubelet服务处理
+![kubelet-podupdate](resource/kubelet-podupdate.drawio.svg)
 
 # 源码
 ## 永久事件轮询处理
@@ -128,5 +132,87 @@ func (kl *Kubelet) HandlePodAdditions(pods []*v1.Pod) {
 		kl.dispatchWork(pod, kubetypes.SyncPodCreate, mirrorPod, start)
 
 	}
+}
+```
+
+## PodConfig
+PodConfig实例提供了一个关键的`updates chan`, 从"TODO"收集pod信息,被`Kubelet syncLoopIteration` 消费
+```go
+// pkg/kubelet/config/config.go
+func NewPodConfig(mode PodConfigNotificationMode, recorder record.EventRecorder, startupSLIObserver podStartupSLIObserver) *PodConfig {
+	// 创建chan
+	updates := make(chan kubetypes.PodUpdate, 50)
+	// todo
+	storage := newPodStorage(updates, mode, recorder, startupSLIObserver)
+	podConfig := &PodConfig{
+		pods:    storage,
+		mux:     config.NewMux(storage), // 调用storage 的Merge 方法把pod更新信息写入updates chan
+		updates: updates, // 这个入口是个Kubelet消费者消费的
+		sources: sets.String{},
+	}
+	return podConfig
+}
+```
+
+### podStorage
+// todo 介绍
+```go
+func (s *podStorage) Merge(source string, change interface{}) error {
+	s.updateLock.Lock()
+	defer s.updateLock.Unlock()
+
+	seenBefore := s.sourcesSeen.Has(source)
+	adds, updates, deletes, removes, reconciles := s.merge(source, change)
+	firstSet := !seenBefore && s.sourcesSeen.Has(source)
+
+	// deliver update notifications
+	switch s.mode {
+	case PodConfigNotificationIncremental:
+		if len(removes.Pods) > 0 {
+			s.updates <- *removes
+		}
+		if len(adds.Pods) > 0 {
+			s.updates <- *adds
+		}
+		if len(updates.Pods) > 0 {
+			s.updates <- *updates
+		}
+		if len(deletes.Pods) > 0 {
+			s.updates <- *deletes
+		}
+		if firstSet && len(adds.Pods) == 0 && len(updates.Pods) == 0 && len(deletes.Pods) == 0 {
+			// Send an empty update when first seeing the source and there are
+			// no ADD or UPDATE or DELETE pods from the source. This signals kubelet that
+			// the source is ready.
+			s.updates <- *adds
+		}
+		// Only add reconcile support here, because kubelet doesn't support Snapshot update now.
+		if len(reconciles.Pods) > 0 {
+			s.updates <- *reconciles
+		}
+
+	case PodConfigNotificationSnapshotAndUpdates:
+		if len(removes.Pods) > 0 || len(adds.Pods) > 0 || firstSet {
+			s.updates <- kubetypes.PodUpdate{Pods: s.MergedState().([]*v1.Pod), Op: kubetypes.SET, Source: source}
+		}
+		if len(updates.Pods) > 0 {
+			s.updates <- *updates
+		}
+		if len(deletes.Pods) > 0 {
+			s.updates <- *deletes
+		}
+
+	case PodConfigNotificationSnapshot:
+		if len(updates.Pods) > 0 || len(deletes.Pods) > 0 || len(adds.Pods) > 0 || len(removes.Pods) > 0 || firstSet {
+			s.updates <- kubetypes.PodUpdate{Pods: s.MergedState().([]*v1.Pod), Op: kubetypes.SET, Source: source}
+		}
+
+	case PodConfigNotificationUnknown:
+		fallthrough
+	default:
+		panic(fmt.Sprintf("unsupported PodConfigNotificationMode: %#v", s.mode))
+	}
+
+	return nil
 }
 ```
