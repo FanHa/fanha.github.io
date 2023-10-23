@@ -4,9 +4,10 @@ release-1.27
 # 序
 kubelet
 # 示意图
-## pod 更新信息流转
-通过一个updates 的chan 把各个来源的pod更新信息汇集发给kubelet服务处理
-![kubelet-podupdate](resource/kubelet-podupdate.drawio.svg)
+- listwatch k8s api pod信息(用当前的node名过滤)
+- 通过一个updates 的chan 把各个来源的pod更新信息汇集发给kubelet实例处理
+- kubelet实例更具更新的pod状态调用底层containerRuntime维护pod状态
+![kubelet-podupdate](resource/kubelet.drawio.svg)
 
 # 源码
 ## 永久事件轮询处理
@@ -136,7 +137,7 @@ func (kl *Kubelet) HandlePodAdditions(pods []*v1.Pod) {
 ```
 
 ## PodConfig
-PodConfig实例提供了一个关键的`updates chan`, 从"TODO"收集pod信息,被`Kubelet syncLoopIteration` 消费
+PodConfig实例提供了一个关键的`updates chan`, 从k8s控制面api收集pod信息,被`Kubelet syncLoopIteration` 消费
 ```go
 // pkg/kubelet/config/config.go
 func NewPodConfig(mode PodConfigNotificationMode, recorder record.EventRecorder, startupSLIObserver podStartupSLIObserver) *PodConfig {
