@@ -148,7 +148,7 @@ func NewPodConfig(mode PodConfigNotificationMode, recorder record.EventRecorder,
 	podConfig := &PodConfig{
 		pods:    storage,
 		mux:     config.NewMux(storage), // 调用storage 的Merge 方法把pod更新信息写入updates chan
-		updates: updates, // 这个入口是个Kubelet消费者消费的
+		updates: updates, // 这个入口是给Kubelet消费者消费的
 		sources: sets.String{},
 	}
 	return podConfig
