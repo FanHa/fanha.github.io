@@ -1,12 +1,9 @@
 # 版本
-todo
+https://github.com/chaos-mesh/chaos-mesh
+2.6
 
 # 序
-todo
+networkchaos 用来给集群内部的pod 注入网络故障
 
-# 结构
-todo
-
-# 关键
-## controller
-每个controller只 Reconcile 一个字段
+# 示意图
+![networkchaos](networkchaos.drawio.svg)
