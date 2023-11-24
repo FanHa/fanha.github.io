@@ -125,4 +125,4 @@ envoy 在`onStreamComplete`后统一调用所有filter注册了的log_handler,�
 ```
 
 ## 结论
-被`local_ratelimit filter`拒绝的请求虽然没有经过`istio.stats filter`,但依然会在请求的`onStreamComplete`阶段后调用`istio.stats filter`注册的log方法,从而记录日志
+被`local_ratelimit filter`拒绝的请求虽然没有经过`istio.stats filter`,但依然会在请求的`onStreamComplete`阶段后调用`istio.stats filter`注册的`log方法`,从而记录日志
