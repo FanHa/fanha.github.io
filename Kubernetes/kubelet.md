@@ -15,7 +15,7 @@ kubelet
 - configCh Pod的增删改 事件处理
 - plegCh pod的生命周期变化事件
 - syncCh 周期性调用同步pod状态
-- kl.livenessManager.Updates todo
+- kl.livenessManager.Updates, kl.readinessManager.Updates, kl.startupManager.Updates 三个chan分别处理pod的liveness, readiness, startup probe结果
 - housekeepingCh 周期性做清理
 ```go
 // pkg/kubelet/kubelet.go

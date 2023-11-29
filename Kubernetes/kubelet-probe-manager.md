@@ -62,6 +62,8 @@ func (m *manager) AddPod(pod *v1.Pod) {
 	}
 }
 ```
+
+## 周期性出发probe逻辑
 ```go
 // pkg/kubelet/prober/worker.go
 func (w *worker) run() {
@@ -86,6 +88,8 @@ probeLoop:
 	}
 }
 ```
+## 收集probe结果
+调用w.resultsManager.Set将结果通知出去
 ```go
 // pkg/kubelet/prober/worker.go
 func (w *worker) doProbe(ctx context.Context) (keepGoing bool) {
@@ -106,7 +110,6 @@ func (w *worker) doProbe(ctx context.Context) (keepGoing bool) {
 	}
 
     // 到这里代表probe出现了状况,需要更新probe状态
-    // todo
 	w.resultsManager.Set(w.containerID, result, w.pod)
     // liveness,starup probe失败的情况下,container需要重启, 将onHold置换成true,避免下一次循环再次执行probe
 	if (w.probeType == liveness || w.probeType == startup) && result == results.Failure {
@@ -119,5 +122,51 @@ func (w *worker) doProbe(ctx context.Context) (keepGoing bool) {
 	}
 
 	return true
+}
+```
+## 分发probe结果
+probe发到一个channel中,供订阅了这个事件的其他组件使用
+```go
+// pkg/kubelet/prober/results/results_manager.go
+func (m *manager) Set(id kubecontainer.ContainerID, result Result, pod *v1.Pod) {
+	if m.setInternal(id, result) {
+        // 将pod的probe结果放入updates channel
+		m.updates <- Update{id, result, pod.UID}
+	}
+}
+```
+
+## 处理probe结果
+kubelet 主循环监听了各个probeManager的updates channel,一旦有probe结果,就会调用handler.HandleProbeSync
+```go
+// pkg/kubelet/kubelet.go
+func (kl *Kubelet) syncLoopIteration(ctx context.Context, configCh <-chan kubetypes.PodUpdate, handler SyncHandler,
+	syncCh <-chan time.Time, housekeepingCh <-chan time.Time, plegCh <-chan *pleg.PodLifecycleEvent) bool {
+	select {
+        // ...
+        case update := <-kl.livenessManager.Updates():
+		if update.Result == proberesults.Failure {
+			handleProbeSync(kl, update, handler, "liveness", "unhealthy")
+		}
+	case update := <-kl.readinessManager.Updates():
+		ready := update.Result == proberesults.Success
+		kl.statusManager.SetContainerReadiness(update.PodUID, update.ContainerID, ready)
+
+		status := ""
+		if ready {
+			status = "ready"
+		}
+		handleProbeSync(kl, update, handler, "readiness", status)
+	case update := <-kl.startupManager.Updates():
+		started := update.Result == proberesults.Success
+		kl.statusManager.SetContainerStartup(update.PodUID, update.ContainerID, started)
+
+		status := "unhealthy"
+		if started {
+			status = "started"
+		}
+		handleProbeSync(kl, update, handler, "startup", status)
+        // ...
+    }
 }
 ```
