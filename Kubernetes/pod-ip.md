@@ -5,6 +5,12 @@ release-1.20
 node上的kubelet 监听到自己所在的node的pod,在当前node上创建pod时向cni插件申请ip
 TODO 怎么把这个ip更新到k8s api server上??
 
+# 三份状态
+一个pod有3份状态
+1. api server 上的状态
+2. kubelet上的statusManager上的状态
+3. 容器运行时上的状态
+
 # 示意图
 ![pod-ip-apply](pod-ip.apply.drawio.svg)
 
