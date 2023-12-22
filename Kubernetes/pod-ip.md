@@ -3,7 +3,7 @@ release-1.20
 
 # 序
 node上的kubelet 监听到自己所在的node的pod,在当前node上创建pod时向cni插件申请ip
-TODO 怎么把这个ip更新到k8s api server上??
+创建好pod后,把pod的ip更新到k8s api server上
 
 # 三份状态
 一个pod有3份状态
